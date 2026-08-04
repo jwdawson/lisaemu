@@ -1,5 +1,12 @@
 public final class Bus {
-    public var setupMode = true
+    /// The SETUP flip-flop. Starts `true` at power-on (translation off,
+    /// I/O reachable via flat `$FCxxxx` physical addresses). The only way
+    /// it changes on real hardware is the address-decoded `$E010`/`$E012`
+    /// latch (`IODispatcher`, ANY access, data ignored -- see
+    /// docs/hardware-notes.md "Setup Latch"), so this is `private(set)`;
+    /// `_setSetupModeForTesting` is the internal escape hatch both that
+    /// latch and test suites use.
+    public private(set) var setupMode = true
     public var mmu = MMU()
     private var _domain = 0
     public var domain: Int {
@@ -12,6 +19,16 @@ public final class Bus {
     public private(set) var lastFault: MMUFault?
     public private(set) var unmappedAccesses: [UInt32] = []
     public private(set) var unmappedDropped = 0
+    /// Count of SLIM/SORG MMU-port writes (`Bus.slimSorgPortAccess`,
+    /// docs/hardware-notes.md "Register Port Addressing"). Incremented once
+    /// per high-byte (i.e. per 16-bit register) write, not once per byte --
+    /// see the doc comment on `slimSorgPortAccess`.
+    public private(set) var mmuPortWrites = 0
+    /// Cycle stamp for `IOAccess.cycles`; `Machine.init` wires this to
+    /// `Machine.cycles`. Defaults to a constant 0 for bare `Bus` use (e.g.
+    /// these tests), matching `supervisorProvider`/`busErrorHandler`'s
+    /// pattern of Machine-supplied closures.
+    public var cycleProvider: () -> UInt64 = { 0 }
     /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.
@@ -47,7 +64,13 @@ public final class Bus {
     /// `lisa_cpu_force_halt` shim, not another pulse) avoids ever taking
     /// that recursive branch.
     public var forceHaltHandler: (() -> Void)?
-    private var peeking = false
+    /// Set for the duration of `withPeek`'s body. `internal` get (not
+    /// `private`) so `IODispatcher.swift` -- a different file in this
+    /// module -- can consult it too: peek reads must not toggle latches,
+    /// mutate MMU ports, or log to `ioTrace`/`unmappedAccesses`, exactly
+    /// like they must not mutate `lastFault`/`faultPendingResolution`
+    /// below. The setter stays `private` to this file, same as before.
+    private(set) var peeking = false
     /// True from the moment a translated CPU access faults and pulses a
     /// bus error, until either a translated access succeeds (exception
     /// stacking completed -- the CPU is now cleanly executing the handler)
@@ -55,9 +78,25 @@ public final class Bus {
     /// a double bus fault). See `forceHaltHandler`.
     private var faultPendingResolution = false
     var ram: [UInt8]
+    /// The 16KB boot ROM, `$FE0000-$FE3FFF` (docs/hardware-notes.md "ROM
+    /// Range"). `loadROM` pads/truncates to exactly this size.
+    private var rom = [UInt8](repeating: 0, count: 0x4000)
+    /// Gates the `$0000-$3FFF` read mirror (see `access`): before any ROM
+    /// is loaded there is nothing to mirror, so low addresses behave as
+    /// plain flat RAM. This is a modeled convenience, not a cited hardware
+    /// fact -- real silicon always has a ROM chip present -- but it lets
+    /// every pre-Task-5 test (M68KTests/MachineTests/MonitorTests/etc.,
+    /// which poke boot vectors straight into low RAM the way tests have
+    /// since M0, and never call `loadROM`) keep working unchanged instead
+    /// of every one of them needing a synthetic ROM image. Once `loadROM`
+    /// is called (Task 6 onward, with the real Lisa ROM), the mirror is
+    /// live for the rest of that Bus's lifetime.
+    private var romLoaded = false
+    private var io: IODispatcher!
 
     public init(ramSize: Int) {
         ram = [UInt8](repeating: 0, count: ramSize)
+        io = IODispatcher(bus: self)
     }
 
     public func withPeek<T>(_ body: () -> T) -> T {
@@ -67,22 +106,139 @@ public final class Bus {
         return body()
     }
 
-    private func physical(_ address: UInt32, isWrite: Bool) -> Int? {
+    /// Loads the 16KB boot ROM (`$FE0000-$FE3FFF`, and its `$0000-$3FFF`
+    /// read mirror while `setupMode == true`). Pads with zero bytes if
+    /// `bytes` is shorter than 16KB, truncates if longer -- Task 6 is
+    /// expected to supply exactly 16KB from the real Lisa ROM image, but
+    /// tests here use short hand-built byte arrays for convenience.
+    public func loadROM(_ bytes: [UInt8]) {
+        var newRom = [UInt8](repeating: 0, count: 0x4000)
+        for i in 0..<min(bytes.count, 0x4000) {
+            newRom[i] = bytes[i]
+        }
+        rom = newRom
+        romLoaded = true
+    }
+
+    /// Sole path (besides the hardware latch itself) that mutates
+    /// `setupMode`. `internal`, not `private`, for two reasons: (1)
+    /// `IODispatcher.swift`'s `$E010`/`$E012` handlers -- the real
+    /// "hardware path" per docs/hardware-notes.md's "Setup Latch" -- are a
+    /// different file in this module and call this exact function; (2) test
+    /// suites (`@testable import`) that predate the I/O latch and set up
+    /// translation state directly need to flip the mode without walking a
+    /// synthetic bus access through `IODispatcher`. Real hardware has no
+    /// third way to change this bit.
+    func _setSetupModeForTesting(_ value: Bool) {
+        setupMode = value
+    }
+
+    /// SLIM/SORG MMU port intercept, checked before every other setup-mode
+    /// routing decision. Unlike everything else `Bus.access` hands off to
+    /// `IODispatcher`, these ports are addressed per 128KB segment block
+    /// across the *entire* 24-bit physical space -- `SLIM = $8000 +
+    /// mmu_index * $20000`, `SORG` 8 bytes higher, `mmu_index = addr >> 17`
+    /// (docs/hardware-notes.md "Register Port Addressing") -- not scoped to
+    /// IOSpace, so it cannot live inside IODispatcher's `$FC0000-$FDFFFF`
+    /// dispatch. Both registers are 16-bit hardware ports (`AND.W #$0FFF`),
+    /// so this models them as two consecutive byte lanes (high byte at the
+    /// base offset, low byte one above) read-modify-written against the
+    /// already-12-bit-masked `SegmentRegister` storage; `mmuPortWrites`
+    /// counts once per high-byte write (i.e. once per 16-bit register
+    /// write), not once per byte, matching how real code always programs
+    /// these with a single `MOVE.W`. Returns the accessed byte (the read
+    /// value, or the written value echoed back) when `a`'s low 17 bits
+    /// match a port, `nil` otherwise so the caller falls through to normal
+    /// routing.
+    private func slimSorgPortAccess(_ a: UInt32, isWrite: Bool, value: UInt8) -> UInt8? {
+        let low = a & 0x1_FFFF
+        let isSlim: Bool
+        switch low {
+        case 0x8000, 0x8001: isSlim = true
+        case 0x8008, 0x8009: isSlim = false
+        default: return nil
+        }
+        let isHighByte = (low == 0x8000 || low == 0x8008)
+        let seg = Int(a >> 17)
+
+        if isWrite {
+            if !peeking {
+                var reg = isSlim ? mmu.domains[domain][seg].slim : mmu.domains[domain][seg].sorg
+                if isHighByte {
+                    reg = (reg & 0x00FF) | (UInt16(value) << 8)
+                } else {
+                    reg = (reg & 0xFF00) | UInt16(value)
+                }
+                if isSlim { mmu.domains[domain][seg].slim = reg } else { mmu.domains[domain][seg].sorg = reg }
+                if isHighByte { mmuPortWrites += 1 }
+            }
+            return value
+        } else {
+            let reg = isSlim ? mmu.domains[domain][seg].slim : mmu.domains[domain][seg].sorg
+            return isHighByte ? UInt8(reg >> 8) : UInt8(reg & 0xFF)
+        }
+    }
+
+    /// Routes one byte-wide bus access to its destination and returns the
+    /// resulting byte (meaningful for reads; writes ignore it). This is the
+    /// single place that implements the whole M1a memory map:
+    ///
+    /// While `setupMode == true` (flat physical addressing, no MMU):
+    ///   1. SLIM/SORG ports (any segment block, see `slimSorgPortAccess`).
+    ///   2. ROM window `$FE0000-$FE3FFF` (reads only -- writes ignored+logged).
+    ///   3. Low ROM mirror `$0000-$3FFF`, once a ROM is loaded (`romLoaded`):
+    ///      reads only; writes fall through to RAM. Both the write-falls-
+    ///      through behavior and the `romLoaded` gate itself are modeled
+    ///      assumptions, not cited hardware facts -- see the task-5 report.
+    ///   4. `$FC0000-$FDFFFF` -> `IODispatcher`, offset = low 17 bits.
+    ///   5. Otherwise: flat RAM.
+    ///
+    /// Once `setupMode == false` (translation active, Task 3/4 fault
+    /// semantics preserved exactly):
+    ///   - `.memory(p)`: RAM, UNLESS `p` itself falls in the ROM window
+    ///     (design note: "for simplicity detect ROM by final physical
+    ///     address range" -- currently unreachable given SORG's 12-bit/2MB
+    ///     ceiling, but kept for forward compatibility; see task-5 report).
+    ///   - `.io(offset)`: `IODispatcher`.
+    ///   - `.fault`: unchanged bus-error path.
+    private func access(_ address: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
         let a = address & 0xFF_FFFF
-        guard !setupMode else { return Int(a) }
+
+        if setupMode {
+            if let byte = slimSorgPortAccess(a, isWrite: isWrite, value: value) {
+                return byte
+            }
+            if a >= 0xFE_0000 && a <= 0xFE_3FFF {
+                if isWrite {
+                    recordUnmapped(address)
+                    return value
+                }
+                return rom[Int(a - 0xFE_0000)]
+            }
+            if a <= 0x3FFF && !isWrite && romLoaded {
+                return rom[Int(a)]
+            }
+            if a >= 0xFC_0000 && a <= 0xFD_FFFF {
+                let offset = a & 0x1_FFFF
+                return ioAccess(offset, isWrite: isWrite, value: value)
+            }
+            return ramAccess(address, Int(a), isWrite: isWrite, value: value)
+        }
+
         switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
         case .memory(let p):
             if !peeking { faultPendingResolution = false }
-            return Int(p)
+            if p >= 0xFE_0000 && p <= 0xFE_3FFF {
+                if isWrite {
+                    recordUnmapped(address)
+                    return value
+                }
+                return rom[Int(p - 0xFE_0000)]
+            }
+            return ramAccess(address, Int(p), isWrite: isWrite, value: value)
         case .io(let offset):
             if !peeking { faultPendingResolution = false }
-            // IODispatcher lands in Task 5. Until then, .io is treated like
-            // an unmapped physical address: reads return 0xFF, writes are
-            // dropped, and the access is recorded via the same
-            // unmappedAccesses bookkeeping as any other out-of-range
-            // address (guaranteed out of range here since it's offset from
-            // ram.count, regardless of ram size).
-            return ram.count + Int(offset)
+            return ioAccess(offset, isWrite: isWrite, value: value)
         case .fault(let fault):
             if !peeking {
                 lastFault = fault
@@ -97,7 +253,44 @@ public final class Bus {
                     busErrorHandler?(address, isWrite)
                 }
             }
-            return nil
+            return 0xFF
+        }
+    }
+
+    /// Dispatches to `IODispatcher`, respecting `peeking`: a peek must
+    /// observe current state without toggling any latch, mutating any
+    /// register, or logging to `ioTrace` (docs/hardware-notes.md-derived
+    /// latches are address-decoded on ANY real access, but a peek is not a
+    /// real bus access).
+    private func ioAccess(_ offset: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
+        if peeking {
+            return io.currentValue(offset)
+        }
+        if isWrite {
+            io.write(offset, value)
+            return value
+        }
+        return io.read(offset)
+    }
+
+    private func ramAccess(_ originalAddress: UInt32, _ index: Int, isWrite: Bool, value: UInt8) -> UInt8 {
+        guard index >= 0, index < ram.count else {
+            recordUnmapped(originalAddress)
+            return 0xFF
+        }
+        if isWrite {
+            ram[index] = value
+            return value
+        }
+        return ram[index]
+    }
+
+    private func recordUnmapped(_ originalAddress: UInt32) {
+        guard !peeking else { return }
+        if unmappedAccesses.count < 1024 {
+            unmappedAccesses.append(originalAddress & 0xFF_FFFF)
+        } else {
+            unmappedDropped += 1
         }
     }
 
@@ -116,33 +309,21 @@ public final class Bus {
     }
 
     public func read8(_ address: UInt32) -> UInt8 {
-        guard let a = physical(address, isWrite: false) else { return 0xFF }
-        guard a < ram.count else {
-            if !peeking {
-                if unmappedAccesses.count < 1024 {
-                    unmappedAccesses.append(address & 0xFF_FFFF)
-                } else {
-                    unmappedDropped += 1
-                }
-            }
-            return 0xFF
-        }
-        return ram[a]
+        access(address, isWrite: false, value: 0)
     }
 
     public func write8(_ address: UInt32, _ value: UInt8) {
-        guard let a = physical(address, isWrite: true) else { return }
-        guard a < ram.count else {
-            if !peeking {
-                if unmappedAccesses.count < 1024 {
-                    unmappedAccesses.append(address & 0xFF_FFFF)
-                } else {
-                    unmappedDropped += 1
-                }
-            }
-            return
-        }
-        ram[a] = value
+        _ = access(address, isWrite: true, value: value)
+    }
+
+    // MARK: - IODispatcher-backed diagnostics
+
+    public var ioTrace: [IOAccess] { io.ioTrace }
+    public var ioTraceDropped: Int { io.ioTraceDropped }
+    public var videoPageLatch: UInt8 { io.videoPageLatch }
+    public var statusByte: UInt8 {
+        get { io.statusByte }
+        set { io.statusByte = newValue }
     }
 
     public func read16(_ a: UInt32) -> UInt16 {

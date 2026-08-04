@@ -70,16 +70,79 @@ import Testing
 
 @Test func peekSuppressesLastFaultInTranslatedPath() {
     let bus1 = Bus(ramSize: 0x100)
-    bus1.setupMode = false  // Enable MMU translation
+    bus1._setSetupModeForTesting(false)  // Enable MMU translation
     // Read from unmapped location outside withPeek — should record fault
     _ = bus1.read8(0x1000)
     let faultRecorded = bus1.lastFault != nil
 
     let bus2 = Bus(ramSize: 0x100)
-    bus2.setupMode = false  // Enable MMU translation
+    bus2._setSetupModeForTesting(false)  // Enable MMU translation
     // Same address read inside withPeek — should NOT record fault
     _ = bus2.withPeek { bus2.read8(0x1000) }
     let faultSuppressed = bus2.lastFault == nil
 
     #expect(faultRecorded && faultSuppressed)
+}
+
+// MARK: - ROM window ($FE0000-$FE3FFF) + low mirror ($0000-$3FFF while setupMode)
+
+@Test func romWindowReadsLoadedBytes() {
+    let bus = Bus(ramSize: 0x1000)
+    let rom = (0..<0x4000).map { UInt8($0 & 0xFF) }
+    bus.loadROM(rom)
+    #expect(bus.read8(0xFE_0000) == rom[0])
+    #expect(bus.read8(0xFE_0001) == rom[1])
+    #expect(bus.read8(0xFE_3FFF) == rom[0x3FFF])
+}
+
+@Test func romWindowWritesAreIgnoredAndLogged() {
+    let bus = Bus(ramSize: 0x1000)
+    bus.loadROM([UInt8](repeating: 0xAA, count: 0x4000))
+    bus.write8(0xFE_0000, 0x00)
+    #expect(bus.read8(0xFE_0000) == 0xAA)   // write had no effect
+    #expect(bus.unmappedAccesses.contains(0xFE_0000))   // but was logged
+}
+
+@Test func lowMirrorReadsROMWhileInSetupMode() {
+    let bus = Bus(ramSize: 0x1000)
+    var rom = [UInt8](repeating: 0, count: 0x4000)
+    rom[0] = 0x60
+    rom[1] = 0xFE
+    bus.loadROM(rom)
+    #expect(bus.setupMode == true)
+    #expect(bus.read8(0x0) == rom[0])
+    #expect(bus.read8(0x1) == rom[1])
+}
+
+@Test func lowMirrorWritesFallThroughToRAM() {
+    // Modeled assumption (per task-5 brief): while the mirror is read-only
+    // for ROM, writes to $0000-$3FFF are NOT dropped -- they fall straight
+    // through to RAM underneath, since the boot ROM writes low RAM during
+    // POST after mapping is established. Task 7's real-ROM trace will
+    // confirm or correct this.
+    let bus = Bus(ramSize: 0x1000)
+    bus.loadROM([UInt8](repeating: 0xAA, count: 0x4000))
+    bus.write8(0x10, 0x5A)
+    // The mirror still shadows reads at $10 (ROM wins for reads)...
+    #expect(bus.read8(0x10) == 0xAA)
+    // ...but the byte really did land in RAM underneath: once setup mode
+    // clears (and nothing maps segment 0), the mirror is gone entirely and
+    // the flat/translated path is no longer meaningful here, so instead we
+    // verify the underlying RAM directly via a segment 0 mapping.
+    bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 256, access: .readWrite)
+    bus._setSetupModeForTesting(false)
+    #expect(bus.read8(0x10) == 0x5A)
+}
+
+@Test func mirrorIsGoneOnceSetupModeClearsWithAnMMUMapping() {
+    let bus = Bus(ramSize: 0x100000)
+    var rom = [UInt8](repeating: 0xAA, count: 0x4000)
+    rom[0] = 0x11
+    bus.loadROM(rom)
+    #expect(bus.read8(0x0) == 0x11)   // setup mode: mirror shows ROM
+
+    bus.write8(0x40000, 0x99)                 // physical, while still in setup mode
+    bus.mmu.domains[0][0] = .make(originPage: 0x200, limitPages: 256, access: .readWrite)
+    bus._setSetupModeForTesting(false)
+    #expect(bus.read8(0x0) == 0x99)   // translated: RAM via the mapping, not ROM
 }

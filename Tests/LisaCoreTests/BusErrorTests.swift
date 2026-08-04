@@ -5,7 +5,7 @@ extension MusashiSuites {
     @Suite struct BusErrorTests {
         @Test func mmuFaultRaisesRealBusErrorException() {
             let machine = Machine(ramSize: 0x10000)
-            machine.bus.setupMode = false
+            machine.bus._setSetupModeForTesting(false)
             // Domain 0, segment 0 (logical 0x0...0x1FFFF): vectors + code,
             // mapped identity read/write. Segment 1 (logical 0x2_0000...) is
             // left absent (the default slim 0 -> absent nibble), so the
@@ -47,7 +47,7 @@ extension MusashiSuites {
             // without a base case and crashes the process (SIGBUS/stack
             // overflow), not merely fails an assertion.
             let machine = Machine(ramSize: 0x10000)
-            machine.bus.setupMode = false
+            machine.bus._setSetupModeForTesting(false)
             machine.bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 128, access: .readWrite)
             // Segment 1 (0x2_0000...) and segment 2 (0x4_0000...) are both
             // left absent (the default): segment 1 is the program's

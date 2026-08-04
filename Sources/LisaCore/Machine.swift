@@ -24,6 +24,7 @@ public final class Machine {
             cpu?.pulseBusError(address: address, isWrite: isWrite)
         }
         bus.forceHaltHandler = { [weak cpu] in cpu?.forceHalt() }
+        bus.cycleProvider = { [weak self] in self?.cycles ?? 0 }
     }
 
     public func reset() {

@@ -152,7 +152,7 @@ private func mmuWith(_ seg: Int, _ reg: SegmentRegister, domain: Int = 0) -> MMU
     let bus = Bus(ramSize: 0x100000)
     bus.write8(0x40000, 0x5A)                 // physical, while in setup mode
     bus.mmu.domains[0][0] = .make(originPage: 0x200, limitPages: 256, access: .readWrite)  // 0x200*512 = 0x40000
-    bus.setupMode = false
+    bus._setSetupModeForTesting(false)
     #expect(bus.read8(0x0) == 0x5A)           // logical 0 → physical 0x40000
     _ = bus.read8(0x2_0000)                   // segment 1 is invalid
     #expect(bus.lastFault == MMUFault(logical: 0x2_0000, reason: .invalidSegment))

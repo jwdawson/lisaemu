@@ -19,6 +19,7 @@ public final class Machine {
     public init(ramSize: Int = 0x20_0000) {
         bus = Bus(ramSize: ramSize)
         cpu = M68K(bus: bus)
+        bus.supervisorProvider = { [weak cpu] in cpu?.isSupervisor ?? true }
     }
 
     public func reset() {

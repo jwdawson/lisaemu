@@ -20,3 +20,5 @@ unsigned int m68k_read_disassembler_16(unsigned int a) { return g_bus.read16(g_b
 unsigned int m68k_read_disassembler_32(unsigned int a) { return g_bus.read32(g_bus.ctx, a); }
 
 unsigned int lisa_cpu_stopped(void) { return CPU_STOPPED; }
+
+unsigned int lisa_cpu_supervisor(void) { return m68ki_cpu.s_flag; }

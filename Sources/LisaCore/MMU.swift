@@ -24,8 +24,15 @@ public struct MMU {
     public var domains: [[SegmentRegister]] =
         Array(repeating: Array(repeating: SegmentRegister(), count: 128), count: 4)
 
+    /// Translates a logical address through the given domain's segment map.
+    ///
+    /// - Parameter isSupervisor: Carries the CPU's current supervisor/user
+    ///   mode. No supervisor-conditional rule is enforced yet -- the
+    ///   parameter exists so M1b hardware rules can be added without another
+    ///   signature change; behavior is currently identical regardless of its
+    ///   value.
     public func translate(_ logical: UInt32, domain: Int,
-                          isWrite: Bool) -> Result<UInt32, MMUFault> {
+                          isSupervisor: Bool, isWrite: Bool) -> Result<UInt32, MMUFault> {
         let addr = logical & 0xFF_FFFF
         let seg = Int(addr >> 17)
         let offset = addr & (Self.segmentSize - 1)

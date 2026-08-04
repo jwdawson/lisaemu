@@ -26,4 +26,10 @@ void lisa_bus_install(lisa_bus_t bus);
  * the well-known bit positions (see M68K.swift). */
 unsigned int lisa_cpu_stopped(void);
 
+/* Raw value of the Musashi core's internal `s_flag` bitfield
+ * (m68ki_cpu.s_flag). Nonzero when the core is in supervisor mode; zero in
+ * user mode. Swift compares this against zero rather than relying on a
+ * specific bit pattern, since Musashi stores the flag pre-shifted. */
+unsigned int lisa_cpu_supervisor(void);
+
 #endif

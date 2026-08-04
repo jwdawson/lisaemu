@@ -32,5 +32,14 @@ extension MusashiSuites {
             #expect(length == 2)
             #expect(text.lowercased().contains("moveq"))
         }
+
+        @Test func supervisorFlagTracksSR() {
+            let bus = makeMachineRAM()
+            let cpu = M68K(bus: bus)
+            cpu.reset()
+            #expect(cpu.isSupervisor == true)      // 68000 resets in supervisor mode
+            cpu[.sr] = 0x0700                      // clear S bit
+            #expect(cpu.isSupervisor == false)
+        }
     }
 }

@@ -135,6 +135,14 @@ public final class M68K {
         (lisa_cpu_stopped() & StopLevel.halt) != 0
     }
 
+    /// True while the core is executing in supervisor mode (the SR's S bit
+    /// set). Read via the `lisa_cpu_supervisor()` shim accessor, which
+    /// returns Musashi's internal `m68ki_cpu.s_flag` -- stored pre-shifted,
+    /// so we compare against zero rather than a specific bit pattern.
+    public var isSupervisor: Bool {
+        lisa_cpu_supervisor() != 0
+    }
+
     public subscript(_ reg: Register) -> UInt32 {
         get {
             assertOwner()

@@ -12,6 +12,10 @@ public final class Bus {
     public private(set) var lastFault: MMUFault?
     public private(set) var unmappedAccesses: [UInt32] = []
     public private(set) var unmappedDropped = 0
+    /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
+    /// Defaults to always-supervisor; `Machine.init` wires this to the live
+    /// CPU state.
+    public var supervisorProvider: () -> Bool = { true }
     private var peeking = false
     var ram: [UInt8]
 
@@ -29,7 +33,7 @@ public final class Bus {
     private func physical(_ address: UInt32, isWrite: Bool) -> Int? {
         let a = address & 0xFF_FFFF
         guard !setupMode else { return Int(a) }
-        switch mmu.translate(a, domain: domain, isWrite: isWrite) {
+        switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
         case .success(let p): return Int(p)
         case .failure(let fault):
             if !peeking { lastFault = fault }

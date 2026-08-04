@@ -6,6 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "LisaCore", targets: ["LisaCore"]),
+        .executable(name: "lisadbg", targets: ["lisadbg"]),
     ],
     targets: [
         .target(
@@ -30,6 +31,11 @@ let package = Package(
             name: "LisaCoreTests",
             dependencies: ["LisaCore"],
             resources: [.copy("TomHarteKnownFailures.txt")],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        .executableTarget(
+            name: "lisadbg",
+            dependencies: ["LisaCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

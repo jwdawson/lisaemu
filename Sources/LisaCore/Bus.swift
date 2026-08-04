@@ -71,10 +71,19 @@ public final class Bus {
         let a = address & 0xFF_FFFF
         guard !setupMode else { return Int(a) }
         switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
-        case .success(let p):
+        case .memory(let p):
             if !peeking { faultPendingResolution = false }
             return Int(p)
-        case .failure(let fault):
+        case .io(let offset):
+            if !peeking { faultPendingResolution = false }
+            // IODispatcher lands in Task 5. Until then, .io is treated like
+            // an unmapped physical address: reads return 0xFF, writes are
+            // dropped, and the access is recorded via the same
+            // unmappedAccesses bookkeeping as any other out-of-range
+            // address (guaranteed out of range here since it's offset from
+            // ram.count, regardless of ram size).
+            return ram.count + Int(offset)
+        case .fault(let fault):
             if !peeking {
                 lastFault = fault
                 if faultPendingResolution {

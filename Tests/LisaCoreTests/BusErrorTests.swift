@@ -8,9 +8,9 @@ extension MusashiSuites {
             machine.bus.setupMode = false
             // Domain 0, segment 0 (logical 0x0...0x1FFFF): vectors + code,
             // mapped identity read/write. Segment 1 (logical 0x2_0000...) is
-            // left .invalid (the default), so the absolute-long read at
-            // $20000 below takes a real MMU fault.
-            machine.bus.mmu.domains[0][0] = SegmentRegister(origin: 0, limitBytes: 0x10000, access: .readWrite)
+            // left absent (the default slim 0 -> absent nibble), so the
+            // absolute-long read at $20000 below takes a real MMU fault.
+            machine.bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 128, access: .readWrite)
 
             machine.bus.write32(0x0, 0x3000)   // initial SSP
             machine.bus.write32(0x4, 0x400)    // initial PC
@@ -48,9 +48,9 @@ extension MusashiSuites {
             // overflow), not merely fails an assertion.
             let machine = Machine(ramSize: 0x10000)
             machine.bus.setupMode = false
-            machine.bus.mmu.domains[0][0] = SegmentRegister(origin: 0, limitBytes: 0x10000, access: .readWrite)
+            machine.bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 128, access: .readWrite)
             // Segment 1 (0x2_0000...) and segment 2 (0x4_0000...) are both
-            // left .invalid (the default): segment 1 is the program's
+            // left absent (the default): segment 1 is the program's
             // faulting read target, segment 2 is where the (unmapped)
             // supervisor stack lives.
 

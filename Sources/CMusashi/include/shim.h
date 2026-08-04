@@ -18,4 +18,12 @@ typedef struct {
 /* Install the bus callbacks Musashi's memory macros forward to. */
 void lisa_bus_install(lisa_bus_t bus);
 
+/* Raw value of the Musashi core's internal `stopped` bitfield (m68ki_cpu.stopped).
+ * Bit STOP_LEVEL_STOP (1) means the core executed a STOP instruction (low-power
+ * wait; resumes on interrupt -- not fatal). Bit STOP_LEVEL_HALT (2) means a
+ * double bus fault halted the core (fatal until reset). The two constants are
+ * not exposed in the public m68k.h, so Swift decodes this raw value against
+ * the well-known bit positions (see M68K.swift). */
+unsigned int lisa_cpu_stopped(void);
+
 #endif

@@ -43,28 +43,46 @@ extension MusashiSuites {
         }
 
         @Test
-        func haltedFlagSetWhenCpuReturnsZero() {
-            // Test that halted flag is set when CPU returns 0 cycles (e.g., HALT state)
-            // and that run(until:) returns without hanging.
+        func stopInstructionIsNotFatalHalt() {
+            // MOVEQ #42,D0 ; STOP #$2700 -- STOP is a low-power wait that
+            // resumes on interrupt, not a fatal condition. It must not set
+            // Machine.halted, and run(until:) must return promptly because
+            // Musashi bills the full requested slice against a STOPPED core
+            // (see the "defensive only" comment on Machine.run(until:)).
             let m = Machine(ramSize: 0x10000)
-            // Setup with odd SSP and PC to attempt triggering address error → exception → HALT
-            // SSP (odd): 0x3001, PC (odd): 0x401
-            m.bus.write32(0x0, 0x3001)
-            m.bus.write32(0x4, 0x401)
-            m.bus.load([0x60, 0xFE], at: 0x400)   // BRA.s spin
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.load([0x70, 0x2A, 0x4E, 0x72, 0x27, 0x00], at: 0x400)
             m.reset()
 
-            // This should not hang; halted may or may not be true depending on
-            // whether Musashi actually enters HALT state with this setup.
-            // The important thing is that run(until:) returns.
             m.run(until: 1000)
 
-            // Verify we didn't hang: cycles should be >= 0 and either halted is true
-            // or cycles reached close to target.
-            #expect(m.cycles >= 0)
-            if m.halted {
-                #expect(m.halted == true)  // Explicitly verify halted flag behavior if set
-            }
+            #expect(m.cpu[.d0] == 42)
+            #expect(m.cpu.isStopped == true)
+            #expect(m.halted == false)
+            #expect(m.cycles >= 1000)
+        }
+
+        @Test
+        func doubleFaultProducesFatalHalt() {
+            // Odd SSP (0x3001) and odd PC (0x401): the initial instruction
+            // fetch takes an address error, and writing that exception's
+            // stack frame via the odd SSP takes a second address error
+            // while already processing the first -- a double bus fault,
+            // which Musashi reports as STOP_LEVEL_HALT. This retries the
+            // Task 6 experiment now that M68K_EMULATE_ADDRESS_ERROR is ON
+            // (Task 7), so the first fetch actually faults instead of
+            // silently executing whatever was at the odd address.
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3001)
+            m.bus.write32(0x4, 0x401)
+            m.bus.load([0x60, 0xFE], at: 0x400)   // BRA.s spin (never reached)
+            m.reset()
+
+            m.run(until: 1000)
+
+            #expect(m.halted == true)
+            #expect(m.cpu.isHalted == true)
         }
 
         @Test
@@ -75,6 +93,42 @@ extension MusashiSuites {
             // Even if halted was set somehow, reset should clear it
             m.reset()
             #expect(m.halted == false)
+        }
+
+        @Test
+        func boundedSliceClampsToInt32MaxForFarTargets() {
+            // stop - cycles vastly exceeds Int32.max; the slice must clamp
+            // rather than let `Int32(cycles)` inside M68K.run(cycles:) trap.
+            let cycles: UInt64 = 10
+            let stop = cycles + UInt64(Int32.max) + 1_000
+            #expect(Machine.boundedSlice(from: cycles, to: stop) == Int(Int32.max))
+        }
+
+        @Test
+        func boundedSliceUnchangedForSmallTargets() {
+            #expect(Machine.boundedSlice(from: 0, to: 100) == 100)
+            #expect(Machine.boundedSlice(from: 50, to: 50) == 1)
+            #expect(Machine.boundedSlice(from: 0, to: 1) == 1)
+        }
+
+        @Test
+        func stepAdvancesCyclesAndDrainsDueEvents() {
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            // MOVEQ #42,D0 ; BRA.s spin (self-loop at 0x402)
+            m.bus.load([0x70, 0x2A, 0x60, 0xFE], at: 0x400)
+            m.reset()
+
+            var fired = false
+            m.schedule(at: 1) { _ in fired = true }
+
+            m.step()
+            m.step()
+
+            #expect(m.cpu[.d0] == 42)
+            #expect(m.cycles > 0)
+            #expect(fired == true)
         }
     }
 }

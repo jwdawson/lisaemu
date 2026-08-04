@@ -28,7 +28,7 @@ while let line = readLine(strippingNewline: true) {
     case .regs:
         print(monitor.registerDump())
     case .step(let n):
-        for _ in 0..<n { _ = machine.cpu.step() }
+        for _ in 0..<n { _ = machine.step() }
         print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
     case .disasm(let addr, let n):

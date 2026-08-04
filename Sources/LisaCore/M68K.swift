@@ -103,6 +103,30 @@ public final class M68K {
         Int(m68k_execute(1))
     }
 
+    /// Bit values of Musashi's internal `stopped` field (`m68ki_cpu.stopped`,
+    /// read via the `lisa_cpu_stopped()` shim accessor). Mirrored here
+    /// because the public m68k.h does not expose `STOP_LEVEL_STOP` /
+    /// `STOP_LEVEL_HALT` -- see Sources/CMusashi/m68kcpu.h.
+    private enum StopLevel {
+        static let stop: UInt32 = 1
+        static let halt: UInt32 = 2
+    }
+
+    /// True while the core is idling in a STOP-instruction low-power wait.
+    /// This resumes automatically on interrupt; it is not a fatal
+    /// condition (the Lisa's scheduler idles this way between ticks).
+    public var isStopped: Bool {
+        (lisa_cpu_stopped() & StopLevel.stop) != 0
+    }
+
+    /// True once the core has taken a double bus fault (an address/bus
+    /// error while already processing a bus/address-error/reset
+    /// exception). This is fatal -- the core will not resume without a
+    /// reset, unlike `isStopped`.
+    public var isHalted: Bool {
+        (lisa_cpu_stopped() & StopLevel.halt) != 0
+    }
+
     public subscript(_ reg: Register) -> UInt32 {
         get { m68k_get_reg(nil, reg.musashi) }
         set { m68k_set_reg(reg.musashi, newValue) }

@@ -16,6 +16,16 @@ public final class Bus {
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.
     public var supervisorProvider: () -> Bool = { true }
+    /// Invoked (address, isWrite) whenever `mmu.translate` faults on a real
+    /// access while translation is active (`setupMode == false`) and the
+    /// access is not a `withPeek` peek. `Machine.init` wires this to
+    /// `cpu.pulseBusError(address:isWrite:)`, which raises a genuine
+    /// Musashi 68000 bus-error exception -- but only when the CPU is
+    /// actually inside `m68k_execute` (see `M68K.insideCpuCallback`); calls
+    /// arriving from peeks or direct test/tooling reads are no-ops there.
+    /// Either way, `Bus` itself still records `lastFault` and returns
+    /// 0xFF/drops the write below, exactly as before this handler existed.
+    public var busErrorHandler: ((UInt32, Bool) -> Void)?
     private var peeking = false
     var ram: [UInt8]
 
@@ -36,7 +46,10 @@ public final class Bus {
         switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
         case .success(let p): return Int(p)
         case .failure(let fault):
-            if !peeking { lastFault = fault }
+            if !peeking {
+                lastFault = fault
+                busErrorHandler?(address, isWrite)
+            }
             return nil
         }
     }

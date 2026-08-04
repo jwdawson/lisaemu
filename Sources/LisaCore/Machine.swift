@@ -20,6 +20,9 @@ public final class Machine {
         bus = Bus(ramSize: ramSize)
         cpu = M68K(bus: bus)
         bus.supervisorProvider = { [weak cpu] in cpu?.isSupervisor ?? true }
+        bus.busErrorHandler = { [weak cpu] address, isWrite in
+            cpu?.pulseBusError(address: address, isWrite: isWrite)
+        }
     }
 
     public func reset() {

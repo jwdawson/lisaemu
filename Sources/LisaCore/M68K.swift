@@ -46,6 +46,13 @@ public final class M68K {
     public let bus: Bus
     private let ownerThread = Thread.current
 
+    /// True only while a call into Musashi's `m68k_execute` is live on the
+    /// current C stack -- set immediately before, cleared immediately after,
+    /// in both `run(cycles:)` and `step()`. `pulseBusError(address:isWrite:)`
+    /// refuses to call into Musashi unless this is true; see that method's
+    /// doc comment for why calling outside of `m68k_execute` would be unsafe.
+    private var insideCpuCallback = false
+
     public init(bus: Bus) {
         self.bus = bus
         M68K.currentBus = bus
@@ -101,6 +108,8 @@ public final class M68K {
     @discardableResult
     public func run(cycles: Int) -> Int {
         assertOwner()
+        insideCpuCallback = true
+        defer { insideCpuCallback = false }
         return Int(m68k_execute(Int32(cycles)))
     }
 
@@ -108,7 +117,75 @@ public final class M68K {
     @discardableResult
     public func step() -> Int {
         assertOwner()
+        insideCpuCallback = true
+        defer { insideCpuCallback = false }
         return Int(m68k_execute(1))
+    }
+
+    /// Raises a genuine Musashi 68000 bus-error exception for an MMU
+    /// translation fault. Wired as `Bus.busErrorHandler` by `Machine.init`,
+    /// so `Bus.physical` calls this on every real (non-peek) translation
+    /// failure while `setupMode == false`.
+    ///
+    /// `address`/`isWrite` are accepted to match the `Bus.busErrorHandler`
+    /// shape but are otherwise unused: Musashi's `m68k_pulse_bus_error()`
+    /// takes no arguments, and in this vendored version
+    /// `m68ki_exception_bus_error()` pushes the stack frame via
+    /// `m68ki_stack_frame_1000` (m68kcpu.h:1698), which hardcodes the FAULT
+    /// ADDRESS field to 0 rather than reading `m68ki_aerr_address` -- so
+    /// there is nothing useful to stash into Musashi state first. No
+    /// `m68k_set_reg` or other setup is required before the call.
+    ///
+    /// ## The longjmp mechanism (read m68kcpu.c/.h before touching this)
+    ///
+    /// `m68k_pulse_bus_error()` -> `m68ki_exception_bus_error()`
+    /// (m68kcpu.h:1956) pushes the exception stack frame, redirects PC to
+    /// the bus-error vector (vector 2, address `VBR + 8`), and then performs
+    /// a synchronous C `longjmp(m68ki_bus_error_jmp_buf, 1)`
+    /// (m68kcpu.h:1988) -- it does **not** return to its caller. The
+    /// matching `setjmp` lives at the top of `m68k_execute`, inside the
+    /// *same* C call (`m68ki_check_bus_error_trap()`, m68kcpu.c:982,
+    /// discarding the setjmp return value and falling into the main
+    /// instruction loop either way). So the longjmp unwinds every frame
+    /// between here and that setjmp point -- this function, the
+    /// `busErrorHandler` closure, `Bus.physical`/`read8`/`write8`, and the
+    /// `@convention(c)` `cbus.read8`/`write8` trampolines installed in
+    /// `init` above, down through shim.c's `m68k_read_memory_8` /
+    /// `m68k_write_memory_8` and Musashi's inline memory-access macros --
+    /// but it lands back inside the *same* `m68k_execute()` C call that our
+    /// `run(cycles:)`/`step()` invoked, which then continues its do-while
+    /// loop from the new PC and returns to Swift normally once its cycle
+    /// budget is exhausted. Callers of `run`/`step` see nothing unusual.
+    ///
+    /// None of the unwound frames may run cleanup code after being skipped
+    /// this way: the trampolines in `init` are single-expression closures
+    /// with no `defer` and no local allocations, `Bus.physical`/`read8`/
+    /// `write8` have no `defer` either, so there is nothing for the longjmp
+    /// to skip past unsafely (a leaked ARC retain on `M68K.currentBus!`'s
+    /// temporary would be the worst case, harmless for a process-lifetime
+    /// singleton). This mirrors the pre-existing address-error longjmp path
+    /// (`m68ki_aerr_trap`, guarded by the local BSD sigsetjmp cycle-check
+    /// patch documented in m68kcpu.h) that this codebase already relies on
+    /// and has validated against the TomHarte suite -- bus error and
+    /// address error are two different jmp_buf families reusing the same
+    /// "longjmp back into the top of m68k_execute" mechanism.
+    ///
+    /// Because the target `jmp_buf` is only valid while `m68k_execute` is
+    /// live on the stack, calling `m68k_pulse_bus_error()` from outside a
+    /// CPU-driven memory access (e.g. `Monitor` peeks, or a test calling
+    /// `bus.read8` directly) would longjmp into a stack frame that no
+    /// longer exists -- undefined behavior, not a clean no-op. `Bus` only
+    /// invokes `busErrorHandler` for non-peek faults, but that alone is not
+    /// enough (direct/tooling reads outside CPU execution are also
+    /// non-peek), so this method additionally guards on
+    /// `insideCpuCallback`, which is only true while `run`/`step` has an
+    /// `m68k_execute` call live. Faulting still records `Bus.lastFault` and
+    /// returns 0xFF/drops the write regardless -- that bookkeeping lives in
+    /// `Bus.physical` and happens whether or not this method actually
+    /// pulses Musashi.
+    public func pulseBusError(address: UInt32, isWrite: Bool) {
+        guard insideCpuCallback else { return }
+        m68k_pulse_bus_error()
     }
 
     /// Bit values of Musashi's internal `stopped` field (`m68ki_cpu.stopped`,

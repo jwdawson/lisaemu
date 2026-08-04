@@ -5,7 +5,15 @@ let args = CommandLine.arguments
 guard args.count >= 2 else {
     print("usage: lisadbg <binary> [hex-load-address]"); exit(2)
 }
-let data = try Data(contentsOf: URL(fileURLWithPath: args[1]))
+
+let data: Data
+do {
+    data = try Data(contentsOf: URL(fileURLWithPath: args[1]))
+} catch {
+    FileHandle.standardError.write("lisadbg: cannot read \(args[1]): \(error.localizedDescription)\n".data(using: .utf8) ?? Data())
+    exit(1)
+}
+
 let loadAddr = args.count > 2 ? UInt32(args[2], radix: 16) ?? 0 : 0
 
 let machine = Machine()

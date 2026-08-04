@@ -42,6 +42,40 @@ func ioAnnotation(_ offset: UInt32) -> String? {
     }
 }
 
+/// Decodes a SLIM (limit/access) or SORG (origin) MMU register value the way
+/// `MMU.translate`/`do_an_mmu` do (docs/hardware-notes.md §1), for the trace.
+func decodeMMUValue(isSorg: Bool, value: UInt16) -> String {
+    if isSorg {
+        let originPage = value & 0xFFF
+        let physBase = UInt32(originPage) << 9
+        return "origin page $\(String(format: "%03X", originPage)) -> phys $\(String(format: "%06X", physBase))"
+    }
+    let nibble = (value >> 8) & 0xF
+    let limitByte = Int(value & 0xFF)
+    let access: String
+    switch nibble {
+    case 0x5: access = "readOnly"
+    case 0x6: access = "stack"
+    case 0x7: access = "readWrite"
+    case 0x8: access = "io"
+    case 0xC: access = "absent"
+    default:  access = "nibble$\(String(nibble, radix: 16))"
+    }
+    let pages: String
+    if nibble == 0x6 {
+        pages = "\(limitByte + 1) pages (stack)"
+    } else {
+        let raw = (0x100 - limitByte) & 0xFF
+        pages = "\(raw == 0 ? 256 : raw) pages"
+    }
+    return "access $\(String(nibble, radix: 16)) (\(access)), limit \(pages)"
+}
+
+func formatMMUPortWrite(_ e: (domain: Int, segment: Int, isSorg: Bool, value: UInt16, cycles: UInt64)) -> String {
+    let reg = e.isSorg ? "SORG" : "SLIM"
+    return "      mmu dom\(e.domain) seg\(e.segment) \(reg)=$\(String(format: "%03X", e.value))  [\(decodeMMUValue(isSorg: e.isSorg, value: e.value))]"
+}
+
 func formatIOAccess(_ access: IOAccess) -> String {
     let offsetStr = String(format: "%06X", access.offset)
     let rw = access.isWrite ? "W" : "R"
@@ -105,17 +139,40 @@ while let line = readLine(strippingNewline: true) {
         for _ in 0..<n {
             guard !machine.halted else { break }
             print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
-            let before = machine.bus.ioTrace.count
+            let beforeIO = machine.bus.ioTrace.count
+            let beforeMMU = machine.bus.mmuPortLog.count
             _ = machine.step()
-            for access in machine.bus.ioTrace[before...] {
+            for e in machine.bus.mmuPortLog[beforeMMU...] {
+                print(formatMMUPortWrite(e))
+            }
+            for access in machine.bus.ioTrace[beforeIO...] {
                 print(formatIOAccess(access))
             }
         }
+        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites)")
+        print(monitor.registerDump())
+    case .go(let n):
+        // Run n cycles quietly, then dump SLIM/SORG writes + I/O touches that
+        // happened during the slice (deduped/summarized), plus final state.
+        let beforeIO = machine.bus.ioTrace.count
+        let beforeMMU = machine.bus.mmuPortLog.count
+        let target = machine.cycles + UInt64(n)
+        machine.run(until: target)
+        print("--- MMU port writes this slice ---")
+        for e in machine.bus.mmuPortLog[beforeMMU...] {
+            print(formatMMUPortWrite(e))
+        }
+        print("--- I/O touches this slice ---")
+        for access in machine.bus.ioTrace[beforeIO...] {
+            print(formatIOAccess(access))
+        }
+        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) halted=\(machine.halted)")
+        print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | q")
     case nil:
         print("? — unknown command")
     }

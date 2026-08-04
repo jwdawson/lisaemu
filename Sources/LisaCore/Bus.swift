@@ -24,6 +24,19 @@ public final class Bus {
     /// per high-byte (i.e. per 16-bit register) write, not once per byte --
     /// see the doc comment on `slimSorgPortAccess`.
     public private(set) var mmuPortWrites = 0
+    /// Diagnostic log of completed SLIM/SORG MMU-port *writes* (M1a Task 7,
+    /// permitted instrumentation -- this is a debug trace, not device
+    /// behavior). One entry is appended per completed 16-bit register write
+    /// (logged on the low-byte lane, by which point the full 16-bit value the
+    /// ROM's `MOVE.W` deposited is present), capturing which `domain` was
+    /// latched, which 128KB `segment` block the port addressed
+    /// (`addr >> 17`), whether it was `SORG` (`$8008`) vs SLIM (`$8000`), the
+    /// complete 12-bit-masked register `value`, and the `cycles` stamp. Bounded
+    /// to 4096 entries; `mmuPortLogDropped` counts overflow. Consumed by
+    /// `lisadbg`'s `t`/`g` trace commands and `ROMBootTests`.
+    public private(set) var mmuPortLog: [(domain: Int, segment: Int, isSorg: Bool, value: UInt16, cycles: UInt64)] = []
+    public private(set) var mmuPortLogDropped = 0
+    private static let mmuPortLogLimit = 8192
     /// Cycle stamp for `IOAccess.cycles`; `Machine.init` wires this to
     /// `Machine.cycles`. Defaults to a constant 0 for bare `Bus` use (e.g.
     /// these tests), matching `supervisorProvider`/`busErrorHandler`'s
@@ -170,7 +183,20 @@ public final class Bus {
                     reg = (reg & 0xFF00) | UInt16(value)
                 }
                 if isSlim { mmu.domains[domain][seg].slim = reg } else { mmu.domains[domain][seg].sorg = reg }
-                if isHighByte { mmuPortWrites += 1 }
+                if isHighByte {
+                    mmuPortWrites += 1
+                } else {
+                    // Low-byte lane: the 16-bit register now holds the full
+                    // value the ROM's MOVE.W deposited (high byte written
+                    // first). Log the completed write for the Task 7 trace.
+                    // Store the 12-bit-masked value actually latched.
+                    let full = isSlim ? mmu.domains[domain][seg].slim : mmu.domains[domain][seg].sorg
+                    if mmuPortLog.count < Self.mmuPortLogLimit {
+                        mmuPortLog.append((domain: domain, segment: seg, isSorg: !isSlim, value: full, cycles: cycleProvider()))
+                    } else {
+                        mmuPortLogDropped += 1
+                    }
+                }
             }
             return value
         } else {

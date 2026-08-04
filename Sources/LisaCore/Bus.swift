@@ -7,6 +7,17 @@ public final class Bus {
     /// `_setSetupModeForTesting` is the internal escape hatch both that
     /// latch and test suites use.
     public private(set) var setupMode = true
+    /// CPU-conformance testing only -- bypasses ALL Lisa routing; every
+    /// address is RAM. `Bus.access` checks this first, before `setupMode`
+    /// or anything else: the TomHarte/ProcessorTests vectors (`TomHarteTests`)
+    /// construct a flat 16MB `Bus` and expect every one of those 16M
+    /// addresses to behave as plain bounds-checked RAM, including the
+    /// $FC0000-$FDFFFF I/O window, the $FE0000-$FE3FFF ROM window, and the
+    /// 512 SLIM/SORG MMU port bytes -- none of which are part of what the
+    /// 68000 conformance suite is testing. Left `false` (default) for every
+    /// other caller, which gets the real M1a memory map below. `internal`,
+    /// not `public`: this is a test-harness escape hatch, not API.
+    internal var flatConformanceMode = false
     public var mmu = MMU()
     private var _domain = 0
     public var domain: Int {
@@ -209,6 +220,10 @@ public final class Bus {
     /// resulting byte (meaningful for reads; writes ignore it). This is the
     /// single place that implements the whole M1a memory map:
     ///
+    /// 0. `flatConformanceMode`, checked first: bypasses everything below,
+    ///    every address is bounds-checked RAM. See that property's doc
+    ///    comment.
+    ///
     /// While `setupMode == true` (flat physical addressing, no MMU):
     ///   1. SLIM/SORG ports (any segment block, see `slimSorgPortAccess`).
     ///   2. ROM window `$FE0000-$FE3FFF` (reads only -- writes ignored+logged).
@@ -244,6 +259,10 @@ public final class Bus {
     ///   - `.fault`: unchanged bus-error path.
     private func access(_ address: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
         let a = address & 0xFF_FFFF
+
+        if flatConformanceMode {
+            return ramAccess(address, Int(a), isWrite: isWrite, value: value)
+        }
 
         if setupMode {
             if let byte = slimSorgPortAccess(a, isWrite: isWrite, value: value) {

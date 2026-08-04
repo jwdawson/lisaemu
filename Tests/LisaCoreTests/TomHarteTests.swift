@@ -98,6 +98,7 @@ extension MusashiSuites {
                 for c in cases {
                     if knownFailures.contains(c.name) { skipped += 1; continue }
                     let bus = Bus(ramSize: 1 << 24)     // flat 16 MB, setup mode
+                    bus.flatConformanceMode = true      // bypass M1a routing -- every address is RAM (see Bus.flatConformanceMode)
                     let cpu = M68K(bus: bus)
                     apply(c.initial, to: cpu, bus: bus)
                     _ = cpu.step()

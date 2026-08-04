@@ -48,6 +48,12 @@ Source: OS/source-MMPRIM.TEXT.unix.txt:97-101, OS/source-PASCALDEFS.TEXT.unix.tx
 - mmuio = $8
 - mmuabsent = $C
 
+Additionally observed programmed by the Rev H boot ROM (see
+rom-trace-notes.md); not present in the OS source's constant set --
+decode semantics to be implemented in M1b:
+- $9 = iospace (seg126 SLIM=$901, programmed at $FE0118)
+- $F = prom/special (seg127 SLIM=$F00, programmed at $FE0120)
+
 ### Software Segment Map Table (SMT) Entry
 
 Source: OS/source-MMPRIM.TEXT.unix.txt:268-274, OS/source-LDASM.TEXT.unix.txt:139

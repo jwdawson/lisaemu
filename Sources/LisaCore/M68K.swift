@@ -202,7 +202,18 @@ public final class M68K {
     /// directly rather than pulsing a second bus error into Musashi.
     /// `Machine.run(until:)`/`step()` already surface `isHalted` as
     /// `Machine.halted`, so no further wiring is needed here.
+    ///
+    /// Guarded on `insideCpuCallback` for the same reason as
+    /// `pulseBusError(address:isWrite:)` above: `Bus.forceHaltHandler` is
+    /// invoked for any consecutive-fault shape on a non-peek access, which
+    /// includes direct/tooling reads made outside `run`/`step` (e.g. two
+    /// back-to-back faulting `bus.read8` calls from a test or the
+    /// `Monitor`). Calling into Musashi's C core with no CPU access live
+    /// would touch process-global state with no corresponding
+    /// `m68k_execute` on the stack, which is unsafe for the same reasons
+    /// pulsing a bus error outside `m68k_execute` is.
     public func forceHalt() {
+        guard insideCpuCallback else { return }
         lisa_cpu_force_halt()
     }
 

@@ -2,6 +2,7 @@ public final class Machine {
     public let bus: Bus
     public let cpu: M68K
     public private(set) var cycles: UInt64 = 0
+    public private(set) var halted = false
 
     private struct Event {
         let cycle: UInt64
@@ -19,6 +20,7 @@ public final class Machine {
     public func reset() {
         cpu.reset()
         cycles = 0
+        halted = false
         queue.removeAll()
     }
 
@@ -33,7 +35,12 @@ public final class Machine {
         while cycles < targetCycle {
             let stop = min(targetCycle, queue.first?.cycle ?? targetCycle)
             let slice = max(1, Int(stop - cycles))
-            cycles &+= UInt64(cpu.run(cycles: slice))
+            let executed = cpu.run(cycles: slice)
+            if executed == 0 {
+                halted = true
+                return
+            }
+            cycles &+= UInt64(executed)
             while let first = queue.first, first.cycle <= cycles {
                 queue.removeFirst()
                 first.action(self)

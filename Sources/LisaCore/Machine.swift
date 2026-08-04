@@ -23,6 +23,7 @@ public final class Machine {
         bus.busErrorHandler = { [weak cpu] address, isWrite in
             cpu?.pulseBusError(address: address, isWrite: isWrite)
         }
+        bus.forceHaltHandler = { [weak cpu] in cpu?.forceHalt() }
     }
 
     public func reset() {

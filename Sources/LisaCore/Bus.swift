@@ -26,7 +26,34 @@ public final class Bus {
     /// Either way, `Bus` itself still records `lastFault` and returns
     /// 0xFF/drops the write below, exactly as before this handler existed.
     public var busErrorHandler: ((UInt32, Bool) -> Void)?
+    /// Invoked (no arguments) when a translated CPU access faults while a
+    /// *previous* fault's exception frame is still being pushed -- i.e. no
+    /// successful translated access happened between the two faults. That
+    /// shape means the fault occurred while Musashi was writing the
+    /// bus-error exception's own stack frame (vector fetch + pushes), which
+    /// on real 68000 hardware is a double bus fault: fatal, and the CPU
+    /// halts rather than taking another exception. `Machine.init` wires
+    /// this to `cpu.forceHalt()`.
+    ///
+    /// This exists because pulsing a *second* bus error into Musashi here
+    /// would be unsafe, not just redundant: `m68ki_exception_bus_error`'s
+    /// "already processing a bus/address error" branch
+    /// (`RUN_MODE_BERR_AERR_RESET_WSF`) itself performs a live bus read
+    /// (`m68k_read_memory_8(0x00ffff01)`) *before* it sets `CPU_STOPPED` --
+    /// so if the supervisor stack is unmapped (a routine early-boot state
+    /// before the OS has set up its stack segment), that read faults too,
+    /// re-entering this same path with no base case. Detecting the
+    /// consecutive-fault condition in Swift and halting directly (via the
+    /// `lisa_cpu_force_halt` shim, not another pulse) avoids ever taking
+    /// that recursive branch.
+    public var forceHaltHandler: (() -> Void)?
     private var peeking = false
+    /// True from the moment a translated CPU access faults and pulses a
+    /// bus error, until either a translated access succeeds (exception
+    /// stacking completed -- the CPU is now cleanly executing the handler)
+    /// or another fault arrives first (exception stacking itself faulted --
+    /// a double bus fault). See `forceHaltHandler`.
+    private var faultPendingResolution = false
     var ram: [UInt8]
 
     public init(ramSize: Int) {
@@ -44,14 +71,33 @@ public final class Bus {
         let a = address & 0xFF_FFFF
         guard !setupMode else { return Int(a) }
         switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
-        case .success(let p): return Int(p)
+        case .success(let p):
+            if !peeking { faultPendingResolution = false }
+            return Int(p)
         case .failure(let fault):
             if !peeking {
                 lastFault = fault
-                busErrorHandler?(address, isWrite)
+                if faultPendingResolution {
+                    // A fault arrived with no successful access since the
+                    // previous one pulsed -- exception stacking for that
+                    // prior fault never completed. Real double bus fault:
+                    // halt, don't pulse again (see forceHaltHandler).
+                    forceHaltHandler?()
+                } else {
+                    faultPendingResolution = true
+                    busErrorHandler?(address, isWrite)
+                }
             }
             return nil
         }
+    }
+
+    /// Clears the consecutive-fault tracking used by `forceHaltHandler`.
+    /// Called by `M68K.run(cycles:)`/`step()` at the start of each CPU
+    /// slice, belt-and-suspenders alongside `insideCpuCallback`, so stale
+    /// state from a previous slice can never bleed into the next one.
+    func resetFaultTracking() {
+        faultPendingResolution = false
     }
 
     public func load(_ bytes: [UInt8], at address: UInt32) {

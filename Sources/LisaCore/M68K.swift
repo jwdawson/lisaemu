@@ -51,6 +51,11 @@ public final class M68K {
     /// in both `run(cycles:)` and `step()`. `pulseBusError(address:isWrite:)`
     /// refuses to call into Musashi unless this is true; see that method's
     /// doc comment for why calling outside of `m68k_execute` would be unsafe.
+    /// Deliberately *not* set around `m68k_pulse_reset()` in `reset()`
+    /// below: its SSP/PC vector reads happen before any `m68k_execute` call
+    /// establishes the bus-error `setjmp` context, so a fault during reset
+    /// must stay a silent 0xFF read (via `pulseBusError`'s guard), never a
+    /// pulse -- there is no live jmp_buf to longjmp into yet.
     private var insideCpuCallback = false
 
     public init(bus: Bus) {
@@ -109,6 +114,7 @@ public final class M68K {
     public func run(cycles: Int) -> Int {
         assertOwner()
         insideCpuCallback = true
+        bus.resetFaultTracking()
         defer { insideCpuCallback = false }
         return Int(m68k_execute(Int32(cycles)))
     }
@@ -118,6 +124,7 @@ public final class M68K {
     public func step() -> Int {
         assertOwner()
         insideCpuCallback = true
+        bus.resetFaultTracking()
         defer { insideCpuCallback = false }
         return Int(m68k_execute(1))
     }
@@ -186,6 +193,17 @@ public final class M68K {
     public func pulseBusError(address: UInt32, isWrite: Bool) {
         guard insideCpuCallback else { return }
         m68k_pulse_bus_error()
+    }
+
+    /// Forces Musashi's core into the fatal HALT stop level (`STOP_LEVEL_HALT`),
+    /// the same terminal state a real double bus fault produces. Wired as
+    /// `Bus.forceHaltHandler` by `Machine.init`; see that property's doc
+    /// comment for why `Bus` detects a double-fault shape itself and halts
+    /// directly rather than pulsing a second bus error into Musashi.
+    /// `Machine.run(until:)`/`step()` already surface `isHalted` as
+    /// `Machine.halted`, so no further wiring is needed here.
+    public func forceHalt() {
+        lisa_cpu_force_halt()
     }
 
     /// Bit values of Musashi's internal `stopped` field (`m68ki_cpu.stopped`,

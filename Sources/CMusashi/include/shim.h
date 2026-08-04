@@ -32,4 +32,16 @@ unsigned int lisa_cpu_stopped(void);
  * specific bit pattern, since Musashi stores the flag pre-shifted. */
 unsigned int lisa_cpu_supervisor(void);
 
+/* Force the core into the fatal HALT stop level (sets STOP_LEVEL_HALT in
+ * m68ki_cpu.stopped), the same terminal state a real double bus fault
+ * produces. Used by Bus's consecutive-fault detection: a translated CPU
+ * access that faults while a previous fault's exception stack frame is
+ * still being pushed (i.e. no successful access happened in between) is a
+ * real 68000 double-fault condition, but pulsing a second bus error into
+ * Musashi's WSF "catastrophic failure" branch (m68ki_exception_bus_error)
+ * itself performs a live bus access before setting CPU_STOPPED, which would
+ * recurse back into the same fault and never terminate -- so we halt
+ * directly instead of pulsing again. See M68K.forceHalt(). */
+void lisa_cpu_force_halt(void);
+
 #endif

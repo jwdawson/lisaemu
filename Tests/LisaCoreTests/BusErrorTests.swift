@@ -29,5 +29,43 @@ extension MusashiSuites {
             #expect(machine.cpu[.d1] == 99)
             #expect(machine.bus.lastFault?.reason == .invalidSegment)
         }
+
+        @Test func doubleBusFaultDuringExceptionStackingHalts() {
+            // Same fault as above (absolute-long read of an absent segment
+            // 1), but the supervisor stack pointer itself points into a
+            // second absent segment. When the MOVE.B fault pulses a bus
+            // error, Musashi tries to push the exception stack frame
+            // through that unmapped SSP -- a fault while stacking a fault
+            // is a genuine 68000 *double* bus fault. Real hardware halts
+            // rather than taking yet another exception; Bus's
+            // consecutive-fault tracking must reproduce that (via
+            // forceHaltHandler) instead of pulsing Musashi a second time,
+            // which would recurse into `m68ki_exception_bus_error`'s
+            // "already stacking" branch -- itself a live bus access
+            // (`m68k_read_memory_8(0x00ffff01)`) performed *before*
+            // `CPU_STOPPED` is set, so an unguarded second pulse recurses
+            // without a base case and crashes the process (SIGBUS/stack
+            // overflow), not merely fails an assertion.
+            let machine = Machine(ramSize: 0x10000)
+            machine.bus.setupMode = false
+            machine.bus.mmu.domains[0][0] = SegmentRegister(origin: 0, limitBytes: 0x10000, access: .readWrite)
+            // Segment 1 (0x2_0000...) and segment 2 (0x4_0000...) are both
+            // left .invalid (the default): segment 1 is the program's
+            // faulting read target, segment 2 is where the (unmapped)
+            // supervisor stack lives.
+
+            machine.bus.write32(0x0, 0x40000)  // initial SSP -- unmapped (segment 2)
+            machine.bus.write32(0x4, 0x400)    // initial PC
+
+            // Program: MOVE.B $20000,D0 (absolute-long read of absent segment 1)
+            // then NOP.
+            machine.bus.load([0x10, 0x39, 0x00, 0x02, 0x00, 0x00, 0x4E, 0x71], at: 0x400)
+
+            machine.reset()
+            machine.run(until: 500)   // must return promptly -- no crash, no hang
+
+            #expect(machine.halted == true)
+            #expect(machine.cpu.isHalted == true)
+        }
     }
 }

@@ -1,0 +1,168 @@
+# LisaEmu — Apple Lisa 2/10 Emulator Design
+
+**Date:** 2026-08-03
+**Status:** Approved design, pre-implementation
+**Author:** jdawson + Claude
+
+## Purpose and goals
+
+A from-scratch Apple Lisa emulator built primarily for **learning** — to deeply
+understand the Lisa hardware and the Lisa OS 3.1 source code released by Apple/CHM
+(local copy at `~/Development/Lisa_Source`). Existing emulators (LisaEm, MAME,
+IDLE) are references and cross-check oracles, not competitors.
+
+**North star:** boot from power-on through the real Rev H boot ROM and Lisa OS 3.1
+to the Office System desktop, with working mouse, keyboard, and clock.
+
+**Secondary product:** a debugger that makes the Lisa OS source *legible while
+running* — MMU domain inspection and symbol overlay from the shipped Linkmaps.
+
+## Decisions (fixed)
+
+| Decision | Choice |
+|---|---|
+| Target machine | Lisa 2/10 (Sony 400K floppy + internal Widget HD) first |
+| Language / platform | Swift, native macOS app |
+| 68000 core | Wrap Musashi (C) via an SPM C target; Swift core possible later behind the same interface |
+| Peripheral sub-CPUs (COPS421, 6504 floppy, Widget controller) | **Staged hybrid**: behavioral (HLE) implementations first behind stable `Device` interfaces; low-level (LLE) replacements as later projects |
+| Disk image formats | DC42 and raw sector images (with tags) natively; flux formats (A2R) converted offline with Applesauce tooling |
+| Project location | `~/Development/LisaEmu`, its own git repo, separate from the licensed source dump |
+
+## External prerequisites (not in this repo, not redistributable)
+
+From `https://www.bitsavers.org/bits/Apple/Lisa/`:
+
+- `firmware/REV_H_BOOT_SOURCE_1/2.IMAGE` — Rev H boot ROM (+ its source listing, used as a debugging oracle)
+- `firmware/342-0172A_IO_28L22_U48.BIN` — I/O board ROM
+- `firmware/COP421-HZT_LisaIO.zip` — COPS ROM dump (only needed for the future LLE COPS stage)
+- `office_3.x/Lisa_Office_System_3.1.7z` — OS 3.1 install disks (convert to DC42 if flux-format)
+- `workshop_3.0/` — Workshop toolchain (stretch milestone)
+
+The Lisa Hardware Reference Manual (bitsavers PDFs) is the authority for exact
+register addresses, bit layouts, and video timing. **This spec commits to
+structure, not to numeric constants from memory** — all constants get sourced
+from the manual or the boot ROM listing during implementation.
+
+License note: the OS source tree is under Apple's academic license (no
+redistribution); ROMs/disk images are personal-study material. The emulator's own
+code is ours, but we never bundle ROMs, images, or Apple source with it.
+
+## §1 Architecture
+
+Two layers:
+
+- **`LisaCore`** — pure Swift package, no UI dependencies.
+  - `CMusashi` — C target wrapping Musashi; small shim routes Musashi's memory
+    callbacks into the bus.
+  - `Machine` — owns everything; single-threaded core loop driven by one master
+    clock (CPU cycles @ 5 MHz). Runs CPU until the next scheduled event, then
+    dispatches from a cycle-stamped event queue (vsync, VIA timers, device
+    completion interrupts). No per-device threads; determinism over parallelism.
+  - `Bus` — memory map. Every access: Musashi callback → MMU translate (logical →
+    physical + access check, per current domain) → RAM / ROM / framebuffer /
+    device dispatch.
+  - `Device` protocol — `read(addr)`, `write(addr, value)`, `tick(event)`, reset,
+    IRQ plumbing, and snapshotable state. The HLE↔LLE swap seam.
+- **`LisaApp`** — SwiftUI macOS app. Framebuffer view (vImage 1-bit expansion
+  into a CGImage, aspect-corrected; Metal only if profiling ever demands it),
+  keyboard/mouse capture → COPS events, menus for
+  power/reset/disk images. Emulation runs on its own thread; UI↔core
+  communication via input-event queue in, frames + status out.
+
+## §2 MMU and memory map
+
+The MMU is built first and sits in the bus path from day one.
+
+- 24-bit logical space ÷ **128 segments × 128 KB** (matches `maxmmusize = 131072`
+  in the OS memory manager). Top 7 address bits select the segment register pair.
+- **4 domains** (register sets). OS = domain 0; users = 1–3. Domain selected by
+  the two context bits the OS writes at `$FCE008–$FCE00E`
+  (`Lisa_Source/LISA_OS/OS/source-starasm1.text.unix.txt:234-256`).
+- Per segment: **SOR** (origin) + **SLR** (limit + access type): read/write RAM,
+  read-only, **stack** (grows down, limit-checked — backs the OS `ds_stack`
+  segments), memory-mapped I/O, invalid.
+- Violations assert **bus error** → `m68k_pulse_bus_error`. This path is
+  first-class: the OS uses faults for protection and swap-in.
+- **Setup mode** at reset: translation bypassed, boot ROM visible at address 0
+  for reset vectors; ROM programs MMU then leaves setup mode. Modeled as a bus
+  flag.
+- Swift shape: `struct MMU` with 4 × 128 segment registers and a pure
+  `translate(logical, domain, isSupervisor, isWrite) -> PhysicalAccess | Fault`.
+  No caching until profiling demands it.
+- Physical targets: RAM (≤ 2 MB; parity modeled always-good initially), 16 KB
+  boot ROM, framebuffer (ordinary RAM, base set by video address latch, 32 KB
+  for 720×364×1bpp), I/O space (devices below + MMU/system control registers).
+
+## §3 Devices
+
+- **Video** — passive scanout + **vertical-retrace interrupt** (~60 Hz; exact
+  timing from the manual). Vsync event: raise IRQ, snapshot framebuffer to UI.
+- **2 × 6522 VIA** — full register-accurate implementation (timers, IFR/IER,
+  ports, shift register). Cheap "LLE" — it is a chip, not a CPU — and both COPS
+  and Widget/parallel hang off VIAs.
+- **COPS (HLE)** — byte-protocol endpoint behind its VIA: keyboard make/break
+  codes, mouse deltas, RTC (host-time backed), power/reset events. LLE-from-ROM
+  is a future stage.
+- **Floppy controller (HLE)** — models the 6504's observable behavior: commands
+  via shared RAM (per the 68000-side protocol in `source-twiggy`/`SOURCE-SONY`:
+  clamp/format/eject, per-drive status bits, completion interrupts), plausible
+  completion delays (OS timeouts), serves 512-byte sectors **+ tag bytes** from
+  DC42/raw images. Tags are mandatory: Lisa FS block labels (Scavenger fodder)
+  live there.
+- **Widget HD (HLE)** — ProFile-family block protocol (read/write/spare, status
+  bytes) over a 10 MB image file. Boot volume for OS 3.1; retry/status semantics
+  exercised by `source-PROFILE` logic.
+- **SCC (Z8530)** — register-level stub first (satisfy ROM/OS probes); later
+  bridged to host PTYs (LisaTerminal, LisaBug serial console).
+- **System glue** — interrupt priority encoder to 68000 levels, parity-error
+  latch (inert initially), power/config latches, **serial-number PROM**
+  (synthesized valid serial; OS reads machine ID — FS stores it for theft
+  protection).
+
+## §4 App shell and debugger
+
+**Shell (thin):** one window — framebuffer, status strip (power, disk activity,
+speed), menus (power on/off via COPS, reset, insert/eject floppy, choose Widget
+image). Speed toggle (real-time vs unthrottled). Drag-and-drop disk images.
+Deferred: sound, full-screen, config UI.
+
+**Debugger (bring-up tool from day one),** separate window:
+
+- CPU + disassembly (Musashi dasm): pause, step, step-over, run-to, breakpoints.
+- Memory viewer: physical or per-domain logical views.
+- MMU inspector: live 4 × 128 decoded segment table, current domain highlighted.
+- **Symbols: load `Lisa_Source/LISA_OS/Linkmaps 3.0` maps** → names in
+  disassembly, break on `SCHEDULER.SelectProcess` by name.
+- I/O trace: filterable device register + interrupt log.
+- **Whole-machine snapshot save/restore** (forces clean device state ownership;
+  turns 90-second boots into instant repro).
+
+Not building: scripting, remote debug protocol, rewind.
+
+## §5 Testing and milestones
+
+Oracles per layer:
+
+- **CPU/shim:** TomHarte/ProcessorTests 68000 JSON vectors run through the full
+  Musashi + shim + bus stack.
+- **MMU:** exhaustive unit tests (translation, limits, stack grow-down, domain
+  isolation, setup mode, supervisor checks).
+- **VIA:** datasheet-driven unit tests.
+- **HLE devices:** protocol tests (command in shared RAM → sectors + tags +
+  completion IRQ; Widget status/retry sequences).
+- **Integration:** boot ROM POST (failure codes map to the ROM source listing);
+  OS `SYSTEM_ERROR` codes map to the OS source. Cross-check LisaEm/MAME when
+  stuck.
+- **Regression:** headless boot from snapshot + framebuffer-hash checkpoints.
+
+Milestones (each a demo):
+
+1. **M0 Scaffold** — SPM builds; Musashi runs test code from emulated RAM;
+   debugger shows disasm + registers.
+2. **M1 Self-test** — real boot ROM passes POST, draws boot menu (MMU, video,
+   VIAs, COPS basics, vsync). Most unknowns die here.
+3. **M2 Floppy boot** — install disk loads; kernel starts (watch with symbols).
+4. **M3 Widget** — install OS 3.1 onto Widget image in-emulator; boot from HD.
+5. **M4 Desktop ⭐** — mouse/keyboard/clock live; Office System desktop.
+6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
+   rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

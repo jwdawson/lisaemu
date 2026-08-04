@@ -43,3 +43,43 @@ import Testing
     #expect(bus.unmappedAccesses.contains(0x1000))
     #expect(bus.unmappedAccesses.contains(0x1001))
 }
+
+@Test func unmappedAccessListIsBounded() {
+    let bus = Bus(ramSize: 0x100)
+    for i in 0..<1500 { _ = bus.read8(0x80_0000 + UInt32(i)) }
+    #expect(bus.unmappedAccesses.count == 1024)
+    #expect(bus.unmappedDropped == 1500 - 1024)
+}
+
+@Test func peekSuppressesDiagnostics() {
+    let bus = Bus(ramSize: 0x100)
+    let v = bus.withPeek { bus.read8(0x80_0000) }
+    #expect(v == 0xFF)
+    #expect(bus.unmappedAccesses.isEmpty)
+}
+
+@Test func domainSetterValidates() {
+    let bus = Bus(ramSize: 0x100)
+    // Valid domains 0-3 should work
+    for domain in 0...3 {
+        bus.domain = domain
+        #expect(bus.domain == domain)
+    }
+    // Invalid domain should trap (not tested, as precondition is debug-only)
+}
+
+@Test func peekSuppressesLastFaultInTranslatedPath() {
+    let bus1 = Bus(ramSize: 0x100)
+    bus1.setupMode = false  // Enable MMU translation
+    // Read from unmapped location outside withPeek — should record fault
+    _ = bus1.read8(0x1000)
+    let faultRecorded = bus1.lastFault != nil
+
+    let bus2 = Bus(ramSize: 0x100)
+    bus2.setupMode = false  // Enable MMU translation
+    // Same address read inside withPeek — should NOT record fault
+    _ = bus2.withPeek { bus2.read8(0x1000) }
+    let faultSuppressed = bus2.lastFault == nil
+
+    #expect(faultRecorded && faultSuppressed)
+}

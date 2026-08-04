@@ -1,6 +1,7 @@
 #!/bin/bash
 # Vendors Musashi into Sources/CMusashi. Requires network + a C compiler.
 # Re-runnable; overwrites previously vendored files.
+# By default pins to the commit in MUSASHI_COMMIT.txt; pass --latest to update.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/Sources/CMusashi"
@@ -9,8 +10,22 @@ trap 'rm -rf "$TMP"' EXIT
 
 mkdir -p "$DEST"
 
-git clone --depth 1 https://github.com/kstenerud/Musashi.git "$TMP/musashi"
-git -C "$TMP/musashi" rev-parse HEAD > "$DEST/MUSASHI_COMMIT.txt"
+LATEST=false
+if [[ "${1:-}" == "--latest" ]]; then
+    LATEST=true
+fi
+
+if [[ "$LATEST" == "false" && -f "$DEST/MUSASHI_COMMIT.txt" ]]; then
+    # Pin to recorded commit by fetching it specifically (can't use --depth 1 for old commits)
+    COMMIT="$(cat "$DEST/MUSASHI_COMMIT.txt")"
+    git clone https://github.com/kstenerud/Musashi.git "$TMP/musashi"
+    git -C "$TMP/musashi" fetch --depth 1 origin "$COMMIT"
+    git -C "$TMP/musashi" checkout FETCH_HEAD
+else
+    # Clone latest (--depth 1) and record the commit
+    git clone --depth 1 https://github.com/kstenerud/Musashi.git "$TMP/musashi"
+    git -C "$TMP/musashi" rev-parse HEAD > "$DEST/MUSASHI_COMMIT.txt"
+fi
 
 # Musashi generates its opcode handlers with a bootstrap tool.
 cc -O2 -o "$TMP/m68kmake" "$TMP/musashi/m68kmake.c"

@@ -45,31 +45,35 @@ public struct Monitor {
     }
 
     public func disassembly(from address: UInt32, count: Int) -> String {
-        var lines: [String] = []
-        var pc = address
-        for _ in 0..<count {
-            let (text, length) = machine.cpu.disassemble(at: pc)
-            let addrStr = String(format: "%06X", Int(pc))
-            let line = "\(addrStr): \(text)"
-            lines.append(line)
-            pc &+= UInt32(length)
+        machine.bus.withPeek {
+            var lines: [String] = []
+            var pc = address
+            for _ in 0..<count {
+                let (text, length) = machine.cpu.disassemble(at: pc)
+                let addrStr = String(format: "%06X", Int(pc))
+                let line = "\(addrStr): \(text)"
+                lines.append(line)
+                pc &+= UInt32(length)
+            }
+            return lines.joined(separator: "\n")
         }
-        return lines.joined(separator: "\n")
     }
 
     public func hexDump(at address: UInt32, count: Int) -> String {
-        var lines: [String] = []
-        for row in stride(from: 0, to: count, by: 16) {
-            var bytes: [String] = []
-            for i in 0..<min(16, count - row) {
-                let byte = machine.bus.read8(address &+ UInt32(row + i))
-                bytes.append(String(format: "%02X", Int(byte)))
+        machine.bus.withPeek {
+            var lines: [String] = []
+            for row in stride(from: 0, to: count, by: 16) {
+                var bytes: [String] = []
+                for i in 0..<min(16, count - row) {
+                    let byte = machine.bus.read8(address &+ UInt32(row + i))
+                    bytes.append(String(format: "%02X", Int(byte)))
+                }
+                let byteString = bytes.joined(separator: " ")
+                let addrStr = String(format: "%06X", Int(address &+ UInt32(row)))
+                let line = "\(addrStr): \(byteString)"
+                lines.append(line)
             }
-            let byteString = bytes.joined(separator: " ")
-            let addrStr = String(format: "%06X", Int(address &+ UInt32(row)))
-            let line = "\(addrStr): \(byteString)"
-            lines.append(line)
+            return lines.joined(separator: "\n")
         }
-        return lines.joined(separator: "\n")
     }
 }

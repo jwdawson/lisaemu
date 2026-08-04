@@ -1,3 +1,4 @@
+import Foundation
 import CMusashi
 
 /// Swift wrapper around the vendored Musashi 68000 core.
@@ -43,6 +44,7 @@ public final class M68K {
     static var currentBus: Bus?
 
     public let bus: Bus
+    private let ownerThread = Thread.current
 
     public init(bus: Bus) {
         self.bus = bus
@@ -90,17 +92,23 @@ public final class M68K {
         m68k_execute(0)
     }
 
+    private func assertOwner() {
+        assert(Thread.current === ownerThread, "M68K used off its creation thread — Musashi is a process-global singleton")
+    }
+
     /// Runs the core for at least `cycles` cycles, returning the number of
     /// cycles actually executed.
     @discardableResult
     public func run(cycles: Int) -> Int {
-        Int(m68k_execute(Int32(cycles)))
+        assertOwner()
+        return Int(m68k_execute(Int32(cycles)))
     }
 
     /// Executes a single instruction, returning the number of cycles it took.
     @discardableResult
     public func step() -> Int {
-        Int(m68k_execute(1))
+        assertOwner()
+        return Int(m68k_execute(1))
     }
 
     /// Bit values of Musashi's internal `stopped` field (`m68ki_cpu.stopped`,
@@ -128,13 +136,20 @@ public final class M68K {
     }
 
     public subscript(_ reg: Register) -> UInt32 {
-        get { m68k_get_reg(nil, reg.musashi) }
-        set { m68k_set_reg(reg.musashi, newValue) }
+        get {
+            assertOwner()
+            return m68k_get_reg(nil, reg.musashi)
+        }
+        set {
+            assertOwner()
+            m68k_set_reg(reg.musashi, newValue)
+        }
     }
 
     /// Disassembles the instruction at `address`, returning its text and
     /// length in bytes.
     public func disassemble(at address: UInt32) -> (text: String, length: Int) {
+        assertOwner()
         var buffer = [CChar](repeating: 0, count: 256)
         let length = buffer.withUnsafeMutableBufferPointer { ptr in
             m68k_disassemble(ptr.baseAddress, address, UInt32(M68K_CPU_TYPE_68000))

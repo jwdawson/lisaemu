@@ -29,6 +29,7 @@ let package = Package(
         .testTarget(
             name: "LisaCoreTests",
             dependencies: ["LisaCore"],
+            resources: [.copy("TomHarteKnownFailures.txt")],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
     ]

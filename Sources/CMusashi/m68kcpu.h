@@ -618,6 +618,21 @@ typedef uint32 uint64;
 /* sigjmp() on Mac OS X and *BSD in general saves signal contexts and is super-slow, use sigsetjmp() to tell it not to */
 #ifdef _BSD_SETJMP_H
 extern sigjmp_buf m68ki_aerr_trap;
+/* LisaEmu fix: upstream's sigsetjmp (BSD/macOS) variant of this macro is
+ * missing the "stop if the cycle budget is exhausted" check that the
+ * plain-setjmp variant below has (compare the #else branch). Without it, a
+ * call like m68k_execute(1) that hits an address error keeps running the
+ * main do-while loop and executes one extra "phantom" instruction at the
+ * exception vector target before the loop's own while(cycles>0) condition
+ * catches up -- corrupting PC/SP/memory for every address-error case on
+ * macOS (which always defines _BSD_SETJMP_H, so this branch, not the #else
+ * one, is the one actually compiled here). Confirmed via TomHarte
+ * 68000 ADD.w vectors: e.g. "d864 [ADD.w -(A4), D4] 6" landed at the
+ * address-error vector (PC=0x1400) correctly, then silently executed
+ * whatever opcode happened to be at 0x1400 before returning. Mirroring the
+ * #else branch's cycle check below fixes it. See Scripts/vendor-musashi.sh,
+ * which re-applies this patch after re-vendoring from upstream.
+ */
 #define m68ki_set_address_error_trap(m68k) \
 	if(sigsetjmp(m68ki_aerr_trap, 0) != 0) \
 	{ \
@@ -627,6 +642,10 @@ extern sigjmp_buf m68ki_aerr_trap;
 			if (m68ki_remaining_cycles > 0) \
 				m68ki_remaining_cycles = 0; \
 			return m68ki_initial_cycles; \
+		} \
+		if(m68ki_remaining_cycles <= 0) \
+		{ \
+			return m68ki_initial_cycles - m68ki_remaining_cycles; \
 		} \
 	}
 

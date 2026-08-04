@@ -230,8 +230,15 @@
  * access a word or longword at an odd address.
  * NOTE: This is only emulated properly for 68000 mode.
  */
+/* LisaEmu: turned ON (upstream default is OFF). The Lisa's 68000 relies on
+ * real address-error trapping (Lisa OS software and, separately, the
+ * TomHarte/ProcessorTests 68000 vectors both exercise odd-address word/long
+ * accesses expecting a trap), so this is a correctness fix for the emulator
+ * core, not just a test convenience. See Scripts/vendor-musashi.sh, which
+ * re-applies this override after re-vendoring from upstream.
+ */
 #ifndef M68K_EMULATE_ADDRESS_ERROR
-#define M68K_EMULATE_ADDRESS_ERROR  M68K_OPT_OFF
+#define M68K_EMULATE_ADDRESS_ERROR  M68K_OPT_ON
 #endif
 
 

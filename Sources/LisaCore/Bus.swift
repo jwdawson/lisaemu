@@ -1,10 +1,22 @@
 public final class Bus {
     public var setupMode = true
+    public var mmu = MMU()
+    public var domain = 0
+    public private(set) var lastFault: MMUFault?
     public private(set) var unmappedAccesses: [UInt32] = []
     var ram: [UInt8]
 
     public init(ramSize: Int) {
         ram = [UInt8](repeating: 0, count: ramSize)
+    }
+
+    private func physical(_ address: UInt32, isWrite: Bool) -> Int? {
+        let a = address & 0xFF_FFFF
+        guard !setupMode else { return Int(a) }
+        switch mmu.translate(a, domain: domain, isWrite: isWrite) {
+        case .success(let p): return Int(p)
+        case .failure(let fault): lastFault = fault; return nil
+        }
     }
 
     public func load(_ bytes: [UInt8], at address: UInt32) {
@@ -14,7 +26,7 @@ public final class Bus {
     }
 
     public func read8(_ address: UInt32) -> UInt8 {
-        let a = Int(address & 0xFF_FFFF)
+        guard let a = physical(address, isWrite: false) else { return 0xFF }
         guard a < ram.count else {
             unmappedAccesses.append(address & 0xFF_FFFF)
             return 0xFF
@@ -23,7 +35,7 @@ public final class Bus {
     }
 
     public func write8(_ address: UInt32, _ value: UInt8) {
-        let a = Int(address & 0xFF_FFFF)
+        guard let a = physical(address, isWrite: true) else { return }
         guard a < ram.count else {
             unmappedAccesses.append(address & 0xFF_FFFF)
             return

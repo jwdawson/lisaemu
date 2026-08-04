@@ -195,11 +195,26 @@ public final class Bus {
     ///
     /// Once `setupMode == false` (translation active, Task 3/4 fault
     /// semantics preserved exactly):
-    ///   - `.memory(p)`: RAM, UNLESS `p` itself falls in the ROM window
-    ///     (design note: "for simplicity detect ROM by final physical
-    ///     address range" -- currently unreachable given SORG's 12-bit/2MB
-    ///     ceiling, but kept for forward compatibility; see task-5 report).
-    ///   - `.io(offset)`: `IODispatcher`.
+    ///   - `.memory(p)`: RAM, UNLESS `p` itself falls in the ROM window. This
+    ///     check is dead code today and intentionally so: `MMU.translate`'s
+    ///     `.memory` formula is `(sorg & 0xFFF) << 9 + offsetInSegment`, and
+    ///     SORG is a hardware 12-bit register, so the highest physical
+    ///     address `.memory` can ever produce is ~0x21FDFF (~2.2MB) --
+    ///     nowhere near `$FE0000` (~16.6MB). It is kept only because the
+    ///     design note calls for it ("for simplicity detect ROM by final
+    ///     physical address range") and it's a harmless, cheap guard.
+    ///     **Translated-mode ROM access is NOT actually reachable through
+    ///     this branch.** The real future path is `.io`, below: prommmu
+    ///     (segment 127) has SLIM access nibble `$8` per
+    ///     docs/hardware-notes.md, so once a domain maps segment 127 as I/O,
+    ///     accesses land in `.io` -- but `IODispatcher.currentValue`'s
+    ///     default case does not yet special-case that segment/offset range
+    ///     to serve ROM bytes. Task 6/7 must add that special-space routing
+    ///     inside `IODispatcher` (or intercept it here before delegating)
+    ///     before translated-mode ROM reads will work; see the task-5 fix
+    ///     report.
+    ///   - `.io(offset)`: `IODispatcher` -- see the ROM caveat immediately
+    ///     above.
     ///   - `.fault`: unchanged bus-error path.
     private func access(_ address: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
         let a = address & 0xFF_FFFF
@@ -237,6 +252,15 @@ public final class Bus {
             }
             return ramAccess(address, Int(p), isWrite: isWrite, value: value)
         case .io(let offset):
+            // NOTE: this is the real future path to translated-mode ROM
+            // access (prommmu = segment 127, SLIM access nibble $8 per
+            // docs/hardware-notes.md) -- NOT the `.memory` branch above,
+            // whose 12-bit-SORG ceiling can never reach $FE0000. Not yet
+            // handled: `IODispatcher.currentValue`'s default case has no
+            // special case for the $FE0000-range special-space offsets a
+            // mapped segment 127 would deliver here. Task 6/7 must add that
+            // routing before translated-mode ROM reads work; see the
+            // task-5 fix report.
             if !peeking { faultPendingResolution = false }
             return ioAccess(offset, isWrite: isWrite, value: value)
         case .fault(let fault):

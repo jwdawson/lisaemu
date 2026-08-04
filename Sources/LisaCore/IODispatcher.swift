@@ -85,6 +85,17 @@ final class IODispatcher {
             if let (via, index) = Self.viaRegisterIndex(offset) {
                 return via == 1 ? via1[index] : via2[index]
             }
+            // NOT YET HANDLED: translated-mode ROM access. prommmu
+            // (segment 127) has SLIM access nibble $8 (docs/hardware-
+            // notes.md), so once a domain maps it as I/O, ROM-range
+            // offsets from Bus's `.io` case land here and fall into this
+            // generic 0xFF/unknown bucket instead of returning real ROM
+            // bytes. `Bus.access`'s `.memory` branch can never reach ROM
+            // (12-bit SORG caps it at ~2.2MB) -- this IS the real future
+            // path. Task 6/7 must special-case that offset range (or
+            // intercept it in `Bus.access` before delegating here) once
+            // real ROM-reading behavior needs to work in translated mode;
+            // see the task-5 fix report.
             return 0xFF
         }
     }

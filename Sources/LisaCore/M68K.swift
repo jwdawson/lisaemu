@@ -131,7 +131,7 @@ public final class M68K {
 
     /// Raises a genuine Musashi 68000 bus-error exception for an MMU
     /// translation fault. Wired as `Bus.busErrorHandler` by `Machine.init`,
-    /// so `Bus.physical` calls this on every real (non-peek) translation
+    /// so `Bus.access` calls this on every real (non-peek) translation
     /// failure while `setupMode == false`.
     ///
     /// `address`/`isWrite` are accepted to match the `Bus.busErrorHandler`
@@ -155,7 +155,7 @@ public final class M68K {
     /// discarding the setjmp return value and falling into the main
     /// instruction loop either way). So the longjmp unwinds every frame
     /// between here and that setjmp point -- this function, the
-    /// `busErrorHandler` closure, `Bus.physical`/`read8`/`write8`, and the
+    /// `busErrorHandler` closure, `Bus.access`/`read8`/`write8`, and the
     /// `@convention(c)` `cbus.read8`/`write8` trampolines installed in
     /// `init` above, down through shim.c's `m68k_read_memory_8` /
     /// `m68k_write_memory_8` and Musashi's inline memory-access macros --
@@ -166,7 +166,7 @@ public final class M68K {
     ///
     /// None of the unwound frames may run cleanup code after being skipped
     /// this way: the trampolines in `init` are single-expression closures
-    /// with no `defer` and no local allocations, `Bus.physical`/`read8`/
+    /// with no `defer` and no local allocations, `Bus.access`/`read8`/
     /// `write8` have no `defer` either, so there is nothing for the longjmp
     /// to skip past unsafely (a leaked ARC retain on `M68K.currentBus!`'s
     /// temporary would be the worst case, harmless for a process-lifetime
@@ -188,7 +188,7 @@ public final class M68K {
     /// `insideCpuCallback`, which is only true while `run`/`step` has an
     /// `m68k_execute` call live. Faulting still records `Bus.lastFault` and
     /// returns 0xFF/drops the write regardless -- that bookkeeping lives in
-    /// `Bus.physical` and happens whether or not this method actually
+    /// `Bus.access` and happens whether or not this method actually
     /// pulses Musashi.
     public func pulseBusError(address: UInt32, isWrite: Bool) {
         guard insideCpuCallback else { return }

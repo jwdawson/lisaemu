@@ -19,6 +19,38 @@ import Testing
     #expect(bus.setupMode == false)
 }
 
+@Test func bareReadOfSetupLatchTogglesIt() {
+    // The earlier "clears" test above only issues a WRITE to $E012 and a
+    // READ to $E010 while setup was already true (so the read was
+    // observably a no-op). This test isolates a bare READ actually
+    // toggling state: turn setup off via a write, then perform ONLY a read
+    // of $E010 (SetUpSet) and confirm setup mode is back on -- proving the
+    // latch really is address-decoded on ANY access, not just writes
+    // (docs/hardware-notes.md "Setup Latch": "ANY access (read or write)").
+    //
+    // Segment 126 (the $FC0000 block) is pre-mapped as io in domain 0 so
+    // that once the write below flips setupMode off, the read that
+    // follows still reaches IODispatcher via the translated `.io` route
+    // instead of faulting on an otherwise-unmapped segment 126 -- without
+    // this, the write's own side effect (setupMode false) would silently
+    // change how the very next access is routed.
+    let bus = Bus(ramSize: 0x1000)
+    bus.mmu.domains[0][126] = SegmentRegister(sorg: 0, slim: 0x800)  // access $8 = io
+    bus.write8(0xFC_E012, 0x00)   // SetUpReset -- setup off (still flat here)
+    #expect(bus.setupMode == false)
+    _ = bus.read8(0xFC_E010)      // bare READ of SetUpSet -- now via translated .io
+    #expect(bus.setupMode == true)
+}
+
+@Test func bareReadOfContextLatchSetsDomainBit() {
+    // Same point for a context latch: a READ of $E00A (context bit1 on)
+    // must set the domain bit, not just a write.
+    let bus = Bus(ramSize: 0x1000)
+    #expect(bus.domain == 0)
+    _ = bus.read8(0xFC_E00A)
+    #expect(bus.domain == 1)
+}
+
 @Test func setupLatchTogglesViaTranslatedIOSegment() {
     // Same latch, but reached through a translated `.io` segment instead of
     // the flat setup-mode address -- exercises the other path into

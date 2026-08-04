@@ -12,28 +12,25 @@ private func makeMachineRAM() -> Bus {
     return bus
 }
 
-// Musashi is a process-global singleton core (see M68K.currentBus), so these
-// tests cannot run concurrently with each other without corrupting each
-// other's CPU/bus state. `.serialized` keeps them from overlapping while
-// still letting other suites (e.g. BusTests) run in parallel.
-@Suite(.serialized)
-struct M68KTests {
-    @Test func executesMoveq() {
-        let bus = makeMachineRAM()
-        let cpu = M68K(bus: bus)
-        cpu.reset()
-        #expect(cpu[.pc] == 0x400)
-        #expect(cpu[.a7] == 0x3000)
-        cpu.run(cycles: 20)
-        #expect(cpu[.d0] == 42)
-    }
+extension MusashiSuites {
+    @Suite struct M68KTests {
+        @Test func executesMoveq() {
+            let bus = makeMachineRAM()
+            let cpu = M68K(bus: bus)
+            cpu.reset()
+            #expect(cpu[.pc] == 0x400)
+            #expect(cpu[.a7] == 0x3000)
+            cpu.run(cycles: 20)
+            #expect(cpu[.d0] == 42)
+        }
 
-    @Test func disassemblesMoveq() {
-        let bus = makeMachineRAM()
-        let cpu = M68K(bus: bus)
-        cpu.reset()
-        let (text, length) = cpu.disassemble(at: 0x400)
-        #expect(length == 2)
-        #expect(text.lowercased().contains("moveq"))
+        @Test func disassemblesMoveq() {
+            let bus = makeMachineRAM()
+            let cpu = M68K(bus: bus)
+            cpu.reset()
+            let (text, length) = cpu.disassemble(at: 0x400)
+            #expect(length == 2)
+            #expect(text.lowercased().contains("moveq"))
+        }
     }
 }

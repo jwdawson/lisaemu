@@ -10,6 +10,8 @@ extension MusashiSuites {
             #expect(Monitor.parse("d 400 3") == .disasm(0x400, 3))
             #expect(Monitor.parse("d") == .disasm(nil, 8))
             #expect(Monitor.parse("m 400 32") == .mem(0x400, 32))
+            #expect(Monitor.parse("t") == .trace(1))
+            #expect(Monitor.parse("t 5") == .trace(5))
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
         }

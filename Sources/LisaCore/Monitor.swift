@@ -2,7 +2,7 @@ import Foundation
 
 public struct Monitor {
     public enum Command: Equatable {
-        case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), quit, help
+        case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), quit, help
     }
 
     let machine: Machine
@@ -23,6 +23,7 @@ public struct Monitor {
         case "d": return .disasm(hex(1), int(2, default: 8))
         case "m": guard let a = hex(1) else { return nil }
                   return .mem(a, int(2, default: 64))
+        case "t": return .trace(int(1, default: 1))
         case "q": return .quit
         case "?": return .help
         default:  return nil

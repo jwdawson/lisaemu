@@ -8,8 +8,9 @@ public final class Bus {
     }
 
     public func load(_ bytes: [UInt8], at address: UInt32) {
-        let base = Int(address & 0xFF_FFFF)
-        ram.replaceSubrange(base ..< base + bytes.count, with: bytes)
+        for (offset, byte) in bytes.enumerated() {
+            write8(address &+ UInt32(offset), byte)
+        }
     }
 
     public func read8(_ address: UInt32) -> UInt8 {

@@ -32,7 +32,7 @@ public final class Bus {
     /// latched, which 128KB `segment` block the port addressed
     /// (`addr >> 17`), whether it was `SORG` (`$8008`) vs SLIM (`$8000`), the
     /// complete 12-bit-masked register `value`, and the `cycles` stamp. Bounded
-    /// to 4096 entries; `mmuPortLogDropped` counts overflow. Consumed by
+    /// to 8192 entries; `mmuPortLogDropped` counts overflow. Consumed by
     /// `lisadbg`'s `t`/`g` trace commands and `ROMBootTests`.
     public private(set) var mmuPortLog: [(domain: Int, segment: Int, isSorg: Bool, value: UInt16, cycles: UInt64)] = []
     public private(set) var mmuPortLogDropped = 0

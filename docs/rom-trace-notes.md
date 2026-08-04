@@ -44,6 +44,8 @@ FE00F6: move.w  $fc8000.l, D0     ; read SLIM[seg126] (iospace) via port $8000
 FE00FC: andi.w  #$fff, D0
 FE0100: cmpi.w  #$901, D0         ; already initialized? (iospace SLIM == $901)
 FE0104: bne     $fe0152           ; COLD boot (our case: reg reads 0) -> full init
+FE0106: andi.w  #$fff, $fc8008.l   ; seg126 SORG re-check (mask in place) ...
+FE010E: bne     $fe0152           ; ... nonzero SORG -> also COLD path
    ; --- warm path (skipped on cold boot) explicitly programs the real map: ---
 FE0110: move.w  #$700, $8000.l     ; seg0   SLIM = $700  (readWrite, 256 pages)
 FE0118: move.w  #$901, $fc8000.l   ; seg126 SLIM = $901  (iospace, nibble $9)
@@ -158,19 +160,28 @@ faulting fetch address `$FE0446` and the undecoded prom nibble `$F`.
 
 ### OQ1 — Does the ROM program SLIM/SORG targeting the CURRENT domain (our model), or does the hardware "inactive domain" semantic matter?
 
-**The current-domain model is correct for the boot ROM.** The ROM programs each
-domain by first *selecting it* via the context latches and then writing its
-registers, verifying every write with an immediate `eor` read-back
-(`$FE0288`). If setup-mode writes were instead routed to the *inactive* domain
-(as `hardware-notes.md` "Setup Latch" states), those read-backs would observe
-the wrong domain and take the error branch at `$FE02B0` — which never happens;
-the self-test runs clean to setup-drop. Domain 0 (the domain active when setup
-drops) is programmed while it is itself the current domain. So our
-"setup writes hit the context-selected domain" model matches observed ROM
-behavior. **Caveat:** this only proves the boot path; a live OS domain-swap
-(program the *soon-to-be-active* domain while executing in another) may still
-depend on the inactive-domain routing and should be revisited in M1b once
-translated execution works.
+**Undetermined by the boot trace — remains OPEN for M1b.** The current-domain
+model is *consistent with* everything the boot ROM does, but the boot path
+**cannot discriminate** current- from inactive-domain routing, so this is not
+evidence that the model is correct.
+
+Why the self-test can't decide it: the MMU register test writes a pattern and
+immediately reads it back to `eor`-verify (`$FE0290` write / `$FE0286`,
+`$FE0288` read). But in `Bus.slimSorgPortAccess` **both** the write and the
+read-back index the *same* `domain`, so the test is read/write-symmetric — it
+would pass identically under a symmetric inactive-domain hardware model (write
+to inactive X, read back from inactive X). No context-latch toggle occurs
+*inside* the write→verify loop, so nothing observes which physical domain was
+actually hit. And the single translated instruction fetch before HALT
+(`$FE0446`) faults on the segment-127 nibble-`$F` decode regardless of which
+domain holds the map — so it, too, tells us nothing about routing.
+
+Therefore: our current-domain implementation is retained because it is
+consistent with all observed M1a boot behavior, but the `hardware-notes.md`
+"Setup Latch" claim that setup-mode writes program the **inactive** domain
+stays **UNVALIDATED and open**. The discriminating experiment is a live OS
+domain-switch (program the soon-to-be-active domain while executing in another,
+then swap and observe), which M1b must run once translated execution works.
 
 ### OQ2 — How does the ROM reach ROM+special space in translated mode? Exact SLIM/SORG for segments 125/126/127.
 

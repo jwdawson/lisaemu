@@ -244,18 +244,22 @@ public final class Bus {
     ///     nowhere near `$FE0000` (~16.6MB). It is kept only because the
     ///     design note calls for it ("for simplicity detect ROM by final
     ///     physical address range") and it's a harmless, cheap guard.
-    ///     **Translated-mode ROM access is NOT actually reachable through
-    ///     this branch.** The real future path is `.io`, below: prommmu
-    ///     (segment 127) has SLIM access nibble `$8` per
-    ///     docs/hardware-notes.md, so once a domain maps segment 127 as I/O,
-    ///     accesses land in `.io` -- but `IODispatcher.currentValue`'s
-    ///     default case does not yet special-case that segment/offset range
-    ///     to serve ROM bytes. Task 6/7 must add that special-space routing
-    ///     inside `IODispatcher` (or intercept it here before delegating)
-    ///     before translated-mode ROM reads will work; see the task-5 fix
-    ///     report.
-    ///   - `.io(offset)`: `IODispatcher` -- see the ROM caveat immediately
-    ///     above.
+    ///   - `.io(offset)`: `IODispatcher` -- the real IOSpace ($FC0000-
+    ///     $FDFFFF) MMU access nibble `$8`, AND the ROM-discovered iospace
+    ///     nibble `$9` (seg126 SLIM=`$901`, docs/rom-trace-notes.md OQ2),
+    ///     which `MMU.translate` also routes to `.io` since it targets the
+    ///     same IODispatcher.
+    ///   - `.special(offset)`: prom/special space, MMU access nibble `$F`
+    ///     (seg127 SLIM=`$F00`). This -- NOT `.io` -- is the real
+    ///     translated-mode path to ROM bytes; the M1a ledger's hypothesis
+    ///     that prommmu used nibble `$8` (routing through `.io`) was
+    ///     refuted by the boot trace (rom-trace-notes.md OQ2). `specialAccess`
+    ///     serves `$0000-$3FFF` of the offset (the 16KB ROM) directly from
+    ///     `rom`, mirroring the setup-mode ROM window/low-mirror behavior
+    ///     above; `$4000-$1FFFF` is unknown (hardware-notes.md §2 places the
+    ///     SNUM region somewhere in this range) and is stubbed as a logged
+    ///     0xFF read until a later M1b task traces what the ROM expects
+    ///     there.
     ///   - `.fault`: unchanged bus-error path.
     private func access(_ address: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
         let a = address & 0xFF_FFFF
@@ -297,17 +301,19 @@ public final class Bus {
             }
             return ramAccess(address, Int(p), isWrite: isWrite, value: value)
         case .io(let offset):
-            // NOTE: this is the real future path to translated-mode ROM
-            // access (prommmu = segment 127, SLIM access nibble $8 per
-            // docs/hardware-notes.md) -- NOT the `.memory` branch above,
-            // whose 12-bit-SORG ceiling can never reach $FE0000. Not yet
-            // handled: `IODispatcher.currentValue`'s default case has no
-            // special case for the $FE0000-range special-space offsets a
-            // mapped segment 127 would deliver here. Task 6/7 must add that
-            // routing before translated-mode ROM reads work; see the
-            // task-5 fix report.
+            // Real IOSpace (nibble $8) and the ROM's own iospace nibble $9
+            // (seg126 SLIM=$901, docs/rom-trace-notes.md OQ2) both land
+            // here -- `MMU.translate` routes both to `.io` identically.
+            // Translated-mode ROM access is NOT this branch; see `.special`
+            // below.
             if !peeking { faultPendingResolution = false }
             return ioAccess(offset, isWrite: isWrite, value: value)
+        case .special(let offset):
+            // prom/special space (nibble $F) -- the real translated-mode
+            // path to ROM bytes, refuting the M1a ledger's $8/`.io`
+            // hypothesis (rom-trace-notes.md OQ2). See `specialAccess`.
+            if !peeking { faultPendingResolution = false }
+            return specialAccess(address, offset, isWrite: isWrite, value: value)
         case .fault(let fault):
             if !peeking {
                 lastFault = fault
@@ -340,6 +346,40 @@ public final class Bus {
             return value
         }
         return io.read(offset)
+    }
+
+    /// Routes a `.special` MMU translation (nibble `$F`, prom/special
+    /// space -- docs/rom-trace-notes.md OQ2) to its two known sub-ranges
+    /// within the 128KB segment:
+    ///
+    ///   - `$0000-$3FFF`: the 16KB boot ROM, exactly like the setup-mode
+    ///     `$FE0000-$FE3FFF` window / `$0000-$3FFF` mirror above. Reads
+    ///     return ROM bytes; writes are dropped and logged via the same
+    ///     `recordUnmapped` path those use (real hardware: ROM is read-only
+    ///     silicon).
+    ///   - `$4000-$1FFFF`: UNKNOWN. `hardware-notes.md §2` places the SNUM
+    ///     (serial number) region somewhere in segment 127's upper range,
+    ///     but no trace has reached it yet -- this task's scope is only
+    ///     "run past the setup-drop boundary", not decode every offset a
+    ///     later boot stage might touch. Stubbed as a logged 0xFF
+    ///     read/no-op write (mirroring `IODispatcher`'s own unknown-I/O
+    ///     stub) until a later M1b task traces what the ROM expects here.
+    ///
+    /// `originalAddress` is the untranslated logical CPU address, threaded
+    /// through only so `recordUnmapped` logs what the CPU actually asked
+    /// for -- consistent with the `.memory` ROM-window case above.
+    private func specialAccess(_ originalAddress: UInt32, _ offset: UInt32, isWrite: Bool, value: UInt8) -> UInt8 {
+        if offset <= 0x3FFF {
+            if isWrite {
+                recordUnmapped(originalAddress)
+                return value
+            }
+            return rom[Int(offset)]
+        }
+        if !peeking {
+            io.logUnknownSpecial(offset: offset, value: value, isWrite: isWrite)
+        }
+        return isWrite ? value : 0xFF
     }
 
     private func ramAccess(_ originalAddress: UInt32, _ index: Int, isWrite: Bool, value: UInt8) -> UInt8 {

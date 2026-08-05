@@ -134,6 +134,43 @@ import Testing
     #expect(bus.read8(0x10) == 0x5A)
 }
 
+// MARK: - Translated-mode `.special` routing (MMU nibble $F, rom-trace-notes.md OQ2)
+
+@Test func specialSpaceServesROMBytesInLowRange() {
+    let bus = Bus(ramSize: 0x1000)
+    var rom = [UInt8](repeating: 0xAA, count: 0x4000)
+    rom[0] = 0x11
+    rom[0x3FFF] = 0x22
+    bus.loadROM(rom)
+    bus.mmu.domains[0][127] = SegmentRegister(sorg: 0, slim: 0xF00)   // nibble $F, full segment
+    bus._setSetupModeForTesting(false)
+    let base: UInt32 = 127 << 17
+    #expect(bus.read8(base) == 0x11)
+    #expect(bus.read8(base + 0x3FFF) == 0x22)
+}
+
+@Test func specialSpaceWritesToROMRangeAreIgnoredAndLogged() {
+    let bus = Bus(ramSize: 0x1000)
+    bus.loadROM([UInt8](repeating: 0xAA, count: 0x4000))
+    bus.mmu.domains[0][127] = SegmentRegister(sorg: 0, slim: 0xF00)
+    bus._setSetupModeForTesting(false)
+    let base: UInt32 = 127 << 17
+    bus.write8(base, 0x00)
+    #expect(bus.read8(base) == 0xAA)              // write had no effect
+    #expect(bus.unmappedAccesses.contains(base))  // but was logged
+}
+
+@Test func specialSpaceAboveROMReadsUnknownStub() {
+    let bus = Bus(ramSize: 0x1000)
+    bus.loadROM([UInt8](repeating: 0xAA, count: 0x4000))
+    bus.mmu.domains[0][127] = SegmentRegister(sorg: 0, slim: 0xF00)
+    bus._setSetupModeForTesting(false)
+    let base: UInt32 = 127 << 17
+    #expect(bus.read8(base + 0x4000) == 0xFF)
+    #expect(bus.read8(base + 0x1_FFFF) == 0xFF)
+    #expect(bus.ioTrace.contains { $0.offset == 0x4000 && !$0.isWrite })
+}
+
 @Test func mirrorIsGoneOnceSetupModeClearsWithAnMMUMapping() {
     let bus = Bus(ramSize: 0x100000)
     var rom = [UInt8](repeating: 0xAA, count: 0x4000)

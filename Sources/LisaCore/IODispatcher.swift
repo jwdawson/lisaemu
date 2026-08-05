@@ -85,17 +85,17 @@ final class IODispatcher {
             if let (via, index) = Self.viaRegisterIndex(offset) {
                 return via == 1 ? via1[index] : via2[index]
             }
-            // NOT YET HANDLED: translated-mode ROM access. prommmu
-            // (segment 127) has SLIM access nibble $8 (docs/hardware-
-            // notes.md), so once a domain maps it as I/O, ROM-range
-            // offsets from Bus's `.io` case land here and fall into this
-            // generic 0xFF/unknown bucket instead of returning real ROM
-            // bytes. `Bus.access`'s `.memory` branch can never reach ROM
-            // (12-bit SORG caps it at ~2.2MB) -- this IS the real future
-            // path. Task 6/7 must special-case that offset range (or
-            // intercept it in `Bus.access` before delegating here) once
-            // real ROM-reading behavior needs to work in translated mode;
-            // see the task-5 fix report.
+            // Genuinely unknown I/O-space offset (real IOSpace, $FC0000-
+            // $FDFFFF, or the ROM's iospace nibble $9 -- both land here via
+            // Bus's `.io` case). NOTE: translated-mode ROM access does NOT
+            // route through here -- the M1a ledger's hypothesis that
+            // prommmu (segment 127) uses access nibble $8 was refuted by
+            // the boot trace (docs/rom-trace-notes.md OQ2): the ROM
+            // actually programs segment 127 with nibble $F, which
+            // `MMU.translate` now decodes as `.special`, a distinct case
+            // `Bus.access` serves directly (ROM bytes / unknown-special
+            // stub) before ever reaching `IODispatcher`. This default case
+            // is only the real "unmapped I/O register" bucket now.
             return 0xFF
         }
     }
@@ -148,6 +148,21 @@ final class IODispatcher {
             return (2, Int((offset - 0xDC01) / 2))
         }
         return nil
+    }
+
+    /// Logs an access to the unknown sub-range of `.special` (prom, MMU
+    /// nibble `$F`) space -- offsets `$4000-$1FFFF` within segment 127,
+    /// above the 16KB ROM mirror. `hardware-notes.md §2` places the SNUM
+    /// (serial number) region somewhere up here per the OS source's
+    /// `iospacemmu`/`prommmu` base-address table, but no trace has reached
+    /// it yet (M1b Task 1 scope is only "run past the setup-drop
+    /// boundary"), so `Bus.access` calls this directly -- never through
+    /// `read`/`write`, since this isn't real IOSpace-decoded hardware, just
+    /// a diagnostic record of an access this emulator doesn't yet model --
+    /// to log the touch for a later task's trace without applying any of
+    /// the latch/VIA side effects real I/O gets.
+    func logUnknownSpecial(offset: UInt32, value: UInt8, isWrite: Bool) {
+        record(offset: offset, value: value, isWrite: isWrite)
     }
 
     private func record(offset: UInt32, value: UInt8, isWrite: Bool) {

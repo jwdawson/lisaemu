@@ -39,6 +39,31 @@ private func mmuWith(_ seg: Int, _ reg: SegmentRegister, domain: Int = 0) -> MMU
     } else { Issue.record("expected fault") }
 }
 
+// MARK: - ROM-discovered special-space nibbles $F (prom) / $9 (iospace)
+//
+// docs/rom-trace-notes.md OQ2: the Rev H boot ROM programs seg127 SLIM =
+// $F00 and seg126 SLIM = $901 at $FE0120/$FE0118, refuting the M1a ledger's
+// $8-routed prommmu hypothesis. Both nibbles are hardwired special-space
+// decodes, not page-limited memory-type windows like $5/$6/$7/$8: modeled
+// as full-segment (entire 128KB), limit byte ignored. Tested near both ends
+// of the window per the task-1 brief.
+
+@Test func specialNibbleFDecodesFullSegmentIgnoringLimitByte() {
+    var mmu = MMU()
+    mmu.domains[0][127] = SegmentRegister(sorg: 0, slim: 0xF00)   // ROM's actual programmed value
+    let base: UInt32 = 127 << 17
+    #expect(mmu.translate(base, domain: 0, isSupervisor: true, isWrite: false) == .special(0))
+    #expect(mmu.translate(base + 0x1_FFFF, domain: 0, isSupervisor: true, isWrite: false) == .special(0x1_FFFF))
+}
+
+@Test func iospaceNibble9DecodesFullSegmentIgnoringLimitByte() {
+    var mmu = MMU()
+    mmu.domains[0][126] = SegmentRegister(sorg: 0, slim: 0x901)   // ROM's actual programmed value
+    let base: UInt32 = 126 << 17
+    #expect(mmu.translate(base, domain: 0, isSupervisor: true, isWrite: false) == .io(0))
+    #expect(mmu.translate(base + 0x1_FFFF, domain: 0, isSupervisor: true, isWrite: false) == .io(0x1_FFFF))
+}
+
 @Test func unassignedNibbleCIsAbsent() {
     // $C is the hardware's own "absent" code (docs/hardware-notes.md §1),
     // but every other unassigned nibble must decode as absent too.

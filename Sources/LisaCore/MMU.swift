@@ -77,12 +77,16 @@ public struct MMUFault: Error, Equatable {
 }
 
 /// Result of `MMU.translate`. `.io` is distinct from `.memory` because I/O
-/// segments (SLIM access nibble $8) route to the IODispatcher (M1a Task 5)
-/// rather than RAM -- `Bus` treats `.io` as unmapped-style for now (Task 4
-/// is self-contained; the real IODispatcher lands in Task 5).
+/// segments (SLIM access nibble $8, and the ROM-discovered nibble $9 --
+/// docs/rom-trace-notes.md OQ2) route to the IODispatcher rather than RAM.
+/// `.special` (nibble $F) is the ROM's own prom/special-space decode,
+/// carrying the offset within the 128KB segment; `Bus` routes it to ROM
+/// bytes / an unknown-special stub rather than either `.memory` or `.io`
+/// (see `Bus.access`'s doc comment).
 public enum Translation: Equatable {
     case memory(UInt32)
     case io(UInt32)
+    case special(UInt32)
     case fault(MMUFault)
 }
 
@@ -97,7 +101,16 @@ public struct MMU {
     ///
     ///   - `accessNibble = (slim >> 8) & 0xF`: $5 readOnly, $6 stack,
     ///     $7 readWrite, $8 io. Any other nibble (including $C, the
-    ///     hardware's own "absent" code) is absent -> `.invalidSegment`.
+    ///     hardware's own "absent" code) is absent -> `.invalidSegment` --
+    ///     EXCEPT the two ROM-discovered nibbles below.
+    ///   - $9 (iospace) and $F (prom/special) are hardwired special-space
+    ///     decodes the Rev H boot ROM itself programs (seg126 SLIM=$901,
+    ///     seg127 SLIM=$F00 at $FE0118/$FE0120 -- docs/rom-trace-notes.md
+    ///     OQ2), not page-limited memory-type windows like $5/$6/$7/$8:
+    ///     modeled as FULL-SEGMENT, limit byte ignored entirely. $9 routes
+    ///     to `.io` (identically to $8); $F routes to the new `.special`.
+    ///     docs/hardware-notes.md §1 documents both as newly-observed,
+    ///     absent from the OS source's `do_an_mmu` constant set.
     ///   - Page size is 512 bytes; a segment spans 256 pages (128 KB).
     ///   - readOnly/readWrite/io: `limitPages = (0x100 - (slim & 0xFF)) &
     ///     0xFF`, with a result of 0 meaning 256 pages (two's-complement
@@ -172,6 +185,13 @@ public struct MMU {
                 return .fault(MMUFault(logical: addr, reason: .limitViolation))
             }
             return .memory((UInt32(r.sorg & 0xFFF) << 9) &+ offsetInSegment)
+        case 0x9, 0xF:
+            // iospace ($9) / prom-special ($F): ROM-discovered hardwired
+            // decodes, not limit-checked memory windows (see the doc
+            // comment above). The ROM's own programmed limit bytes ($01 for
+            // $901, $00 for $F00) are not treated as page counts here --
+            // full 128KB segment, unconditionally.
+            return nibble == 0x9 ? .io(offsetInSegment) : .special(offsetInSegment)
         default:    // $C (absent) and every other unassigned nibble
             return .fault(MMUFault(logical: addr, reason: .invalidSegment))
         }

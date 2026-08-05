@@ -176,17 +176,17 @@ public final class EmulationController {
     private let startupGate = DispatchSemaphore(value: 0)
     private let shutdownGate = DispatchSemaphore(value: 0)
 
-    /// PLACEHOLDER Lisa keycap for the mouse button, pending Task 2's
-    /// `KeyMap`/hardware-notes.md §8 research into whether the real Lisa
-    /// delivers mouse-button state as a keycode-shaped event (like the
-    /// documented power-button synthesis, "$FB: power button (synthesized
-    /// as key $08 down/up)", hardware-notes.md "Input Packet State
-    /// Machine" State 4) or some other mechanism. Mirrors `COPS`'s own
-    /// established "flagged placeholder" precedent
-    /// (`COPS.placeholderKeyboardID`). `$7F` chosen only to be a
-    /// syntactically valid 7-bit keycap value, not because it's known to be
-    /// correct or even unused by a real key.
-    static let placeholderMouseButtonKeycap: UInt8 = 0x7F
+    /// Lisa keycap for the mouse button, per hardware-notes.md §8 "Mouse":
+    /// "keycap `$06` in the KEYBOARD stream (down = `$86`, up = `$06`) --
+    /// NOT part of the delta packet." This is an ordinary keycap event
+    /// (`COPS.postKey`), the same channel as every other key -- there is no
+    /// separate "modifier state" or delta-packet-field mechanism for the
+    /// mouse button (Task 1's `placeholderMouseButtonKeycap = 0x7F` --
+    /// Command/Apple -- was a pre-research stand-in per that constant's
+    /// former doc comment; M1c Task 4 corrects it to the researched `$06`
+    /// in lockstep with hardware-notes.md, matching the both-docs rule
+    /// `COPS.placeholderKeyboardID` established for the keyboard-ID byte).
+    static let mouseButtonKeycap: UInt8 = 0x06
 
     public init(romDirectory: URL) throws {
         let framePublisher = self.framePublisher
@@ -286,7 +286,7 @@ public final class EmulationController {
         case .mouseDelta(let dx, let dy):
             machine.bus.cops.postMouse(dx: dx, dy: dy)
         case .mouseButton(let down):
-            machine.bus.cops.postKey(code: placeholderMouseButtonKeycap, down: down)
+            machine.bus.cops.postKey(code: mouseButtonKeycap, down: down)
         }
     }
 

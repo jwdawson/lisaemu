@@ -197,5 +197,122 @@ extension LisaShellMusashiSuites {
             let received = sem.wait(timeout: .now() + 10) == .success
             #expect(received, "the final onFrame assignment should still receive subsequent frames")
         }
+
+        // MARK: mouse + click drive the REAL ROM's boot menu (M1c Task 4
+        // automated backstop -- the acceptance proof that input works
+        // end-to-end without a human at the keyboard/mouse)
+
+        /// Coordinates and cycle budgets below are all trace-derived
+        /// (`swift build -c release --product lisadbg`, then `lisadbg
+        /// --rom ~/Development/LisaROMs` with `g 25000000` to reach the
+        /// documented stable boot-menu window -- same 25M-cycle anchor as
+        /// `ROMBootTests.romCompletesPOSTAndReachesBootMenu`), not guessed:
+        ///
+        /// **Hit-test table** -- disassembling the menu's cursor hit-test
+        /// routine (`d fe2e20 60`) shows, at `$FE2E46`:
+        /// ```
+        /// move.w  $496.w, D6      ; D6 = cursor X
+        /// move.w  $498.w, D7      ; D7 = cursor Y
+        /// lea     $53a.w, A0      ; A0 -> hit-test table
+        /// move.w  (A0)+, D0       ; D0 = entry count
+        /// ...loop: movem.w (A0)+, D1-D5   ; D1=id, D2=xMin, D3=yMin, D4=xMax, D5=yMax
+        ///          cmp.w D2,D6 / D4,D6 / D3,D7 / D5,D7   ; xMin<=X<=xMax && yMin<=Y<=yMax
+        /// ```
+        /// **Live table dump** at cycle 25,000,000 (`m 53a 60`) -- count
+        /// `$0003` at `$53A`, then 3 five-word entries from `$53C`:
+        /// | id (`$53C`+n) | xMin | yMin | xMax | yMax | button (by Y, matches the on-screen layout top-to-bottom) |
+        /// |---|---|---|---|---|---|
+        /// | `$F4` | 416 | 69  | 496 | 96  | RESTART |
+        /// | `$F1` | 416 | 117 | 496 | 144 | CONTINUE |
+        /// | `$F2` | 416 | 165 | 496 | 192 | **STARTUP FROM** |
+        ///
+        /// **Cursor start position** at the same cycle (`m 490 20`):
+        /// `$496`=360, `$498`=182 -- matches the mouse arrow's on-screen
+        /// position in docs/rom-trace-notes.md's boot-menu screenshot. Y=182
+        /// already falls inside STARTUP FROM's Y range (165-192); only X
+        /// needs to move right, from 360 into [416, 496].
+        ///
+        /// **Mouse scaling, empirically measured**: the Lisa mouse driver
+        /// applies its own acceleration curve to raw deltas
+        /// (hardware-notes.md §8, "OS-side scaling modes exist; the
+        /// emulator sends raw deltas only") -- a single `postMouse(dx: 96,
+        /// dy: 0)` packet overshoots to X=504 (outside the button), while
+        /// `dx: 40` lands exactly at X=420, inside [416, 496]. `dx: 40` is
+        /// the value used below.
+        @Test
+        func mouseAndClickDriveTheRealBootMenu() throws {
+            let controller = try makeController()
+            _ = controller.debugSync { machine -> Int in
+                machine.run(until: 25_000_000)
+                return 0
+            }
+
+            func cursorPosition() -> (x: UInt16, y: UInt16) {
+                controller.debugSync { m in (m.bus.read16(0x496), m.bus.read16(0x498)) }
+            }
+            // 64-bit FNV-1a over the framebuffer -- same fingerprint shape
+            // as ROMBootTests' anchor, used here only to detect CHANGE, not
+            // to assert a specific value.
+            func framebufferHash() -> UInt64 {
+                controller.debugSync { m in
+                    var h: UInt64 = 0xcbf2_9ce4_8422_2325
+                    for b in m.bus.framebufferSnapshot() { h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01b3 }
+                    return h
+                }
+            }
+
+            let start = cursorPosition()
+            #expect(start == (360, 182), "boot-menu cursor should start at the trace-documented idle position")
+            let hashBeforeMove = framebufferHash()
+
+            // MARK: Proof 1 -- mouse movement reaches COPS and moves the
+            // ROM's own cursor (the framebuffer changes because the ROM
+            // redrew the cursor bitmap at a new position).
+            controller.post(.mouseDelta(dx: 40, dy: 0))
+            _ = controller.debugSync { machine -> Int in
+                // 200k cycles: well past COPS.byteDeliveryDelayCycles (300)
+                // and interruptReassertDelayCycles (4000), comfortably under
+                // one vsync (VideoTiming.cyclesPerVsync == 83,333) so the
+                // ROM's next cursor-redraw pass has certainly run.
+                machine.run(until: machine.cycles + 200_000)
+                return 0
+            }
+            let afterMove = cursorPosition()
+            #expect(afterMove == (420, 182),
+                    "cursor should have moved to X=420 (inside the STARTUP FROM button) after a dx=40 packet; got \(afterMove)")
+            #expect(framebufferHash() != hashBeforeMove,
+                    "framebuffer must change once the ROM redraws the moved cursor")
+
+            // MARK: Proof 2 -- a click at STARTUP FROM's coordinates changes
+            // menu state: PC leaves the idle-wait poll while handling the
+            // click, the ROM draws a new "STARTUP FROM" device-list window
+            // (framebuffer changes substantially), then settles back into
+            // its (shared) idle-wait poll once that window is drawn.
+            let hashBeforeClick = framebufferHash()
+            controller.post(.mouseButton(down: true))
+            _ = controller.debugSync { machine -> Int in
+                machine.run(until: machine.cycles + 5_000)
+                return 0
+            }
+            let pcDuringClick = controller.debugSync { $0.cpu[.pc] }
+            #expect(!(0x00FE_2DBE...0x00FE_2DD6).contains(pcDuringClick),
+                    "PC should have left the boot-menu idle-wait poll while handling the click; got \(String(format: "%08X", pcDuringClick))")
+
+            controller.post(.mouseButton(down: false))
+            _ = controller.debugSync { machine -> Int in
+                // 3M cycles: comfortably enough for the ROM to draw the
+                // STARTUP FROM window and settle back into idle-wait
+                // (empirically settles well within this budget).
+                machine.run(until: machine.cycles + 3_000_000)
+                return 0
+            }
+            let pcSettled = controller.debugSync { $0.cpu[.pc] }
+            #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pcSettled),
+                    "ROM should settle back into the shared idle-wait poll once the STARTUP FROM window is drawn; got \(String(format: "%08X", pcSettled))")
+
+            let hashAfterClick = framebufferHash()
+            #expect(hashAfterClick != hashBeforeClick,
+                    "clicking STARTUP FROM should draw a new window (device list), changing the framebuffer")
+        }
     }
 }

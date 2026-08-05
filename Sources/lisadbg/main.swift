@@ -32,11 +32,14 @@ func ioAnnotation(_ offset: UInt32) -> String? {
     case 0x8000, 0x8001: return "SLIM port"
     case 0x8008, 0x8009: return "SORG port"
     default:
-        if offset >= 0xD801, offset <= 0xD801 + 15 * 8, (offset - 0xD801) % 8 == 0 {
-            return "VIA1 reg \((offset - 0xD801) / 8)"
+        // ROM-observed bases (docs/hardware-notes.md §3, task-3 VIA core):
+        // VIA1 = $D901 stride 8, VIA2 = $DD81 stride 2. The historical
+        // $D801/$DC01 OS-source equates are refuted for the Rev H boot path.
+        if offset >= 0xD901, offset <= 0xD901 + 15 * 8, (offset - 0xD901) % 8 == 0 {
+            return "VIA1 reg \((offset - 0xD901) / 8)"
         }
-        if offset >= 0xDC01, offset <= 0xDC01 + 15 * 2, (offset - 0xDC01) % 2 == 0 {
-            return "VIA2 reg \((offset - 0xDC01) / 2)"
+        if offset >= 0xDD81, offset <= 0xDD81 + 15 * 2, (offset - 0xDD81) % 2 == 0 {
+            return "VIA2 reg \((offset - 0xDD81) / 2)"
         }
         return nil
     }

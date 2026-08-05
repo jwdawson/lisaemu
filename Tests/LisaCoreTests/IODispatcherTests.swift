@@ -123,24 +123,60 @@ import Testing
     #expect(bus.read8(0xFC_C031) == 0x00)
 }
 
-// MARK: - VIA1 (stride 8, 16 regs at $D801) / VIA2 (stride 2, 16 regs at $DC01)
+// MARK: - VIA1 (stride 8, 16 regs at $D901) / VIA2 (stride 2, 16 regs at $DD81)
+//
+// ROM-observed bases (docs/hardware-notes.md §3); the historical
+// $D801/$DC01 OS-source equates are refuted for the Rev H boot path (see
+// docs/rom-trace-notes.md "Beyond the M1a boundary"). As of Task 3 these
+// route to a real `VIA6522`, not a dumb byte-store stub -- PORTA/PORTB
+// reads are DDR-mixed against `portAInput`/`portBInput` (default all-ones),
+// so DDR is driven all-output here first to make the plain write/read-back
+// shape below observable; full VIA semantics (timers, IFR/IER, DDR mixing
+// itself) are covered by the CPU-free `VIA6522Tests.swift`, not here --
+// this file only checks that `IODispatcher` maps these IOSpace offsets onto
+// the right VIA/register index.
 
 @Test func via1RegisterFileReadBack() {
     let bus = Bus(ramSize: 0x1000)
-    bus.write8(0xFC_D801, 0xAB)          // PORTB1 (index 0)
-    bus.write8(0xFC_D801 + 0x78, 0xCD)   // IORA1 (index 15, offset 15*8=0x78)
-    #expect(bus.read8(0xFC_D801) == 0xAB)
-    #expect(bus.read8(0xFC_D801 + 0x78) == 0xCD)
-    // Untouched register still reads its stub default (0).
-    #expect(bus.read8(0xFC_D801 + 0x08) == 0)
+    bus.write8(0xFC_D901 + 0x10, 0xFF)   // DDRB1 (index 2, offset 2*8=0x10) = all outputs
+    bus.write8(0xFC_D901 + 0x18, 0xFF)   // DDRA1 (index 3, offset 3*8=0x18) = all outputs
+    bus.write8(0xFC_D901, 0xAB)          // ORB1/PORTB1 (index 0)
+    bus.write8(0xFC_D901 + 0x78, 0xCD)   // IORA1 (index 15, offset 15*8=0x78)
+    #expect(bus.read8(0xFC_D901) == 0xAB)
+    #expect(bus.read8(0xFC_D901 + 0x78) == 0xCD)
+    // Untouched register (SR1, index 10, offset 10*8=0x50) still reads its
+    // power-on default (0).
+    #expect(bus.read8(0xFC_D901 + 0x50) == 0)
 }
 
 @Test func via2RegisterFileReadBackWithStrideTwo() {
     let bus = Bus(ramSize: 0x1000)
-    bus.write8(0xFC_DC01, 0x11)          // PORTB2 (index 0)
-    bus.write8(0xFC_DC01 + 30, 0x22)     // IORA2 (index 15, offset 15*2=30)
-    #expect(bus.read8(0xFC_DC01) == 0x11)
-    #expect(bus.read8(0xFC_DC01 + 30) == 0x22)
+    bus.write8(0xFC_DD81 + 4, 0xFF)      // DDRB2 (index 2, offset 4) = all outputs
+    bus.write8(0xFC_DD81 + 6, 0xFF)      // DDRA2 (index 3, offset 6) = all outputs
+    bus.write8(0xFC_DD81, 0x11)          // PORTB2 (index 0)
+    bus.write8(0xFC_DD81 + 30, 0x22)     // IORA2 (index 15, offset 15*2=30)
+    #expect(bus.read8(0xFC_DD81) == 0x11)
+    #expect(bus.read8(0xFC_DD81 + 30) == 0x22)
+}
+
+// MARK: - VIA2 register self-test, the exact stall pattern (rom-trace-notes.md)
+
+@Test func via2T1LatchOffsetsSurviveTheROMSelfTestPattern() {
+    // $FCDD8D/$FCDD8F = T1L-L2/T1L-H2 (base $DD81 + stride-2 offsets 12/14,
+    // i.e. register indices 6/7) -- the exact cells the ROM's VIA2 register
+    // self-test hammers (rom-trace-notes.md "The hard stall"): clear, write
+    // $FF, read back expecting the written value, repeatedly.
+    let bus = Bus(ramSize: 0x1000)
+    for _ in 0..<8 {
+        bus.write8(0xFC_DD8D, 0x00)
+        #expect(bus.read8(0xFC_DD8D) == 0x00)
+        bus.write8(0xFC_DD8D, 0xFF)
+        #expect(bus.read8(0xFC_DD8D) == 0xFF)
+        bus.write8(0xFC_DD8F, 0x00)
+        #expect(bus.read8(0xFC_DD8F) == 0x00)
+        bus.write8(0xFC_DD8F, 0xFF)
+        #expect(bus.read8(0xFC_DD8F) == 0xFF)
+    }
 }
 
 // MARK: - Unknown I/O offsets

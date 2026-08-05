@@ -40,11 +40,15 @@ final class IODispatcher {
     private(set) var vsyncResetCount = 0
     private(set) var vsyncEnableCount = 0
 
-    // VIA1 ($D801, stride 8) / VIA2 ($DC01, stride 2): 16-register logging
-    // stubs. Reads default to 0; writes are stored so ROM read-back sees
-    // what it wrote.
-    private var via1 = [UInt8](repeating: 0, count: 16)
-    private var via2 = [UInt8](repeating: 0, count: 16)
+    // VIA1 ($D901, stride 8) / VIA2 ($DD81, stride 2) -- ROM-observed bases
+    // (docs/hardware-notes.md §3, docs/rom-trace-notes.md "Beyond the M1a
+    // boundary"; the historical $D801/$DC01 OS-source equates are refuted
+    // for the Rev H boot path). `let`, not `private`, so `Bus` can expose
+    // them to `Machine` for timer ticking and IRQ-level computation (see
+    // `Bus.via1`/`Bus.via2`) -- these two real 6522 register files are the
+    // Task 3 replacement for the old dumb 16-byte logging stubs.
+    let via1 = VIA6522()
+    let via2 = VIA6522()
 
     private var contextBit1 = false
     private var contextBit2 = false
@@ -54,28 +58,45 @@ final class IODispatcher {
     }
 
     /// A real (non-peek) read: applies any latch side effect (setup/context
-    /// toggle, vsync count), returns the current value, and logs the
-    /// access. Peek reads must go through a path that skips all of this --
-    /// see `Bus.access`, which never calls `read`/`write` while
-    /// `bus.peeking` is true, calling `currentValue` directly instead.
+    /// toggle, vsync count) for non-VIA offsets, returns the current value,
+    /// and logs the access. Peek reads must go through a path that skips
+    /// all of this -- see `Bus.access`, which never calls `read`/`write`
+    /// while `bus.peeking` is true, calling `currentValue` directly
+    /// instead. VIA registers route to `VIA6522.read(_:)`, which HAS side
+    /// effects of its own (e.g. reading T1CL clears IFR6) -- that is
+    /// exactly the point of splitting this from `currentValue` below, which
+    /// stays side-effect-free for the peek path.
     func read(_ offset: UInt32) -> UInt8 {
-        let value = currentValue(offset)
-        applyLatch(offset)
+        let value: UInt8
+        if let (via, index) = Self.viaRegisterIndex(offset) {
+            value = viaInstance(via).read(index)
+        } else {
+            value = currentValue(offset)
+            applyLatch(offset)
+        }
         record(offset: offset, value: value, isWrite: false)
         return value
     }
 
     func write(_ offset: UInt32, _ value: UInt8) {
-        if !applyLatch(offset) {
+        if let (via, index) = Self.viaRegisterIndex(offset) {
+            viaInstance(via).write(index, value)
+        } else if !applyLatch(offset) {
             applyNonLatchWrite(offset, value)
         }
         record(offset: offset, value: value, isWrite: true)
     }
 
     /// The value a read would currently return -- with NO side effects.
-    /// Used both by `read` and directly by `Bus.access` for peek reads
-    /// (which must observe current state without toggling any latch or
-    /// logging to `ioTrace`).
+    /// Used both by `Bus.access` for peek reads (which must observe current
+    /// state without toggling any latch, mutating any VIA register, or
+    /// logging to `ioTrace`) and internally by `read` for the non-VIA
+    /// offsets that have no read side effect of their own beyond the
+    /// address-decoded latches `read` applies afterward. VIA offsets route
+    /// to `VIA6522.peek(_:)`, the side-effect-free twin of `VIA6522.read`
+    /// -- see that method's doc comment for why a peek must never reach
+    /// `VIA6522.read` directly (T1CL/T2CL reads clear IFR bits on real
+    /// hardware).
     func currentValue(_ offset: UInt32) -> UInt8 {
         switch offset {
         case 0xE800: return videoPageLatch
@@ -83,7 +104,7 @@ final class IODispatcher {
         case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
         default:
             if let (via, index) = Self.viaRegisterIndex(offset) {
-                return via == 1 ? via1[index] : via2[index]
+                return viaInstance(via).peek(index)
             }
             // Genuinely unknown I/O-space offset (real IOSpace, $FC0000-
             // $FDFFFF, or the ROM's iospace nibble $9 -- both land here via
@@ -123,16 +144,14 @@ final class IODispatcher {
         return true
     }
 
+    /// VIA writes are handled directly in `write` above (before this is
+    /// ever reached), so this only covers the remaining non-latch,
+    /// non-VIA offsets.
     private func applyNonLatchWrite(_ offset: UInt32, _ value: UInt8) {
         switch offset {
         case 0xE800: videoPageLatch = value
         case 0xF801, 0xC031: break   // hardware-driven; CPU writes have no effect
-        default:
-            if let (via, index) = Self.viaRegisterIndex(offset) {
-                if via == 1 { via1[index] = value } else { via2[index] = value }
-            }
-            // Everything else: unknown I/O space -- write has no effect
-            // beyond being logged (below).
+        default: break   // unknown I/O space -- write has no effect beyond being logged
         }
     }
 
@@ -140,12 +159,20 @@ final class IODispatcher {
         bus.domain = (contextBit1 ? 1 : 0) | (contextBit2 ? 2 : 0)
     }
 
+    private func viaInstance(_ via: Int) -> VIA6522 {
+        via == 1 ? via1 : via2
+    }
+
+    /// ROM-observed bases (docs/hardware-notes.md §3): VIA1 = `$D901`,
+    /// stride ×8; VIA2 = `$DD81`, stride ×2. The historical OS-source
+    /// equates ($D801/$DC01) are refuted for the Rev H boot path -- see
+    /// docs/rom-trace-notes.md "Beyond the M1a boundary".
     private static func viaRegisterIndex(_ offset: UInt32) -> (via: Int, index: Int)? {
-        if offset >= 0xD801, offset <= 0xD801 + 15 * 8, (offset - 0xD801) % 8 == 0 {
-            return (1, Int((offset - 0xD801) / 8))
+        if offset >= 0xD901, offset <= 0xD901 + 15 * 8, (offset - 0xD901) % 8 == 0 {
+            return (1, Int((offset - 0xD901) / 8))
         }
-        if offset >= 0xDC01, offset <= 0xDC01 + 15 * 2, (offset - 0xDC01) % 2 == 0 {
-            return (2, Int((offset - 0xDC01) / 2))
+        if offset >= 0xDD81, offset <= 0xDD81 + 15 * 2, (offset - 0xDD81) % 2 == 0 {
+            return (2, Int((offset - 0xDD81) / 2))
         }
         return nil
     }

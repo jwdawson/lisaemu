@@ -206,7 +206,11 @@ public final class COPS {
     /// Total bytes currently queued for delivery to the CPU, including one
     /// already "ready" on Port A (`byteReady`) but not yet consumed via a
     /// handshake read, if any. Read-only; no behavior depends on it or is
-    /// gated by it.
+    /// gated by it. Undercounts by up to 1 while a byte is "in flight"
+    /// (`deliveryScheduled == true`, removed from `inputQueue` but not yet
+    /// `byteReady` -- see `scheduleDeliveryIfIdle`): that byte is counted
+    /// in neither term for the `byteDeliveryDelayCycles` window between the
+    /// two.
     ///
     /// M1c shell hook (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
     /// Task 1, "input events reach COPS" test): `EmulationController` runs

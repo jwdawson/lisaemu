@@ -161,5 +161,41 @@ extension LisaShellMusashiSuites {
             #expect(after == before + 1 + 3,
                     "1 keyDown byte + 3 mouseDelta bytes (marker+dx+dy) should be queued into COPS")
         }
+
+        // MARK: onFrame cross-thread reassignment (data-race fix regression)
+
+        /// Structural regression test for `FramePublisher.onFrame`'s
+        /// lock-protected get/set (a plain unsynchronized `var` there was a
+        /// genuine data race: written from any caller thread, read+invoked
+        /// from the emulation thread every vsync). Reassigns `onFrame`
+        /// repeatedly from THIS thread while the emulation thread is
+        /// running unthrottled and concurrently invoking whatever
+        /// `onFrame` currently holds on every vsync -- exercises the exact
+        /// concurrent access pattern the lock exists to make safe.
+        ///
+        /// This does not (and no single test run could) deterministically
+        /// PROVE the absence of a race -- that needs a sanitizer run under
+        /// contention, not a `Test` assertion. What it does verify: the
+        /// reassignment itself doesn't crash/deadlock under real concurrent
+        /// pressure, and -- the actually-observable correctness property --
+        /// the LAST assignment wins and keeps receiving subsequent frames
+        /// (which a torn/lost write from an unsynchronized `var` could
+        /// plausibly break).
+        @Test
+        func reassigningOnFrameWhileRunningIsRaceFree() throws {
+            let controller = try makeController()
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller, timeout: 15) { $0.cycles > 0 })
+
+            for i in 0..<200 {
+                controller.framePublisher.onFrame = { _ in _ = i }
+            }
+
+            let sem = DispatchSemaphore(value: 0)
+            controller.framePublisher.onFrame = { _ in sem.signal() }
+            let received = sem.wait(timeout: .now() + 10) == .success
+            #expect(received, "the final onFrame assignment should still receive subsequent frames")
+        }
     }
 }

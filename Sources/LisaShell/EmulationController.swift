@@ -221,6 +221,12 @@ public final class EmulationController {
 
     /// Returns the raw 1bpp framebuffer snapshot + dimensions via `Frame`
     /// (PNG-encoding stays app-side, per the plan's Task 1 interfaces).
+    /// `completion` fires ON THE EMULATION THREAD, same as `onFrame`/
+    /// `onStatus` -- the app hops threads itself. The returned `Frame`'s
+    /// `sequence` is `framePublisher.currentSequence` (the most recently
+    /// published vsync frame's number, or 0 if none yet), not a fabricated
+    /// `0` -- see that property's doc comment for why a hardcoded `0` would
+    /// wrongly collide with `Frame`'s own "no frame published yet" sentinel.
     public func requestScreenshot(_ completion: @escaping (Frame) -> Void) {
         shared.mailbox.post(.screenshot(completion))
     }
@@ -325,7 +331,7 @@ public final class EmulationController {
                     completion(Frame(bits: machine.bus.framebufferSnapshot(),
                                       width: Bus.framebufferWidth,
                                       height: Bus.framebufferHeight,
-                                      sequence: 0))
+                                      sequence: shared.framePublisher.currentSequence))
                 case .debug(let body):
                     body(machine)
                 case .shutdown:

@@ -1,3 +1,5 @@
+import Foundation
+
 /// Immutable snapshot of one vsync's framebuffer, published to the app.
 ///
 /// `bits` is the raw 1bpp packed snapshot straight from
@@ -25,15 +27,43 @@ public struct Frame {
 /// `onFrame` closure; this type never does that hop itself, matching the
 /// plan's "Frame publication" bullet verbatim.
 ///
+/// `onFrame` ITSELF, however, is set from any caller thread (the app
+/// assigns it once, typically at startup, from whatever thread constructed
+/// the controller) while being read+invoked from the emulation thread on
+/// every vsync -- an unsynchronized `var` here would be a genuine data race
+/// under Swift's memory model. Guarded by `lock`, the same NSLock-backed
+/// get/set shape `EmulationController`'s `Shared.onStatus` already uses:
+/// the emulation thread takes the lock only long enough to copy the closure
+/// reference out, then invokes it outside the lock (so a slow/reentrant
+/// `onFrame` implementation can't hold up a concurrent `onFrame =` from
+/// another thread).
+///
 /// Deliberately has no `Machine`/`Bus` reference of its own -- framebuffer
 /// capture is the controller's job (see `EmulationController.makeMachine`'s
 /// `Machine.onVsync` wiring). This mirrors `COPS`/`VideoTiming`'s
 /// dependency-injected, `Machine`-free shape in `LisaCore`, keeping this
 /// type trivially constructible and testable in isolation.
 public final class FramePublisher {
-    public var onFrame: ((Frame) -> Void)?
+    private let lock = NSLock()
+    private var _onFrame: ((Frame) -> Void)?
+    public var onFrame: ((Frame) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onFrame }
+        set { lock.lock(); defer { lock.unlock() }; _onFrame = newValue }
+    }
 
+    /// Only ever read/written from the emulation thread (`publish(...)`,
+    /// called from `Machine.onVsync`, and `EmulationController`'s
+    /// `.screenshot` mailbox handler, which reads `currentSequence` --
+    /// both run exclusively on that one thread), so unlike `onFrame` this
+    /// needs no lock of its own.
     private var sequence: UInt64 = 0
+
+    /// The most recently published frame's sequence number (0 if none has
+    /// been published yet -- the same "no frame yet" sentinel `Frame`'s own
+    /// doc comment establishes). `EmulationController.requestScreenshot`
+    /// uses this so an ad-hoc screenshot's `Frame.sequence` reflects the
+    /// real current sequence rather than colliding with that sentinel.
+    var currentSequence: UInt64 { sequence }
 
     public init() {}
 

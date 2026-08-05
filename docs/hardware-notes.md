@@ -196,11 +196,17 @@ docs/rom-trace-notes.md "Trace checkpoint B" has the full citation. Model:
 falls through to the existing generic "unknown I/O offset" stub, confirmed
 sufficient (the ROM proceeds past every occurrence regardless).
 
-**StatusRegister bit 1 — new context, still undetermined:** tested inside
-an NMI-vector-installing RAM/bus-error presence probe (`$FE0F46-$FE0F72`,
-installs a handler at low-core `$7C`) within the same RAM-sizing routine —
-likely related to the "Known Gaps" parity/bus-error status noted below,
-not vsync. See docs/rom-trace-notes.md "Trace checkpoint B" for the trace.
+**StatusRegister bit 1 — new context, reconfirmed safe (M1b Task 6):** tested
+inside an NMI-vector-installing RAM/bus-error presence probe
+(`$FE0F46-$FE0F72`, installs a handler at low-core `$7C`) within the same
+RAM-sizing routine — likely related to the "Known Gaps" parity/bus-error
+status noted below, not vsync. M1b Task 6 traced all three gating sites
+(`$FE00D0`, `$FE0F14`, and inside the NMI handler at `$FE0F72`) and confirmed
+this model's default (bit clear) never takes any of their error/skip
+branches — POST proceeds normally through all three. Exact real-hardware
+semantics remain undetermined; see docs/rom-trace-notes.md "Bus-error frame
+spike (M1b Task 6)" for the full trace (supersedes the Trace checkpoint B
+citation for this bit).
 
 **Interrupt:** Level 1 (autovector $64) — libhw-DRIVERS:895-898
 
@@ -560,6 +566,18 @@ Source: STARTUP:326, 344-346, 389-396
 - Loader determines physical RAM size (l_physicalmem/membase/memleng via $2A4)
 - Mapped into MMUs 85-100 (16 × 128KB = 2MB maximum)
 
+**Boot ROM POST-level sizing (M1b Task 6, distinct from the OS loader above):**
+the Rev H boot ROM's own RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`,
+docs/rom-trace-notes.md "Bus-error frame spike") reads a hardware ID register
+at **`$FCF000`** directly (`move.w $fcf000.l,D1` at `$FE0FF2`, called twice)
+to determine installed RAM — NOT by probing for a bus error at the top of
+RAM. Its only fault-shaped defensive mechanism is the **NMI** vector (`$7C`),
+not the CPU bus-error vector — see "NMI and Debugger Break-In" below.
+`$FCF000`'s exact bit encoding is undetermined (evidence-gated, unstubbed —
+`0xFF` bytes); the routine's result is never branched on before the current
+frontier, so this is not blocking. Candidate for a later task if a
+POST-visible RAM-size mismatch surfaces past Task 7's frontier.
+
 ### I/O Board IDs
 
 Source: SOURCE-CD:49-53
@@ -621,7 +639,14 @@ Source: LDASM:68-106
   M1b Task 5 found the ROM's own usage SITE for `$F801` bit 1 (an
   NMI-vector-installing RAM-probe at `$FE0F46-$FE0F72`, see §2 "Vertical
   Retrace" above and docs/rom-trace-notes.md "Trace checkpoint B") but not
-  the bit's exact semantics — still open.
+  the bit's exact semantics. M1b Task 6 reconfirmed the default (clear) is
+  safe at all three gating sites (docs/rom-trace-notes.md "Bus-error frame
+  spike") — still open on exact semantics, not blocking.
+- `$FCF000` RAM-size ID register bit encoding not located (M1b Task 6, see
+  §6 "RAM Sizing" and docs/rom-trace-notes.md "Bus-error frame spike") — the
+  boot ROM reads it directly for POST-level memory sizing; unstubbed
+  (`0xFF`), not blocking since the routine's result is never branched on
+  before the current frontier.
 - RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.
 - `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
   site found (bracketing a RAM-sizing/checksum routine, result discarded),

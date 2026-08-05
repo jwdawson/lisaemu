@@ -257,7 +257,7 @@ while let line = readLine(strippingNewline: true) {
                 print(formatIOAccess(access))
             }
         }
-        var status = "      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites)"
+        var status = "      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount)"
         if machine.bus.ioTraceDropped > 0 {
             status += " ioTraceDropped=\(machine.bus.ioTraceDropped)"
         }
@@ -278,7 +278,7 @@ while let line = readLine(strippingNewline: true) {
         for access in machine.bus.ioTrace[beforeIO...] {
             print(formatIOAccess(access))
         }
-        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) halted=\(machine.halted)")
+        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted)")
         print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
     case .screenshot(let path):

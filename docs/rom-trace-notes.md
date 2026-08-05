@@ -302,7 +302,7 @@ recorded here as a future serial-device requirement.
 | `$F801` status register bit 2 (`btst #2`, vsync)          | **DONE (Task 5)** — real `VideoTiming`; see "Trace checkpoint B" below | ~~Task 5~~ |
 | `$E018/$E01A` video strobes (VertReset/VRIRDIS, VRIRENB)  | **DONE (Task 5)** — arm/clear semantics validated against ROM's own access order; see "Trace checkpoint B" | ~~Task 5~~ |
 | `$E01C/$E01E` video strobes                               | **DIAGNOSED, no model change (Task 5)** — bare bracketing strobes around a RAM-sizing/checksum routine, result never branched on; see "Trace checkpoint B" | ~~Task 5~~ |
-| `$F801` status register bit 1 (`btst #1`)                 | still undetermined — new context found (NMI/bus-error RAM-probe, not vsync); see "Trace checkpoint B" | later task |
+| `$F801` status register bit 1 (`btst #1`)                 | **DONE (Task 6)** — exact semantics still undetermined, but reconfirmed safe: default 0 never diverts any of the 3 gating sites; see "Bus-error frame spike" below | ~~later task~~ |
 | `$FE2DBE` unconditional "next COPS input byte" wait        | genuine open frontier — confirmed NOT vsync-related (SR interrupt mask blocks all levels here regardless); needs either a real unsolicited COPS event or further call-chain tracing to determine what, if anything, the ROM expects | later task |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
@@ -616,6 +616,194 @@ Pepsi-only contrast/DAC adjustment and otherwise proceeds normally. `0x00` does
 benign. **The `0x00` default is correct and needs no change** (it selects the
 simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).
 
+## Bus-error frame spike + board-ID/memory-sizing validation (M1b Task 6)
+
+M0/M1a parked a known Musashi defect: `m68ki_exception_bus_error()`
+(`Sources/CMusashi/m68kcpu.h`) pushes the 68010-only 29-word format-8 frame
+(`m68ki_stack_frame_1000`) with the FAULT ADDRESS field hardcoded to 0,
+instead of the real 68000 7-word group-0 frame (`m68ki_stack_frame_buserr`,
+which the vendored core's *address-error* path already uses correctly) with
+`m68ki_aerr_address`/`m68ki_aerr_write_mode` populated from the fault. This
+task's brief: does the ROM ever take a *recoverable* bus error (a handler
+that RTEs back) on the path to the current frontier, or will POST's memory
+test need one? Method: instrument, run to and past the frontier, then
+disassemble every place the ROM installs vector `$8` (bus error) to see how
+it actually uses it.
+
+### Live instrumentation: zero bus-error pulses through the frontier
+
+`Bus.busErrorPulseCount` (new, bounded diagnostic counter alongside
+`mmuPortWrites`/`lastFault`) increments once per real (non-peek,
+non-double-fault) `busErrorHandler` invocation — i.e. once per genuine
+Musashi bus-error exception the CPU actually takes. Wired into `lisadbg`'s
+`t`/`g` status lines and asserted by
+`ROMBootTests.romTakesNoBusErrorThroughTheFrontier`. Running the full boot
+10M cycles past the `$FE2DBE` frontier (30M total, `lisadbg g 30000000`):
+
+```
+setup=OFF domain=0 mmuPortWrites=4384 busErrorPulses=0 halted=false
+PC=00FE2DCE
+```
+
+**Zero bus errors, the entire way.** Every access the ROM makes on this path
+either lands in mapped RAM/ROM, a modeled IOSpace register, or an
+`IODispatcher`/`specialAccess` "unknown, stub `0xFF`" fallback — none of
+which raise a real `.fault` in `Bus.access`/`MMU.translate`. The only way to
+reach `.fault` today is an absent segment (nibble `$C`, domain-0 segments
+16-125) or a write to a read-only segment; the ROM's boot-path device probes
+never touch those.
+
+### Static evidence: the ROM's own bus-error idiom never RTEs
+
+A full linear disassembly of the ROM image (`lisadbg d fe0000 9000`, same
+method Task 5 used for the SNUM sweep) finds **22 sites** that install a
+handler at vector `$8` (`move.l A3,$8.w` or equivalent) and, across the
+*entire* 16KB image, only **2** `rte` instructions total:
+
+- `$FE00F4` — inside a block (`$FE00CA-$FE00F4`) that is not a branch target
+  anywhere in the ROM (confirmed by grepping every `$FE00C*`/`$FE00CA`
+  reference); it sits between the checksum-failure infinite loop
+  (`$FE00C8: bra $fe00c8`) and the real reset entry (`$FE00F6`, the
+  documented PC-vector target). Dead disassembly, not reachable code.
+- `$FE0DF6` (`moveq #$1,D2 / rte`) — reached via `movea.l A2,$7c.w` /
+  `move.l A3,$7c.w` at `$FE0D5C-$FE0D64` (offset **`$7c`**, the **NMI**
+  vector, not `$8`). This is a genuinely RTE-terminated handler, but it is
+  Musashi's `m68ki_exception_interrupt` path (autovectored level-7
+  interrupt), a completely different C function from
+  `m68ki_exception_bus_error` — the frame-format bug does not apply to it.
+
+So **none** of the ROM's 22 real bus-error (`$8`) handler installations ever
+execute `rte`. Representative disassembly of three of them:
+
+```
+; VIA2 T1-latch self-test guard (installed $FE08B4, target from $FE08B0)
+FE0DF8: moveq   #$32, D0        ; error code
+FE0DFA: bset    #$a, D7         ; mark failure bit
+FE0DFE: bra     $fe0918         ; -> shared "mark + continue POST" dispatcher
+
+; $D241 (candidate SCC) presence probe guard (installed $FE100C)
+FE10EE: cmpa.l  #$fcd241, A0
+FE10F4: bne     $fe10fa
+FE10F6: moveq   #$38, D0
+FE10F8: bra     $fe10fc
+FE10FA: moveq   #$37, D0        ; boot error code $37/$38
+FE10FC: tst.l   D7
+FE10FE: bpl     $fe1108
+FE1100: movea.w #$480, A7       ; reset SP, retry from the top
+FE1104: bra     $fe1008
+FE1108: bra     $fe0918         ; -> same shared dispatcher
+
+; the shared dispatcher itself
+FE0918: bset    #$12, D7
+FE091C: bra     $fe0758
+```
+
+Both funnel into `$FE0918`, a shared "record a failure bit in D7, then
+`bra`" continuation — never a return into the faulting instruction stream.
+Neither reads any field of the pushed exception frame (D0's error code comes
+from a register comparison against the probed address already in A0, not
+from the stack), so the frame's fault-address bug is invisible to them
+regardless of correctness.
+
+A second idiom, used by the I/O-board `MOVEP` presence probes
+(`$FE1306-$FE137E`, `$FE2160-$FE21A6`), sidesteps the frame shape even more
+directly: it saves `A7` into `A6` *before* the guarded probes, installs a
+trivial one-instruction handler that just falls through into the next real
+instruction on a fault (no `rte`, no stack adjustment), and unconditionally
+restores `A7 := A6` once all probes finish — discarding whatever the CPU
+pushed for any fault that occurred in between, wholesale, regardless of its
+length. Musashi's buggy 29-word frame vs. the correct 7-word frame changes
+only how much transient stack headroom this consumes between probes, not
+correctness.
+
+**Even the ROM's own default/baked-in bus-error handler doesn't RTE.**
+Before any POST code installs a handler, vector `$8` (and vector `$C`,
+address error — both share the same target) reads through the
+`$0000-$3FFF` ROM mirror (`setupMode == true`) to `$FE0030`
+(`m fe0000 20`: bytes 8-11 = `00 FE 00 30`):
+
+```
+FE0030: movea.w #$480, A7      ; reset SP to the boot value
+FE0034: clr.l   D7             ; clear the cumulative-failure register
+FE0036: bra     $fe0194        ; -> restart the checksum self-test
+```
+
+A full POST restart, not a resume.
+
+**Conclusion:** this ROM's bus-error idiom is structurally "abandon the
+faulting context, mark/record, continue POST elsewhere" — never
+"trap-and-resume via RTE." The frame layout/fault-address bug this task was
+scoped to evaluate has **no observable effect on any bus-error usage this
+ROM makes**, confirmed both empirically (zero pulses through the live
+frontier) and statically (every reachable installed handler, plus the
+default handler, discards the frame rather than consuming it).
+
+### Memory sizing: reads a hardware ID register, not fault-probed
+
+The RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`, already located by Task
+5 as the `$E01C`/`$E01E`/`$F801`-bit-1 usage site) sizes memory by reading
+**`$FCF000`** directly (`FE0FF0-FE0FFE`, called from `$FE0F2A` and again
+from `$FE0F78`):
+
+```
+FE0FF0: clr.l   D1
+FE0FF2: move.w  $fcf000.l, D1   ; hardware "installed RAM" ID register
+FE0FF8: move.w  D1, $1aa.w      ; stash the raw value
+FE0FFC: lsl.l   #5, D1          ; magnitude/granularity decode
+FE0FFE: rts
+```
+
+This is a **direct register read**, not bus-error-probe-based sizing. The
+only defensive-fault mechanism in this routine is the **NMI** vector
+(`$7c`, level 7 — see `$FE0D5C-$FE0D64` and `$FE0F46-$FE0F4A` installing
+handlers there), not the CPU bus/address-error vector `$8` this task is
+about — a different Musashi code path entirely, unaffected by the format-8
+bug.
+
+Under the current model, `$FCF000` is unstubbed IOSpace (`0xFF` bytes, raw
+`D1 = $FFFF`). The resulting computed "extra RAM" walk address lands, once
+masked to 24 bits, inside segment 127's `.special` decode (the ROM/SNUM
+window) rather than a genuinely absent RAM segment — `specialAccess` serves
+that with its existing logged `0xFF` stub, not a fault, so the checksum
+loop simply completes on stub bytes. This matches the established pattern
+(`hardware-notes.md` "$E01C/$E01E — diagnosed, not modeled"): **the ROM
+never branches on this loop's result**, and forward progress to the
+frontier does not depend on `$FCF000` returning a value that matches the
+true 2 MB configuration. `$FCF000`'s exact encoding is left undetermined
+(evidence-gated, same as `$D241`/`$E01C`/`$E01E`) — a candidate for a later
+task if a POST-visible RAM-size mismatch ever surfaces past this frontier.
+
+### `$F801` bit 1 — reconfirmed safe, no divert
+
+Three call sites gate on it: `$FE00D0` (pre-checksum), `$FE0F14` (entering
+the RAM-sizing routine), and inside the NMI handler installed at `$FE0F46`
+(`$FE0F72-$FE0F74`) — all `btst #$1,$fcf801` / `bne $fe0704` (an error/skip
+branch). `Z` is set when the bit is *clear*, so `bne` requires bit 1 = 1 to
+divert. This model's default (`IODispatcher.statusByte` undriven bits = 0)
+never sets it, so none of the three sites divert — POST proceeds normally
+through all of them, exactly as Task 5 already established for the same
+bit. No behavior change; this re-confirms it against the newly-precise
+`$FCF000`/NMI context above rather than leaving it as a dangling "later
+task" pointer.
+
+### DECISION: defer the Musashi bus-error-frame fix to M2
+
+Per the plan's decision framework: **no recoverable bus error is observed
+or needed through the `$FE2DBE` frontier.** `Bus.busErrorPulseCount == 0`
+live through 30M cycles (10M past the frontier), and the ROM's own
+bus-error idiom — checked both live and statically across all 22
+installation sites plus the ROM-baked default handler — never depends on
+RTE-based resumption or on the pushed frame's content, so even a
+hypothetical future fault along an as-yet-unreached POST probe would not be
+observably affected by the current frame bug. POST's memory sizing is
+register-read-based (`$FCF000`), not fault-probe-based, and its one
+fault-shaped defensive path uses the NMI vector, not the CPU bus-error
+vector this bug lives in. **M2 owns the real 68000 group-0 frame fix**
+(swap to `m68ki_stack_frame_buserr`, plumb address/isWrite into
+`m68ki_aerr_address`/`m68ki_aerr_write_mode`) whenever a future task's trace
+actually needs it; this spike found no such need before Task 7's POST-menu
+frontier.
+
 ## Instrumentation added (Task 7, diagnostics only)
 
 - `Bus.mmuPortLog` — bounded (8192) log of completed SLIM/SORG port writes
@@ -629,3 +817,15 @@ simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).
 
 No device behavior was changed: no stub return value was altered, because the
 trace shows the ROM halts before reaching any stub-served register.
+
+## Instrumentation added (M1b Task 6, diagnostics only)
+
+- `Bus.busErrorPulseCount` — bounded counter, incremented once per real
+  (non-peek, non-double-fault) `busErrorHandler` invocation, i.e. once per
+  genuine Musashi bus-error exception the CPU actually takes. See "Bus-error
+  frame spike" above.
+- `lisadbg`: the `t`/`g` status lines gained `busErrorPulses=`.
+
+No device behavior was changed here either: the ROM never reaches the
+`.fault` branch of `Bus.access` on the traced path, so this counter stays 0
+and no stub was touched.

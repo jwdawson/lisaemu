@@ -192,5 +192,33 @@ extension MusashiSuites {
             #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pc),
                     "PC should be in the documented post-COPS-handshake input-wait region; got \(String(format: "%08X", pc))")
         }
+
+        /// **M1b Task 6** (task-6-report.md / docs/rom-trace-notes.md "Bus-error
+        /// frame spike") instrumented `Bus.busErrorPulseCount` and ran the
+        /// boot 10M cycles past the `$FE2DBE` frontier (30M total). The count
+        /// stays 0 the entire way: the RAM-sizing routine (`$FE0D68-$FE0FCC`)
+        /// sizes memory by reading a hardware ID register (`$FCF000`), not by
+        /// probing via fault, and every device-presence probe on this path
+        /// (VIA2, COPS/VIA2, the `$D241` candidate SCC) targets IOSpace
+        /// addresses `IODispatcher` serves with a benign stub rather than an
+        /// MMU segment fault. This is the empirical half of the spike's
+        /// evidence for deferring the Musashi 68010-format bus-error-frame
+        /// fix (`m68ki_exception_bus_error` hardcoding a 29-word format-8
+        /// frame with fault address 0 instead of the real 68000 7-word
+        /// group-0 frame) to M2 -- see task-6-report.md for the static
+        /// disassembly evidence (the ROM's ~20 vector-`$8` handler
+        /// installations never RTE; they either fall into a shared
+        /// mark-failure-and-continue dispatcher or get wholesale-discarded
+        /// via a saved/restored A7, so the frame's exact shape/fault-address
+        /// content is unread either way).
+        @Test
+        func romTakesNoBusErrorThroughTheFrontier() throws {
+            let m = try bootedMachine()
+            m.run(until: 30_000_000)
+
+            #expect(m.halted == false, "still no halt/fault at 30M cycles")
+            #expect(m.bus.busErrorPulseCount == 0,
+                    "no recoverable-or-otherwise bus error should occur on the boot path through the $FE2DBE frontier")
+        }
     }
 }

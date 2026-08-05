@@ -30,6 +30,16 @@ public final class Bus {
     public private(set) var lastFault: MMUFault?
     public private(set) var unmappedAccesses: [UInt32] = []
     public private(set) var unmappedDropped = 0
+    /// Count of real (non-peek, non-double-fault) `busErrorHandler` pulses --
+    /// i.e. how many times a translated CPU access actually raised a
+    /// Musashi 68000 bus-error exception (M1b Task 6 diagnostic
+    /// instrumentation, docs/rom-trace-notes.md "Bus-error frame spike").
+    /// Incremented in the same branch that invokes `busErrorHandler`, right
+    /// before the call -- NOT incremented for the double-bus-fault
+    /// (`forceHaltHandler`) branch, since that path never reaches Musashi's
+    /// bus-error exception at all. Used to answer whether the boot ROM ever
+    /// takes a *recoverable* bus error before the current frontier.
+    public private(set) var busErrorPulseCount = 0
     /// Count of SLIM/SORG MMU-port writes (`Bus.slimSorgPortAccess`,
     /// docs/hardware-notes.md "Register Port Addressing"). Incremented once
     /// per high-byte (i.e. per 16-bit register) write, not once per byte --
@@ -338,6 +348,7 @@ public final class Bus {
                     forceHaltHandler?()
                 } else {
                     faultPendingResolution = true
+                    busErrorPulseCount += 1
                     busErrorHandler?(address, isWrite)
                 }
             }

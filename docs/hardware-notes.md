@@ -196,17 +196,21 @@ docs/rom-trace-notes.md "Trace checkpoint B" has the full citation. Model:
 falls through to the existing generic "unknown I/O offset" stub, confirmed
 sufficient (the ROM proceeds past every occurrence regardless).
 
-**StatusRegister bit 1 — new context, reconfirmed safe (M1b Task 6):** tested
-inside an NMI-vector-installing RAM/bus-error presence probe
+**StatusRegister bit 1 — new context, still undetermined (M1b Task 6):**
+tested inside an NMI-vector-installing RAM/bus-error presence probe
 (`$FE0F46-$FE0F72`, installs a handler at low-core `$7C`) within the same
 RAM-sizing routine — likely related to the "Known Gaps" parity/bus-error
-status noted below, not vsync. M1b Task 6 traced all three gating sites
-(`$FE00D0`, `$FE0F14`, and inside the NMI handler at `$FE0F72`) and confirmed
-this model's default (bit clear) never takes any of their error/skip
-branches — POST proceeds normally through all three. Exact real-hardware
-semantics remain undetermined; see docs/rom-trace-notes.md "Bus-error frame
-spike (M1b Task 6)" for the full trace (supersedes the Trace checkpoint B
-citation for this bit).
+status noted below, not vsync. M1b Task 6 disassembled all three statically
+gating sites (`$FE00D0`, `$FE0F14`, and inside the NMI handler at `$FE0F72`)
+but an unbounded live single-step trace (every instruction, reset through
+30M cycles — 14M past the `$FE2DBE` frontier) found `$FE00D0` sits in
+unreachable dead disassembly and the other two score zero PC hits — none of
+the three are confirmed live-reached. Real semantics, and whether this
+model's default (bit clear) has any live consequence at all before the
+frontier, remain fully undetermined; see docs/rom-trace-notes.md "Bus-error
+frame spike (M1b Task 6)" for the full trace (an earlier draft of this note
+claimed "reconfirmed safe" from static analysis alone — retracted after the
+live check).
 
 **Interrupt:** Level 1 (autovector $64) — libhw-DRIVERS:895-898
 
@@ -566,17 +570,24 @@ Source: STARTUP:326, 344-346, 389-396
 - Loader determines physical RAM size (l_physicalmem/membase/memleng via $2A4)
 - Mapped into MMUs 85-100 (16 × 128KB = 2MB maximum)
 
-**Boot ROM POST-level sizing (M1b Task 6, distinct from the OS loader above):**
-the Rev H boot ROM's own RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`,
-docs/rom-trace-notes.md "Bus-error frame spike") reads a hardware ID register
-at **`$FCF000`** directly (`move.w $fcf000.l,D1` at `$FE0FF2`, called twice)
-to determine installed RAM — NOT by probing for a bus error at the top of
-RAM. Its only fault-shaped defensive mechanism is the **NMI** vector (`$7C`),
-not the CPU bus-error vector — see "NMI and Debugger Break-In" below.
-`$FCF000`'s exact bit encoding is undetermined (evidence-gated, unstubbed —
-`0xFF` bytes); the routine's result is never branched on before the current
-frontier, so this is not blocking. Candidate for a later task if a
-POST-visible RAM-size mismatch surfaces past Task 7's frontier.
+**Boot ROM POST-level sizing (M1b Task 6, distinct from the OS loader above)
+— statically present, live reachability NOT confirmed:** the Rev H boot
+ROM's RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`,
+docs/rom-trace-notes.md "Bus-error frame spike") reads a hardware ID
+register at **`$FCF000`** at 3 static call sites (`$FE0F2A`, `$FE0F78`,
+`$FE0714`, all via a shared `move.w $fcf000.l,D1` subroutine at `$FE0FF0`)
+plus 2 more direct reads (`$FE00DA`, `$FE0DAE`) — NOT by probing for a bus
+error at the top of RAM. Its only fault-shaped defensive mechanism is the
+**NMI** vector (`$7C`), not the CPU bus-error vector — see "NMI and
+Debugger Break-In" below. An unbounded live single-step trace (every
+instruction, reset through 30M cycles) found **zero** hits on this entire
+routine (entry points, body, and all 3 `$FCF000`-subroutine callers alike)
+— it is statically present in the ROM image but not confirmed to execute
+on the traced boot path; dead-code-for-this-configuration, NMI-only-reached,
+and reached-only-past-the-frontier are all open possibilities. `$FCF000`'s
+exact bit encoding is undetermined (evidence-gated, unstubbed — `0xFF`
+bytes) regardless. See docs/rom-trace-notes.md "Bus-error frame spike" for
+the full reachability evidence.
 
 ### I/O Board IDs
 
@@ -639,14 +650,17 @@ Source: LDASM:68-106
   M1b Task 5 found the ROM's own usage SITE for `$F801` bit 1 (an
   NMI-vector-installing RAM-probe at `$FE0F46-$FE0F72`, see §2 "Vertical
   Retrace" above and docs/rom-trace-notes.md "Trace checkpoint B") but not
-  the bit's exact semantics. M1b Task 6 reconfirmed the default (clear) is
-  safe at all three gating sites (docs/rom-trace-notes.md "Bus-error frame
-  spike") — still open on exact semantics, not blocking.
+  the bit's exact semantics. M1b Task 6 checked all three statically-cited
+  gating sites for live reachability (unbounded single-step trace, reset
+  through 30M cycles): `$FE00D0` is unreachable dead disassembly, and
+  `$FE0F14`/`$FE0F72` scored zero live PC hits — none confirmed reached.
+  Still fully open, not confirmed blocking or safe either way (see
+  docs/rom-trace-notes.md "Bus-error frame spike").
 - `$FCF000` RAM-size ID register bit encoding not located (M1b Task 6, see
   §6 "RAM Sizing" and docs/rom-trace-notes.md "Bus-error frame spike") — the
-  boot ROM reads it directly for POST-level memory sizing; unstubbed
-  (`0xFF`), not blocking since the routine's result is never branched on
-  before the current frontier.
+  boot ROM statically reads it for POST-level memory sizing, but the whole
+  containing routine scored zero hits in the same live single-step
+  reachability check; unstubbed (`0xFF`) either way, not confirmed blocking.
 - RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.
 - `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
   site found (bracketing a RAM-sizing/checksum routine, result discarded),

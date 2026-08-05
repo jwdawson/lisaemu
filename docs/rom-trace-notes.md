@@ -302,7 +302,7 @@ recorded here as a future serial-device requirement.
 | `$F801` status register bit 2 (`btst #2`, vsync)          | **DONE (Task 5)** — real `VideoTiming`; see "Trace checkpoint B" below | ~~Task 5~~ |
 | `$E018/$E01A` video strobes (VertReset/VRIRDIS, VRIRENB)  | **DONE (Task 5)** — arm/clear semantics validated against ROM's own access order; see "Trace checkpoint B" | ~~Task 5~~ |
 | `$E01C/$E01E` video strobes                               | **DIAGNOSED, no model change (Task 5)** — bare bracketing strobes around a RAM-sizing/checksum routine, result never branched on; see "Trace checkpoint B" | ~~Task 5~~ |
-| `$F801` status register bit 1 (`btst #1`)                 | **DONE (Task 6)** — exact semantics still undetermined, but reconfirmed safe: default 0 never diverts any of the 3 gating sites; see "Bus-error frame spike" below | ~~later task~~ |
+| `$F801` status register bit 1 (`btst #1`)                 | still undetermined — Task 6 found all 3 statically-cited gating sites (`$FE00D0`/`$FE0F14`/`$FE0F72`) are either dead code or unconfirmed live-reached through 30M cycles; see "Bus-error frame spike" below | later task |
 | `$FE2DBE` unconditional "next COPS input byte" wait        | genuine open frontier — confirmed NOT vsync-related (SR interrupt mask blocks all levels here regardless); needs either a real unsolicited COPS event or further call-chain tracing to determine what, if anything, the ROM expects | later task |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
@@ -656,9 +656,12 @@ never touch those.
 ### Static evidence: the ROM's own bus-error idiom never RTEs
 
 A full linear disassembly of the ROM image (`lisadbg d fe0000 9000`, same
-method Task 5 used for the SNUM sweep) finds **22 sites** that install a
-handler at vector `$8` (`move.l A3,$8.w` or equivalent) and, across the
-*entire* 16KB image, only **2** `rte` instructions total:
+method Task 5 used for the SNUM sweep) finds **22 sites that touch vector
+`$8`** — **20 writes** (`move.l A3,$8.w` or equivalent: 18 fresh installs
+plus 2 restores of a previously-saved handler) and **2 reads**
+(`movea.l $8.w,A5` at `$FE1318`/`$FE2160`, saving the current handler before
+a temporary install — see the MOVEP-probe idiom below). Across the *entire*
+16KB image there are only **2** `rte` instructions total:
 
 - `$FE00F4` — inside a block (`$FE00CA-$FE00F4`) that is not a branch target
   anywhere in the ROM (confirmed by grepping every `$FE00C*`/`$FE00CA`
@@ -672,8 +675,15 @@ handler at vector `$8` (`move.l A3,$8.w` or equivalent) and, across the
   interrupt), a completely different C function from
   `m68ki_exception_bus_error` — the frame-format bug does not apply to it.
 
-So **none** of the ROM's 22 real bus-error (`$8`) handler installations ever
-execute `rte`. Representative disassembly of three of them:
+So **none** of the ROM's 20 real bus-error (`$8`) handler installs/restores
+ever execute `rte`. This is a static claim about the *content* of every
+installed handler body (each was disassembled and read in full), independent
+of whether every guarded probe is itself confirmed live-reached — the VIA2
+self-test guard (`$FE08B4`, below) and the `$D241` probe guard (`$FE100C`,
+below) both sit on code already independently confirmed live by earlier
+tasks (Task 3's VIA2-stall trace; Task 2's original `ioTrace` observation of
+`$D241` traffic), so those two are solid on both counts. Representative
+disassembly of three of them:
 
 ```
 ; VIA2 T1-latch self-test guard (installed $FE08B4, target from $FE08B0)
@@ -738,12 +748,19 @@ ROM makes**, confirmed both empirically (zero pulses through the live
 frontier) and statically (every reachable installed handler, plus the
 default handler, discards the frame rather than consuming it).
 
-### Memory sizing: reads a hardware ID register, not fault-probed
+### Memory sizing: statically present, live reachability NOT confirmed (fix round 1 correction)
+
+**This section originally asserted the RAM-sizing routine as live boot
+fact from static disassembly alone; code review caught that the reachability
+claim was never actually checked. Corrected below with the live evidence —
+the DECISION is unaffected (see "DECISION" below for why).**
 
 The RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`, already located by Task
-5 as the `$E01C`/`$E01E`/`$F801`-bit-1 usage site) sizes memory by reading
-**`$FCF000`** directly (`FE0FF0-FE0FFE`, called from `$FE0F2A` and again
-from `$FE0F78`):
+5 as the `$E01C`/`$E01E`/`$F801`-bit-1 usage site) is statically present in
+the ROM image and reads **`$FCF000`** at three static call sites into a
+shared subroutine (`FE0FF0-FE0FFE`, called via `bsr` from `$FE0F2A`,
+`$FE0F78`, and `$FE0714`), plus two more direct reads outside that
+subroutine (`$FE00DA`, `$FE0DAE`):
 
 ```
 FE0FF0: clr.l   D1
@@ -753,56 +770,94 @@ FE0FFC: lsl.l   #5, D1          ; magnitude/granularity decode
 FE0FFE: rts
 ```
 
-This is a **direct register read**, not bus-error-probe-based sizing. The
-only defensive-fault mechanism in this routine is the **NMI** vector
-(`$7c`, level 7 — see `$FE0D5C-$FE0D64` and `$FE0F46-$FE0F4A` installing
-handlers there), not the CPU bus/address-error vector `$8` this task is
-about — a different Musashi code path entirely, unaffected by the format-8
-bug.
+**Live reachability check (unbounded, instruction-granular — not subject to
+the `ioTrace`/`mmuPortLog` bounded-cap caveat that made earlier tasks'
+"absence from the trace" arguments weaker evidence):** a `@testable import
+LisaCore` scratch harness single-stepped **every** instruction from reset to
+30M cycles (14M cycles past the `$FE2DBE` frontier — 3,091,264 total steps)
+and recorded PC hits against a broad watch set spanning this routine's two
+NMI-guarded entry points (`$FE0D5C`, `$FE0F46`), its body (`$FE0D68`,
+`$FE0E02`), the `$FCF000` subroutine and all 3 of its callers (`$FE0F2A`,
+`$FE0F78`, `$FE0714`), its post-sizing continuation (`$FE1000`), and the
+shared bit-1-error landing target (`$FE0704`/`$FE0730`/`$FE0764`). The
+harness was validated against 4 independently-known-live sanity PCs
+(`$FE0446` hit at cycle 580,344; `$FE0BA2` at 11,876,766; `$FE2DBE` at
+16,181,126; `$FE2DCE` — the frontier poll — hit 431,839 times from
+16,181,172 onward), all matching prior tasks' documented cycle counts. Every
+one of the RAM-sizing-routine addresses: **zero hits.**
 
-Under the current model, `$FCF000` is unstubbed IOSpace (`0xFF` bytes, raw
-`D1 = $FFFF`). The resulting computed "extra RAM" walk address lands, once
-masked to 24 bits, inside segment 127's `.special` decode (the ROM/SNUM
-window) rather than a genuinely absent RAM segment — `specialAccess` serves
-that with its existing logged `0xFF` stub, not a fault, so the checksum
-loop simply completes on stub bytes. This matches the established pattern
-(`hardware-notes.md` "$E01C/$E01E — diagnosed, not modeled"): **the ROM
-never branches on this loop's result**, and forward progress to the
-frontier does not depend on `$FCF000` returning a value that matches the
-true 2 MB configuration. `$FCF000`'s exact encoding is left undetermined
-(evidence-gated, same as `$D241`/`$E01C`/`$E01E`) — a candidate for a later
-task if a POST-visible RAM-size mismatch ever surfaces past this frontier.
+So: **this routine is statically present in the ROM but empirically NOT
+executed on the traced boot path through 30M cycles.** The earlier claim
+that "$FCF000 is read directly for POST-level memory sizing" describes ROM
+code that exists, not a confirmed live event — precisely the OQ1 pattern
+("statically present, live reachability unconfirmed"; treat as plausible,
+not proven). This task does not distinguish between the honest
+possibilities: the routine could be dead code for this ROM revision/board
+configuration, reachable only via a genuine NMI (level 7) this model never
+generates, or reachable only from a call site past the current `$FE2DBE`
+frontier. What *is* still true regardless: its only fault-shaped defensive
+mechanism is the **NMI** vector (`$7c`), not the CPU bus-error vector `$8`
+this task is about, so even if it were reached, it would exercise a
+different Musashi code path, unaffected by the format-8 bug.
+`$FCF000`'s exact encoding remains undetermined (evidence-gated, same as
+`$D241`/`$E01C`/`$E01E`).
 
-### `$F801` bit 1 — reconfirmed safe, no divert
+### `$F801` bit 1 — all three cited gating sites unconfirmed live (fix round 1 correction)
 
-Three call sites gate on it: `$FE00D0` (pre-checksum), `$FE0F14` (entering
-the RAM-sizing routine), and inside the NMI handler installed at `$FE0F46`
+**This section originally claimed all three sites were "reconfirmed safe"
+live boot behavior. Code review caught that `$FE00D0` sits in dead
+disassembly, and the live-reachability check above shows the other two are
+also unconfirmed — corrected here.**
+
+Three call sites gate on it statically: `$FE00D0`, `$FE0F14` (entering the
+RAM-sizing routine), and inside the NMI handler installed at `$FE0F46`
 (`$FE0F72-$FE0F74`) — all `btst #$1,$fcf801` / `bne $fe0704` (an error/skip
-branch). `Z` is set when the bit is *clear*, so `bne` requires bit 1 = 1 to
-divert. This model's default (`IODispatcher.statusByte` undriven bits = 0)
-never sets it, so none of the three sites divert — POST proceeds normally
-through all of them, exactly as Task 5 already established for the same
-bit. No behavior change; this re-confirms it against the newly-precise
-`$FCF000`/NMI context above rather than leaving it as a dangling "later
-task" pointer.
+branch). Of these:
+
+- `$FE00D0` sits inside the `$FE00CA-$FE00F4` block, which is **not a
+  branch target anywhere in the ROM** (confirmed by grepping every
+  `$FE00C*` reference in the full disassembly) — dead disassembly, not
+  reachable code, regardless of cycle count.
+- `$FE0F14` and `$FE0F72` belong to the RAM-sizing routine just shown above
+  to be unreached through 30M cycles (both were in the watched PC set;
+  both scored zero hits).
+
+So **none of the three originally-cited `$F801` bit 1 gating sites are
+confirmed live-reached** on this boot path. Bit 1's real semantics, and
+whether this model's default (clear) has any live consequence before the
+frontier, remain **undetermined** — this reverts to (and is consistent
+with) `hardware-notes.md`'s original framing. The "reconfirmed safe"
+language previously here is retracted.
 
 ### DECISION: defer the Musashi bus-error-frame fix to M2
 
 Per the plan's decision framework: **no recoverable bus error is observed
-or needed through the `$FE2DBE` frontier.** `Bus.busErrorPulseCount == 0`
-live through 30M cycles (10M past the frontier), and the ROM's own
-bus-error idiom — checked both live and statically across all 22
-installation sites plus the ROM-baked default handler — never depends on
-RTE-based resumption or on the pushed frame's content, so even a
-hypothetical future fault along an as-yet-unreached POST probe would not be
-observably affected by the current frame bug. POST's memory sizing is
-register-read-based (`$FCF000`), not fault-probe-based, and its one
-fault-shaped defensive path uses the NMI vector, not the CPU bus-error
-vector this bug lives in. **M2 owns the real 68000 group-0 frame fix**
-(swap to `m68ki_stack_frame_buserr`, plumb address/isWrite into
-`m68ki_aerr_address`/`m68ki_aerr_write_mode`) whenever a future task's trace
-actually needs it; this spike found no such need before Task 7's POST-menu
-frontier.
+or needed through the `$FE2DBE` frontier.** This rests on two pieces of
+evidence, both solid and **independent of the memory-sizing reachability
+question above**:
+
+1. `Bus.busErrorPulseCount == 0` live through 30M cycles (14M past the
+   frontier) — an unbounded, direct measurement of every real Musashi
+   bus-error exception the CPU actually took. Not subject to any
+   bounded-log-cap caveat.
+2. The ROM's own bus-error idiom, checked statically across all 20 real
+   vector-`$8` handler installs/restores plus the ROM-baked default
+   handler, never depends on RTE-based resumption or on the pushed frame's
+   content — this is a claim about what each installed handler's code
+   *does*, independent of whether every guarded probe is itself reached.
+
+Together these mean: zero bus errors actually occurred, **and** even a
+hypothetical future one (on a probe not yet reached) would not be
+observably affected by the current frame bug, because nothing this ROM
+installs at vector `$8` ever consumes the frame. The memory-sizing
+routine's reachability is a separate, still-open question (see above) that
+does not change this: it is not a source of bus errors either way (its
+defensive path is NMI, a different Musashi exception entirely, not vector
+`$8`), so its uncertain status cannot flip the decision. **M2 owns the real
+68000 group-0 frame fix** (swap to `m68ki_stack_frame_buserr`, plumb
+address/isWrite into `m68ki_aerr_address`/`m68ki_aerr_write_mode`) whenever
+a future task's trace actually needs it; this spike found no such need
+before Task 7's POST-menu frontier.
 
 ## Instrumentation added (Task 7, diagnostics only)
 

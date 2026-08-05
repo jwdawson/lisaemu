@@ -40,11 +40,36 @@ final class AppModel {
     /// through a status publish.
     private(set) var running = false
 
+    /// `UserDefaults` key backing `showActualSize`'s persistence, below.
+    private static let showActualSizeDefaultsKey = "showActualSize"
+
     /// View menu "Actual Size (1:1)" toggle backing store -- `ScreenView`
     /// reads this to pick its displayed size. Defaults to aspect-corrected
     /// (`false`), matching the plan's "Default view applies aspect
-    /// correction" Global Constraint.
-    var showActualSize = false
+    /// correction" Global Constraint, and PERSISTS across launches (M1c
+    /// Task 5 polish: "aspect-toggle persistence (@AppStorage)") via
+    /// `UserDefaults.standard`.
+    ///
+    /// Not the `@AppStorage` property wrapper itself: that wrapper is a
+    /// `DynamicProperty` designed to be read inside a SwiftUI `View.body`
+    /// (its automatic invalidation only fires there), and `AppModel` is a
+    /// plain `@Observable` class, not a `View` -- composing a second
+    /// property wrapper with `@Observable`'s own macro-synthesized storage
+    /// on the same stored property isn't supported. This reads/writes the
+    /// exact same `UserDefaults.standard` store `@AppStorage` would, with
+    /// `@Observable` (already driving every other property here) providing
+    /// the reactivity instead. Set directly in `init()` (below) from the
+    /// persisted value -- assigning there, before the rest of `init()`
+    /// runs, does not re-trigger `didSet` (Swift suppresses property
+    /// observers for a class's own first assignment to its stored
+    /// property, during its own initializer), so startup never redundantly
+    /// re-writes the value it just read.
+    var showActualSize: Bool {
+        didSet {
+            guard oldValue != showActualSize else { return }
+            UserDefaults.standard.set(showActualSize, forKey: Self.showActualSizeDefaultsKey)
+        }
+    }
 
     var throttled: Bool = true {
         didSet {
@@ -60,6 +85,7 @@ final class AppModel {
     private var pixelScratch: [UInt8] = []
 
     init() {
+        showActualSize = UserDefaults.standard.object(forKey: Self.showActualSizeDefaultsKey) as? Bool ?? false
         let romDirectory = AppModel.resolveROMDirectory()
         do {
             let controller = try EmulationController(romDirectory: romDirectory)
@@ -122,6 +148,24 @@ final class AppModel {
         controller?.reset()
         running = true
         controller?.start()
+    }
+
+    /// Explicit clean-shutdown hook (M1c Task 5 polish: "clean shutdown --
+    /// emulation thread joined on window close"). Releasing `controller`
+    /// here drops the last strong reference to `EmulationController`,
+    /// running its `deinit` -- which posts `.shutdown` to the emulation
+    /// thread's mailbox and BLOCKS (`shutdownGate.wait()`) until that
+    /// thread actually acknowledges and returns from its run loop, i.e. a
+    /// real join, not just "stop asking it to run." Called from
+    /// `AppDelegate.applicationWillTerminate` (`LisaApp.swift`) --
+    /// deliberately NOT left to happen implicitly via ARC releasing the
+    /// `App`'s `@State` when the process exits: macOS's actual quit path
+    /// (`NSApplication.terminate` ending the run loop) does not reliably
+    /// guarantee Swift deinits run before the process itself exits, so
+    /// this makes the join an explicit, verifiable step instead of an
+    /// accident of teardown ordering.
+    func shutdown() {
+        controller = nil
     }
 
     // MARK: - Input (M1c Task 4)

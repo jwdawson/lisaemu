@@ -18,12 +18,16 @@ import UniformTypeIdentifiers
 @main
 struct LisaEmuApp: App {
     @State private var model = AppModel()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
         Window("LisaEmu", id: "main") {
             ScreenView()
                 .environment(model)
-                .onAppear { model.runAutoScreenshotIfRequested() }
+                .onAppear {
+                    appDelegate.model = model // see AppDelegate's doc comment
+                    model.runAutoScreenshotIfRequested()
+                }
         }
         .windowResizability(.contentSize)
         .commands {
@@ -80,5 +84,36 @@ struct LisaEmuApp: App {
                 try? data.write(to: url)
             }
         }
+    }
+}
+
+/// Backs `@NSApplicationDelegateAdaptor` above -- the two hooks
+/// `Scene`/`.commands` alone cannot express (M1c Task 5 polish, "clean
+/// shutdown"):
+///
+/// 1. `applicationShouldTerminateAfterLastWindowClosed`: `LisaEmuApp` uses
+///    `Window`, not `WindowGroup` (see that type's doc comment -- `AppModel`
+///    is genuinely singleton, one-Lisa state), so there is no legitimate
+///    reason for the process to keep running headless once its one window
+///    is closed. Without this override, AppKit's default behavior for a
+///    non-document app is to keep running with no visible window.
+/// 2. `applicationWillTerminate`: joins the emulation thread
+///    (`AppModel.shutdown()`) BEFORE the process actually exits, rather
+///    than leaving that to ARC's (unreliable, at process-exit time)
+///    teardown of the `App` struct's `@State`.
+///
+/// `model` is `weak`: `LisaEmuApp`'s `@State model` already owns the
+/// canonical strong reference; this delegate only needs to reach it to
+/// call `shutdown()`, not extend its lifetime (and a strong cycle back
+/// through the delegate would be pointless besides).
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model?.shutdown()
     }
 }

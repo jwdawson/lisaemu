@@ -432,19 +432,28 @@ Source: libhw-DRIVERS:1074-1252 (COPS/COPSX handlers)
 - $FD: keyboard unplugged
 - $FE-$FF: COPS failure (bit 0: 0 = I/O COPS, 1 = keyboard COPS)
 
-**M1b Task 4 trace note — reset packet is a fixed 7 bytes, not
-sub-code-dependent:** the boot ROM's reset-dispatch handler
-(`$FE2D82`-`$FE2D9E`) stores whatever State-4 sub-code byte it received into
-`$480` and then UNCONDITIONALLY falls through to a 5-iteration receive loop
-(`$FE2D9E-$FE2DBA`, storing into `$481-$485`) — regardless of whether the
-sub-code was `$00-$DF` (keyboard ID) or `$E0-$EF` (clock start). This
-contradicts reading State 3 ("receive 5 clock bytes") as conditional on the
-`$E0-$EF` case only: at least at power-on, the ROM expects a fixed 7-byte
-reset packet (`$80`, sub-code, 5 more bytes) no matter what the sub-code is.
-The MEANING of those 5 bytes when the sub-code is a plain keyboard ID is
-undocumented and unvalidated (task-4-report.md's COPS model sends 5 zero
-placeholder bytes — the trailing byte COUNT is trace-validated, the VALUE is
-not).
+**M1b Task 4 trace note (RETRACTED by Task 7 — see correction below):** Task
+4 read the reset-dispatch handler as unconditionally receiving 5 more bytes
+after ANY State-4 sub-code, and its COPS model appended 5 zero placeholder
+trailing bytes to the power-on stream.
+
+**M1b Task 7 correction — the 5-byte payload is CLOCK-START-only, matching
+the state machine:** re-disassembling the reset dispatch (`$FE2D5C`) shows
+the sub-code branches are NOT symmetric. The keyboard-ID branch (`$00-$DF`
+-> `$FE2D7C`) stores the ID at `$1b2` and loops straight back to the
+packet-start (`bra $fe2d38`) — it reads NO trailing bytes. Only the
+clock-start branch (`$E0-$EF` -> `$FE2D82`) stores the sub-code at `$480`
+and falls into the 5-iteration receive loop (`$FE2D9E-$FE2DBA`, into
+`$481-$485`). So a keyboard-ID reset packet is exactly 2 bytes (`$80` +
+ID); the 5 data bytes belong to State 3, reached only via the State-4
+clock-start sub-code, exactly as the state machine above already says. Task
+4's "fixed 7 bytes regardless of sub-code" reading was a misattribution
+(the extra bytes it saw consumed were its own placeholder `$00`s being
+re-parsed as State-0 mouse-packet markers). Task 7's COPS model sends the
+faithful 2-byte `$80, <keyboard ID>` announcement and drops the 5 trailing
+`$00`s; the ROM reaches the byte-identical boot menu either way (the
+power-on stream is not load-bearing for the boot path — see
+docs/rom-trace-notes.md "POST completion (Task 7)").
 
 ## 5. Interrupts
 

@@ -303,7 +303,7 @@ recorded here as a future serial-device requirement.
 | `$E018/$E01A` video strobes (VertReset/VRIRDIS, VRIRENB)  | **DONE (Task 5)** — arm/clear semantics validated against ROM's own access order; see "Trace checkpoint B" | ~~Task 5~~ |
 | `$E01C/$E01E` video strobes                               | **DIAGNOSED, no model change (Task 5)** — bare bracketing strobes around a RAM-sizing/checksum routine, result never branched on; see "Trace checkpoint B" | ~~Task 5~~ |
 | `$F801` status register bit 1 (`btst #1`)                 | still undetermined — Task 6 found all 3 statically-cited gating sites (`$FE00D0`/`$FE0F14`/`$FE0F72`) are either dead code or unconfirmed live-reached through 30M cycles; see "Bus-error frame spike" below | later task |
-| `$FE2DBE` unconditional "next COPS input byte" wait        | genuine open frontier — confirmed NOT vsync-related (SR interrupt mask blocks all levels here regardless); needs either a real unsolicited COPS event or further call-chain tracing to determine what, if anything, the ROM expects | later task |
+| `$FE2DBE` unconditional "next COPS input byte" wait        | **RESOLVED (Task 7)** — NOT a POST blocker: it is the boot MENU's "await next COPS input event" (mouse/keypress) idle loop. POST is complete and the startup menu is drawn by the time the ROM sits here; with no user input it correctly waits forever. See "POST completion (Task 7)" below. | ~~later task~~ |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
 
@@ -884,3 +884,127 @@ trace shows the ROM halts before reaching any stub-served register.
 No device behavior was changed here either: the ROM never reaches the
 `.fault` branch of `Bus.access` on the traced path, so this counter stays 0
 and no stub was touched.
+
+## POST completion (Task 7) — the ROM reaches the boot menu
+
+**M1b exit criterion met.** The `$FE2DBE` frontier that Tasks 4–6 left open
+turned out not to be a POST blocker at all: it is the drawn boot MENU's
+"await the next COPS input event" idle loop. Reproduce with `swift run -c
+release lisadbg --rom $HOME/Development/LisaROMs`, then `g 25000000` and
+`sca` (or `sc <path>.png`).
+
+### What `$FE2DBE` actually is (the consumer, disassembled)
+
+`$FE2DBE` is a blocking "receive one COPS byte" subroutine:
+
+```
+FE2DBE: move.l  A0, -(A7)
+FE2DC0: movea.l #$fcdd81, A0     ; VIA2 base
+FE2DC6: move.b  ($1a,A0), D0     ; read IFR2
+FE2DCA: btst    #$1, D0          ; COPS "byte pending"?
+FE2DCE: beq     $fe2dc6          ; NO TIMEOUT — spin until a byte arrives
+FE2DD0: move.b  ($2,A0), D0      ; read PORTA2 reg 1 (handshake) -> consume; D0 = byte
+FE2DD4: movea.l (A7)+, A0
+FE2DD6: rts                      ; returns the received byte in D0
+```
+
+Its caller `$FE2D38` is the COPS input-packet state machine (State 0
+dispatch): `$00` -> mouse packet (`$FE2D48`, read dx/dy into `$48a`/`$48b`),
+`$80` -> reset dispatch (`$FE2D5C`), else -> keycode. The reset dispatch
+`$FE2D5C` is where the keyboard-ID-vs-clock-start asymmetry lives (see
+hardware-notes.md §4's Task 7 correction): `$00-$DF` -> `$FE2D7C` (store ID
+at `$1b2`, loop back, NO trailing bytes), `$E0-$EF` -> `$FE2D82` (store at
+`$480`, read 5 more into `$481-$485`), `$FB` -> power button, `$FE-$FF` ->
+COPS-failure error codes `$34`/`$35`.
+
+`$FE2D38` is called from the mouse-cursor / menu-interaction loop
+`$FE2C46` (reached from `$FE2624`, which first `bset`s bit 5 of the
+low-RAM flag cell `$2A2`). That loop is unmistakably the interactive UI
+driver:
+
+- `$FE300E`/`$FE2EC2` render the mouse cursor — cursor bitmap at `$4a2`,
+  hot-spot/position words at `$490`-`$498`, clipped against screen bounds
+  `$2d0` (720) × `$16c` (364).
+- `$FE2E46` hit-tests the cursor position against a rectangle table at
+  `$53a` (first word = entry count; a live dump at the stall shows 3
+  entries — the three menu buttons).
+
+With flag bit 5 set, unrecognized received bytes just loop back and fetch
+another packet — i.e. the loop idles here until the user moves the mouse or
+presses a key. There is no user, so `$FE2DBE` waits forever. **This is the
+correct terminal behavior for a menu, not a hang.**
+
+### The screen: the classic Lisa startup menu + a no-boot-device error
+
+The 720×364 framebuffer at the stall (rendered via `lisadbg sc`) shows:
+
+- Three menu buttons in a bordered box: **`[⌘1] RESTART`**, **`[⌘2]
+  CONTINUE`**, **`[⌘3] STARTUP FROM…`**.
+- A mouse-cursor arrow.
+- An **`H`** ROM-revision marker (top-right).
+- A crossed-out **ProFile** hard-disk icon labelled **`42`** (a
+  no-boot-device / device-error indicator) — expected, since no
+  floppy/hard-disk hardware is modeled.
+
+This is BOTH accepted M1b success states at once: the startup/boot-device
+UI *and* a no-boot-device error indicator. (Screenshot reproduce steps:
+docs/m1b-demo.md. The PNG is kept OUT of the repo — it renders Apple's
+ROM-drawn UI.)
+
+### Timing / stability (cycle budget for the test)
+
+Single-process sampling (deterministic under Musashi):
+
+| Cycles | PC        | black px | State                                           |
+|--------|-----------|----------|-------------------------------------------------|
+| ≤15 M  | `$FE0AE2`/`$FE0B4A` | ~48% (desktop-gray dither) | contrast-DAC delay / video setup |
+| 16 M   | `$FE32xx` | transitional | menu being drawn                            |
+| 18 M   | `$FE2DBE-$FE2DD6` | 78,100 / 262,080 (29.80%) | menu fully drawn, input-idle loop entered |
+| 25–60 M| `$FE2DBE-$FE2DD6` | 78,100 (bit-identical) | stable — framebuffer FNV unchanged |
+
+The menu is fully drawn and the idle loop entered by ~18 M cycles; the
+framebuffer is then bit-stable (identical 64-bit FNV-1a fingerprint
+`0xd09234d25516d0b8`) through at least 60 M cycles. The content is
+independent of the host wall clock (the menu shows no time-of-day —
+verified reproducible across processes at different times), so the exact
+hash is a legitimate deterministic anchor. `ROMBootTests
+.romCompletesPOSTAndReachesBootMenu` samples at 25 M and asserts the
+POST-complete markers, the input-loop PC range, `blackPixels == 78100`, the
+robust `>1%` weaker invariant, and the exact FNV anchor.
+
+### COPS power-on stream — the only device change this task made
+
+The `$FE2DBE` wait is reached (and the identical menu drawn) with the
+current command-handshake path regardless of the power-on input stream —
+including with NO power-on stream at all (empirically verified: same
+framebuffer hash). So the input FIFO stream is fidelity-only, not
+load-bearing for the boot path. Task 4's 5 trailing `$00` placeholder bytes
+were both (a) unnecessary and (b) a latent hazard — `$00` is the State-0
+mouse-packet marker, so queuing them risks phantom mouse packets. Task 7
+changes `COPS`'s power-on stream to the faithful 2-byte keyboard-present
+announcement `$80, <keyboard ID>` (matching the state machine's keyboard-ID
+reset = exactly 2 bytes) and drops the trailing `$00`s. Removing them
+reaches the byte-identical menu (same 29.80% / same FNV). No other device
+behavior or stub value was changed.
+
+### Wait-target table — FINAL
+
+Every row the trace opened is now resolved or explicitly deferred with
+evidence:
+
+| Target            | Status                                                        |
+|-------------------|---------------------------------------------------------------|
+| VIA2 `$DD81` / VIA1 `$D901` register files | DONE (Task 3)                        |
+| COPS / VIA2 Port A+B handshake             | DONE (Task 4)                        |
+| `$F801` bit 2 (vsync) + `$E018`/`$E01A`    | DONE (Task 5)                        |
+| `$E01C`/`$E01E` strobes                    | diagnosed inert, no model change (Task 5) |
+| `$F801` bit 1                              | statically present, live-reach unconfirmed; default (clear) reaches the menu (Task 6) |
+| Musashi 68010 bus-error frame              | deferred to M2 with two evidence pillars (Task 6) |
+| **`$FE2DBE` "next COPS byte" wait**        | **RESOLVED (Task 7): the boot-menu input-idle loop; POST is complete** |
+| `$D241` controller (`$37/$38`)             | candidate SCC; passes `0xFF` stub, not on the boot path — later serial task |
+| `$C031` board ID                           | none — `0x00` (pre-Pepsi) correct    |
+| SNUM (`$FE8000+` special `$4000+`)         | never referenced by any ROM instruction (Task 5, whole-image sweep) |
+
+**No stall on the path to the menu requires a new subsystem.** The
+remaining open items (`$F801` bit 1 semantics, the `$D241` SCC, the M2
+bus-error frame) are all off the boot-to-menu path and correctly deferred.

@@ -169,28 +169,36 @@ extension MusashiSuites {
         /// **M1b Task 5** (docs/rom-trace-notes.md "Trace checkpoint B")
         /// re-traced this frontier with `VideoTiming` (vsync/`$F801` bit 2/
         /// `$E018`/`$E01A`) live and confirmed it is UNCHANGED: resampled
-        /// stable from 20M through 220M cycles. Two independent reasons
-        /// video timing cannot resolve it -- both confirmed live: the SR
-        /// interrupt mask is 7 (all levels 0-6 blocked) throughout this
-        /// entire region regardless of `Machine.vsyncPending`, and the poll
-        /// itself only reads VIA2 IFR2 bit 1, an unrelated register/level
-        /// from vsync's level-1/`$F801` source. This remains a genuine
-        /// "await the next unsolicited COPS byte" wait with no further
-        /// evidence of what specific content would satisfy it.
+        /// stable from 20M through 220M cycles.
+        ///
+        /// **M1b Task 7** (docs/rom-trace-notes.md "POST completion (Task 7)")
+        /// finally identified what this `$FE2DBE` poll IS: not a POST blocker
+        /// at all, but the boot MENU's "await the next COPS input event"
+        /// (mouse-move / keypress) idle loop. By the time the ROM reaches it,
+        /// POST has completed and the standard startup menu (RESTART /
+        /// CONTINUE / STARTUP FROM..., plus a no-boot-device error icon) is
+        /// fully drawn -- see `romCompletesPOSTAndReachesBootMenu` below,
+        /// which asserts the framebuffer. `$FE2DBE-$FE2DD6` is the mouse
+        /// cursor-tracking loop `$FE2C46`'s per-packet receive
+        /// (`bsr $fe2dbe` -> read VIA2 IFR2 bit 1 -> read PORTA2), reached
+        /// from `$FE2624`; with no user at the keyboard/mouse it legitimately
+        /// waits forever, which is the correct terminal state for a menu.
+        /// This test keeps the loose "parked in the poll body, not halted"
+        /// characterization; the menu assertions are in the dedicated test.
         @Test
-        func romClearsCOPSPresencePollAndStallsAwaitingNextInputByte() throws {
+        func romClearsCOPSPresencePollAndReachesBootMenuInputLoop() throws {
             let m = try bootedMachine()
             m.run(until: 20_000_000)
 
             #expect(m.bus.setupMode == false, "ROM dropped setup mode (clr.b $fce012)")
             #expect(m.bus.domain == 0, "domain 0 still active")
             #expect(m.halted == false,
-                    "post-COPS-handshake the ROM busy-loops awaiting the next COPS byte, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
-            // Parked in the unconditional "wait for next COPS input byte"
-            // poll ($FE2DC6-$FE2DCE) -- task-4-report.md "New ROM frontier".
+                    "at the boot menu the ROM busy-loops awaiting the next COPS input event, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
+            // Parked in the boot-menu input-idle poll ($FE2DBE-$FE2DD6) --
+            // docs/rom-trace-notes.md "POST completion (Task 7)".
             let pc = m.cpu[.pc]
             #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pc),
-                    "PC should be in the documented post-COPS-handshake input-wait region; got \(String(format: "%08X", pc))")
+                    "PC should be in the documented boot-menu input-wait region; got \(String(format: "%08X", pc))")
         }
 
         /// **M1b Task 6** (task-6-report.md / docs/rom-trace-notes.md "Bus-error
@@ -223,6 +231,75 @@ extension MusashiSuites {
             #expect(m.halted == false, "still no halt/fault at 30M cycles")
             #expect(m.bus.busErrorPulseCount == 0,
                     "no recoverable-or-otherwise bus error should occur on the boot path through the $FE2DBE frontier")
+        }
+
+        /// 64-bit FNV-1a over the framebuffer bytes -- a compact,
+        /// dependency-free content fingerprint (no CryptoKit in this target).
+        private func fnv1a(_ bytes: [UInt8]) -> UInt64 {
+            var h: UInt64 = 0xcbf2_9ce4_8422_2325
+            for b in bytes { h = (h ^ UInt64(b)) &* 0x0000_0100_0000_01b3 }
+            return h
+        }
+
+        /// **M1b exit criterion (Task 7): POST completes and the ROM draws
+        /// the startup/boot-device MENU.** After the checksum/MMU/RAM/VIA/COPS
+        /// power-on sequence the ROM renders the classic Lisa boot menu --
+        /// RESTART / CONTINUE / STARTUP FROM... buttons, a mouse cursor, the
+        /// "H" ROM-revision marker, and (because no floppy/hard-disk hardware
+        /// is modeled) a crossed-out ProFile icon with error code 42 -- then
+        /// enters its "await next COPS input event" idle loop at
+        /// `$FE2DBE-$FE2DD6` (see `romClearsCOPSPresencePollAndReachesBoot
+        /// MenuInputLoop`). This is exactly the brief's accepted success
+        /// state ("startup/boot-device UI or an error screen -- EITHER is M1b
+        /// success"); here we get BOTH the menu and the no-boot-device error
+        /// indicator. Full path documented in docs/rom-trace-notes.md "POST
+        /// completion (Task 7)"; screenshot reproduce steps in docs/m1b-demo.md.
+        ///
+        /// Cycle budget: the menu is fully drawn and the input-idle loop is
+        /// entered by ~18M cycles; the framebuffer content is then bit-stable
+        /// (identical FNV hash) through at least 60M cycles (verified during
+        /// Task 7). 25M is a comfortable, deterministic sampling point inside
+        /// that stable window. The content is independent of the host wall
+        /// clock (the boot menu shows no time-of-day; verified reproducible
+        /// across processes at different times) -- so the exact hash below is
+        /// a legitimate deterministic anchor, NOT a wall-clock artifact.
+        @Test
+        func romCompletesPOSTAndReachesBootMenu() throws {
+            let m = try bootedMachine()
+            m.run(until: 25_000_000)
+
+            // POST-complete markers (rom-trace-notes.md "POST completion"):
+            // setup dropped, domain 0, alive, and parked in the boot-menu
+            // input-idle loop -- NOT halted, NOT faulted.
+            #expect(m.bus.setupMode == false, "ROM dropped setup mode")
+            #expect(m.bus.domain == 0, "domain 0 active")
+            #expect(m.halted == false, "menu input-idle loop is live, not halted")
+            #expect(m.bus.busErrorPulseCount == 0, "no bus error on the path to the menu")
+            let pc = m.cpu[.pc]
+            #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pc),
+                    "parked in the boot-menu input-wait poll; got \(String(format: "%08X", pc))")
+
+            // Framebuffer: non-blank, with a stable exact content hash AND a
+            // robust weaker invariant (>1% black). The menu occupies ~29.8%
+            // of the 720x364 1bpp framebuffer (78,100 of 262,080 pixels set).
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fb.count == Bus.framebufferByteCount)
+            var blackPixels = 0
+            for b in fb { blackPixels += b.nonzeroBitCount }
+            let totalPixels = fb.count * 8
+
+            // Robust weaker invariant (survives future timing/rendering
+            // tweaks): the menu is unmistakably drawn, far above blank.
+            #expect(Double(blackPixels) / Double(totalPixels) > 0.01,
+                    ">1% of pixels are set; got \(blackPixels)/\(totalPixels)")
+
+            // Exact anchors (BRITTLE across future timing/rendering changes,
+            // per the brief -- update alongside rom-trace-notes.md if the
+            // documented boot path legitimately changes):
+            #expect(blackPixels == 78_100,
+                    "exact set-pixel count for the drawn boot menu; got \(blackPixels)")
+            #expect(fnv1a(fb) == 0xd092_34d2_5516_d0b8,
+                    "stable boot-menu framebuffer fingerprint; got \(String(format: "%016llx", fnv1a(fb)))")
         }
     }
 }

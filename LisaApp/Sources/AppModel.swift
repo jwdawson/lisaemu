@@ -124,6 +124,18 @@ final class AppModel {
         controller?.start()
     }
 
+    // MARK: - Input (M1c Task 4)
+
+    /// Passthrough seam for `InputCapture`: `controller` is intentionally
+    /// `private` (nothing outside `AppModel` should reach into
+    /// `EmulationController` directly -- see its own `debugSync` doc
+    /// comment for the same boundary-enforcement rationale), so
+    /// `InputCapture` posts through here rather than being handed the
+    /// controller itself.
+    func post(_ event: InputEvent) {
+        controller?.post(event)
+    }
+
     // MARK: - Screenshot
 
     /// Fetches the current raw frame from the emulation thread and

@@ -9,11 +9,12 @@ public final class Machine {
     public private(set) var halted = false
     /// Level-1 IRQ source alongside VIA1 (docs/hardware-notes.md §5:
     /// "Level 1: VIA1 ... Sources: VIA1 timer, vertical retrace, parallel
-    /// port, Twiggy"). Defaults `false`; Task 5 (video timing) is the first
-    /// task to ever set it. Exposed as a plain settable `var` -- unlike
-    /// VIA1/VIA2's interrupt flags, there is no dedicated hardware register
-    /// modeled yet for the vsync source itself (that's Task 5's job), so
-    /// this stands in for it in the IRQ-level computation below.
+    /// port, Twiggy"). Defaults `false`; driven for real by `VideoTiming`
+    /// (Task 5) via `Bus.vsyncInterruptHandler`, wired below. Exposed as a
+    /// plain settable `var` -- unlike VIA1/VIA2's interrupt flags, there is
+    /// no dedicated hardware register modeled here for the vsync source
+    /// itself (that lives in `VideoTiming`), so this stands in for it in
+    /// the IRQ-level computation below.
     public var vsyncPending = false
 
     private struct Event {
@@ -37,6 +38,7 @@ public final class Machine {
             guard let self else { return }
             self.schedule(at: self.cycles &+ delay) { _ in action() }
         }
+        bus.vsyncInterruptHandler = { [weak self] pending in self?.vsyncPending = pending }
     }
 
     public func reset() {
@@ -44,10 +46,12 @@ public final class Machine {
         cycles = 0
         halted = false
         queue.removeAll()
-        // COPS.reset() schedules the power-on byte stream -- must happen
-        // AFTER queue.removeAll() above, or that clear would wipe the very
-        // event it just scheduled. See `COPS.reset()`'s doc comment.
+        // COPS.reset() / VideoTiming.reset() schedule their own recurring
+        // events -- must happen AFTER queue.removeAll() above, or that
+        // clear would wipe the very event each just scheduled. See
+        // `COPS.reset()`'s doc comment.
         bus.cops.reset()
+        bus.videoTiming.reset()
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {

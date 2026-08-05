@@ -227,3 +227,103 @@ private func makeVideoTiming() -> (timing: VideoTiming, scheduler: FakeScheduler
     #expect(snap[0] == 0x7E)
     #expect(snap[100] == 0, "past the end of the tiny backing RAM")
 }
+
+// MARK: - CPU-driving integration (MusashiSuites: builds a Machine, hence an
+// M68K -- Musashi is a process-global singleton) -- confirms the wiring
+// through IODispatcher/Bus/Machine, not just VideoTiming in isolation.
+
+extension MusashiSuites {
+    @Suite struct VideoTimingIntegrationTests {
+        private func spinningMachine(ramSize: Int = 0x10000) -> Machine {
+            let m = Machine(ramSize: ramSize)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.load([0x60, 0xFE], at: 0x400)   // BRA.s spin
+            m.reset()
+            return m
+        }
+
+        @Test
+        func vsyncTickSetsStatusRegisterBit2ThroughRealBusAccess() {
+            let m = spinningMachine()
+            m.run(until: VideoTiming.cyclesPerVsync + 1000)
+            #expect(m.bus.read8(0xFC_F801) & 0x04 != 0, "status register bit 2 should be set after a vsync period")
+        }
+
+        @Test
+        func machineAssertsLevel1WhenArmedVsyncFiresThroughRealBusAccess() {
+            let m = spinningMachine()
+            #expect(m.vsyncPending == false)
+            m.bus.write8(0xFC_E01A, 0)   // VRIRENB -- arm via a real bus write
+            m.run(until: VideoTiming.cyclesPerVsync + 1000)
+            #expect(m.vsyncPending == true, "an armed vsync fire should assert Machine's level-1 IRQ source")
+        }
+
+        @Test
+        func unarmedVsyncNeverAssertsLevel1ThroughRealBusAccess() {
+            let m = spinningMachine()
+            m.run(until: VideoTiming.cyclesPerVsync + 1000)
+            #expect(m.bus.read8(0xFC_F801) & 0x04 != 0, "status bit still sets")
+            #expect(m.vsyncPending == false, "never armed -- must not assert level 1")
+        }
+
+        @Test
+        func e018AccessClearsArmedVsyncPendingThroughRealBusAccess() {
+            let m = spinningMachine()
+            m.bus.write8(0xFC_E01A, 0)   // arm
+            m.run(until: VideoTiming.cyclesPerVsync + 1000)
+            #expect(m.vsyncPending == true)
+
+            m.bus.write8(0xFC_E018, 0)   // VertReset/VRIRDIS
+            #expect(m.vsyncPending == false, "$E018 access should disarm and clear the asserted IRQ")
+            #expect(m.bus.read8(0xFC_F801) & 0x04 == 0, "and clear the status register bit")
+        }
+
+        /// End-to-end autovector delivery, the same shape as
+        /// `InterruptTests.viaTimerInterruptRunsLevel1AutovectorHandler` but
+        /// for the vsync source instead of VIA1's timer -- proves the level-1
+        /// IRQ line genuinely reaches Musashi's autovector dispatch, not just
+        /// `Machine.vsyncPending` flipping in isolation.
+        @Test
+        func armedVsyncDeliversARealLevel1AutovectorInterrupt() {
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.write32(0x64, 0x500)   // level-1 autovector handler ($64 = 25*4)
+            m.bus.load([
+                0x46, 0xFC, 0x20, 0x00,                              // MOVE.W #$2000,SR (accept level 1+)
+                0x13, 0xFC, 0x00, 0x00, 0x00, 0xFC, 0xE0, 0x1A,      // MOVE.B #$00,$FCE01A.L (VRIRENB -- arm)
+                0x60, 0xFE,                                          // spin
+            ], at: 0x400)
+            m.bus.load([
+                0x52, 0x82,                                          // ADDQ.L #1,D2
+                0x13, 0xFC, 0x00, 0x00, 0x00, 0xFC, 0xE0, 0x18,      // MOVE.B #$00,$FCE018.L (VertReset -- ack)
+                0x4E, 0x73,                                          // RTE
+            ], at: 0x500)
+            m.reset()
+            m.cpu[.d2] = 0   // see InterruptTests.loadProgram's doc comment: D2 isn't reset by a real 68000 reset
+
+            m.run(until: VideoTiming.cyclesPerVsync + 5000)
+
+            #expect(m.cpu[.d2] == 1, "level-1 autovector handler should have run once, acknowledging via $E018")
+            #expect(m.halted == false)
+        }
+
+        @Test
+        func framebufferSnapshotThroughRealMachineHonorsVideoPageLatch() {
+            let m = spinningMachine(ramSize: 0x2_0000)
+            // Page 1 (physical 0x8000) is avoided here -- that address is
+            // ALSO segment 0's SLIM MMU port (`Bus.slimSorgPortAccess`,
+            // `docs/hardware-notes.md` "Register Port Addressing": every
+            // 128KB-aligned segment has its SLIM port at `base + $8000`),
+            // so a plain `write8` there while `setupMode == true` would hit
+            // the MMU port intercept, not RAM. Page 2 (physical 0x10000)
+            // has no such collision.
+            m.bus.write8(0xFC_E800, 0x02)   // page 2 -> physical 0x10000
+            m.bus.write8(0x1_0000, 0x99)
+            let snap = m.bus.framebufferSnapshot()
+            #expect(snap.count == Bus.framebufferByteCount)
+            #expect(snap[0] == 0x99)
+        }
+    }
+}

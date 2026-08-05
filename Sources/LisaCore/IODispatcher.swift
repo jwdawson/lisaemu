@@ -31,12 +31,18 @@ final class IODispatcher {
 
     /// $FCE800 -- video page latch (docs/hardware-notes.md "Video Latches").
     var videoPageLatch: UInt8 = 0
-    /// $FCF801 -- status register low byte. Hardware-driven (bit 2 = vsync
-    /// pending, M1b); CPU bus writes have no effect, but code (M1b, or
-    /// tests standing in for it) can set this directly.
+    /// $FCF801 -- status register low byte, bits OTHER than bit 2 (vsync
+    /// pending). CPU bus writes have no effect (hardware-driven register);
+    /// tests can still set this directly to simulate an undetermined bit.
+    /// Bit 2 itself is no longer stored here as of Task 5 -- it is owned by
+    /// `videoTiming.pending` and OR'd in by `currentValue` below, since
+    /// `VideoTiming` is now the sole real driver of that bit. `hardware-
+    /// notes.md §5`: "bit1 meaning undetermined -- only bit2=vsync is
+    /// documented".
     var statusByte: UInt8 = 0
-    /// $FCE018 / $FCE01A access counts -- "store flags, log" per the task
-    /// brief; M1b will give these real vsync-interrupt semantics.
+    /// $FCE018 / $FCE01A access counts -- diagnostic-only now that Task 5
+    /// gives these real semantics via `videoTiming.handleVertResetAccess`/
+    /// `handleVertEnableAccess` (called alongside these counters below).
     private(set) var vsyncResetCount = 0
     private(set) var vsyncEnableCount = 0
 
@@ -56,6 +62,11 @@ final class IODispatcher {
     /// hardware-notes.md §4).
     let cops: COPS
 
+    /// Vsync timing source (Task 5) -- see `VideoTiming`'s type doc comment.
+    /// Owned here like `cops`, wired to `Bus.scheduleEvent`/
+    /// `Bus.vsyncInterruptHandler`.
+    let videoTiming: VideoTiming
+
     private var contextBit1 = false
     private var contextBit2 = false
 
@@ -71,6 +82,19 @@ final class IODispatcher {
             currentCycle: { [weak bus] in bus?.cycleProvider() ?? 0 },
             raiseInterrupt: { [weak via2Ref] in via2Ref?.setInterruptFlag(COPS.interruptFlagBit) },
             clearInterrupt: { [weak via2Ref] in via2Ref?.clearInterruptFlag(COPS.interruptFlagBit) }
+        )
+        // `videoTiming` doesn't capture `self` (only `bus`, weakly), so --
+        // unlike the `via2.onPortAAccess` closure just below -- it could in
+        // principle be assigned anywhere after `cops`. It's placed here,
+        // still before `self` escapes into anything, purely to keep every
+        // stored-property assignment together before the first
+        // `self`-capturing closure (Swift's definite-initialization rule:
+        // ALL stored properties must have a value before `self` can be
+        // captured by any closure, even one that itself doesn't touch
+        // `videoTiming`).
+        videoTiming = VideoTiming(
+            scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
+            setIRQPending: { [weak bus] pending in bus?.vsyncInterruptHandler(pending) }
         )
         // `self` is fully initialized as of the line above -- safe to
         // capture from here on.
@@ -124,7 +148,7 @@ final class IODispatcher {
     func currentValue(_ offset: UInt32) -> UInt8 {
         switch offset {
         case 0xE800: return videoPageLatch
-        case 0xF801: return statusByte
+        case 0xF801: return statusByte | (videoTiming.pending ? 0x04 : 0)
         case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
         default:
             if let (via, index) = Self.viaRegisterIndex(offset) {
@@ -161,8 +185,8 @@ final class IODispatcher {
         case 0xE00A: contextBit1 = true; syncDomain()
         case 0xE00C: contextBit2 = false; syncDomain()
         case 0xE00E: contextBit2 = true; syncDomain()
-        case 0xE018: vsyncResetCount += 1
-        case 0xE01A: vsyncEnableCount += 1
+        case 0xE018: vsyncResetCount += 1; videoTiming.handleVertResetAccess()
+        case 0xE01A: vsyncEnableCount += 1; videoTiming.handleVertEnableAccess()
         default: return false
         }
         return true

@@ -1,5 +1,8 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import LisaCore
+import UniformTypeIdentifiers
 
 func fail(_ message: String) -> Never {
     FileHandle.standardError.write("lisadbg: \(message)\n".data(using: .utf8) ?? Data())
@@ -90,6 +93,108 @@ func formatIOAccess(_ access: IOAccess) -> String {
     return line
 }
 
+enum ScreenshotError: Error, CustomStringConvertible {
+    case imageCreationFailed
+    case destinationCreationFailed
+    case finalizeFailed
+
+    var description: String {
+        switch self {
+        case .imageCreationFailed: return "failed to build a CGImage from the framebuffer"
+        case .destinationCreationFailed: return "failed to open the destination file"
+        case .finalizeFailed: return "failed to write PNG data"
+        }
+    }
+}
+
+/// Renders a `Bus.framebufferSnapshot()` (720x364, 1 bit/pixel, row-major
+/// MSB-first, `Bus.framebufferByteCount` bytes) to a PNG file at `path`.
+/// "Set bit = black" (task brief) is expressed with a `decode` array rather
+/// than by unpacking bits manually: `CGImage`'s default 1bpp DeviceGray
+/// decode maps component 0 -> black, 1 -> white -- the OPPOSITE of what the
+/// brief specifies -- so `decode: [1, 0]` inverts it (component 0 -> output
+/// 1.0/white, component 1 -> output 0.0/black). This is debugger tooling
+/// only (`lisadbg`, not `LisaCore` -- see that module's "framework-free"
+/// constraint), hence the direct ImageIO/CoreGraphics dependency here.
+func writeScreenshotPNG(_ framebuffer: [UInt8], to path: String) throws {
+    let width = Bus.framebufferWidth
+    let height = Bus.framebufferHeight
+    let bytesPerRow = width / 8
+    guard let provider = CGDataProvider(data: Data(framebuffer) as CFData) else {
+        throw ScreenshotError.imageCreationFailed
+    }
+    let colorSpace = CGColorSpaceCreateDeviceGray()
+    guard let cgImage = CGImage(
+        width: width,
+        height: height,
+        bitsPerComponent: 1,
+        bitsPerPixel: 1,
+        bytesPerRow: bytesPerRow,
+        space: colorSpace,
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: provider,
+        decode: [1, 0],
+        shouldInterpolate: false,
+        intent: .defaultIntent
+    ) else {
+        throw ScreenshotError.imageCreationFailed
+    }
+    guard let dest = CGImageDestinationCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else {
+        throw ScreenshotError.destinationCreationFailed
+    }
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    guard CGImageDestinationFinalize(dest) else {
+        throw ScreenshotError.finalizeFailed
+    }
+}
+
+/// Coarse ~90x45 block-averaged ASCII preview of a framebuffer snapshot,
+/// printed straight to the terminal (`sca`) -- a quick "is anything drawn
+/// yet" sanity check without leaving the shell. Each output cell averages
+/// the black-pixel density of the source block it covers and picks a
+/// character from a light-to-dark ramp; block boundaries are computed by
+/// plain integer scaling (`width * col / outCols`), so boundaries aren't
+/// perfectly uniform when the source dimensions don't divide evenly (364 /
+/// 45 isn't exact) -- "block-averaged", not exact-area-averaged, per the
+/// brief's "~90x45" wording.
+func asciiPreview(_ framebuffer: [UInt8], outCols: Int = 90, outRows: Int = 45) -> String {
+    let width = Bus.framebufferWidth
+    let height = Bus.framebufferHeight
+    let bytesPerRow = width / 8
+    let ramp = Array(" .:-=+*#%@")
+    var lines: [String] = []
+    lines.reserveCapacity(outRows)
+    for oy in 0..<outRows {
+        let y0 = oy * height / outRows
+        let y1 = max(y0 + 1, (oy + 1) * height / outRows)
+        var line = ""
+        line.reserveCapacity(outCols)
+        for ox in 0..<outCols {
+            let x0 = ox * width / outCols
+            let x1 = max(x0 + 1, (ox + 1) * width / outCols)
+            var black = 0
+            var total = 0
+            for y in y0..<y1 {
+                for x in x0..<x1 {
+                    let byteIndex = y * bytesPerRow + x / 8
+                    let bit = 7 - (x % 8)
+                    if (framebuffer[byteIndex] >> bit) & 1 != 0 {
+                        black += 1
+                    }
+                    total += 1
+                }
+            }
+            let density = total > 0 ? Double(black) / Double(total) : 0
+            let idx = min(ramp.count - 1, Int(density * Double(ramp.count)))
+            line.append(ramp[idx])
+        }
+        lines.append(line)
+    }
+    return lines.joined(separator: "\n")
+}
+
 let args = CommandLine.arguments
 guard args.count >= 2 else {
     fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>")
@@ -152,7 +257,11 @@ while let line = readLine(strippingNewline: true) {
                 print(formatIOAccess(access))
             }
         }
-        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites)")
+        var status = "      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites)"
+        if machine.bus.ioTraceDropped > 0 {
+            status += " ioTraceDropped=\(machine.bus.ioTraceDropped)"
+        }
+        print(status)
         print(monitor.registerDump())
     case .go(let n):
         // Run n cycles quietly, then dump SLIM/SORG writes + I/O touches that
@@ -172,10 +281,20 @@ while let line = readLine(strippingNewline: true) {
         print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) halted=\(machine.halted)")
         print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
+    case .screenshot(let path):
+        let snapshot = machine.bus.framebufferSnapshot()
+        do {
+            try writeScreenshotPNG(snapshot, to: path)
+            print("wrote \(Bus.framebufferWidth)x\(Bus.framebufferHeight) screenshot to \(path)")
+        } catch {
+            print("sc: \(error)")
+        }
+    case .asciiPreview:
+        print(asciiPreview(machine.bus.framebufferSnapshot()))
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | q")
     case nil:
         print("? — unknown command")
     }

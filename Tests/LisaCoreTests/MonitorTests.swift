@@ -12,8 +12,26 @@ extension MusashiSuites {
             #expect(Monitor.parse("m 400 32") == .mem(0x400, 32))
             #expect(Monitor.parse("t") == .trace(1))
             #expect(Monitor.parse("t 5") == .trace(5))
+            #expect(Monitor.parse("g") == .go(100000))
+            #expect(Monitor.parse("g 50") == .go(50))
+            #expect(Monitor.parse("sc /tmp/shot.png") == .screenshot("/tmp/shot.png"))
+            #expect(Monitor.parse("sc") == nil, "sc requires a path argument")
+            #expect(Monitor.parse("sca") == .asciiPreview)
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
+        }
+
+        /// Deferred M1b Task 4-review minor, folded in by Task 5: a negative
+        /// count for `s`/`t`/`g` (and, incidentally, `d`/`m`, which share the
+        /// same `int(_:default:)` parsing helper) must fall back to the
+        /// command's default rather than reaching a `0..<n` Range downstream
+        /// and crashing the debugger.
+        @Test func negativeCountsFallBackToDefaultsInsteadOfCrashing() {
+            #expect(Monitor.parse("s -5") == .step(1))
+            #expect(Monitor.parse("t -1") == .trace(1))
+            #expect(Monitor.parse("g -100") == .go(100000))
+            #expect(Monitor.parse("d 400 -3") == .disasm(0x400, 8))
+            #expect(Monitor.parse("m 400 -3") == .mem(0x400, 64))
         }
 
         @Test func registerDumpShowsKnownState() {

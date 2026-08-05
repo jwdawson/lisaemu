@@ -2,7 +2,9 @@ import Foundation
 
 public struct Monitor {
     public enum Command: Equatable {
-        case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), go(Int), quit, help
+        case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), go(Int)
+        case screenshot(String), asciiPreview
+        case quit, help
     }
 
     let machine: Machine
@@ -14,8 +16,16 @@ public struct Monitor {
         func hex(_ i: Int) -> UInt32? {
             parts.count > i ? UInt32(parts[i], radix: 16) : nil
         }
+        // Rejects a negative count rather than letting it reach a `0..<n`
+        // Range construction downstream (`s`/`t`/`g`'s call sites in
+        // lisadbg all loop/run using a count built this way) -- `Range`
+        // traps on a negative upper bound, so a stray `s -5` typed at the
+        // prompt would crash the whole debugger instead of just being
+        // rejected. Falls back to `d`, matching every other malformed-arg
+        // case here.
         func int(_ i: Int, default d: Int) -> Int {
-            parts.count > i ? Int(parts[i]) ?? d : d
+            guard parts.count > i, let v = Int(parts[i]), v >= 0 else { return d }
+            return v
         }
         switch cmd {
         case "r": return .regs
@@ -25,6 +35,9 @@ public struct Monitor {
                   return .mem(a, int(2, default: 64))
         case "t": return .trace(int(1, default: 1))
         case "g": return .go(int(1, default: 100000))
+        case "sc": guard parts.count > 1 else { return nil }
+                   return .screenshot(parts[1])
+        case "sca": return .asciiPreview
         case "q": return .quit
         case "?": return .help
         default:  return nil

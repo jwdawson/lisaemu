@@ -60,6 +60,12 @@ public final class Bus {
     /// (owned by `IODispatcher`) is the first real caller, for CRDY-ack and
     /// input-byte-delivery timing (docs/hardware-notes.md §4).
     public var scheduleEvent: (UInt64, @escaping () -> Void) -> Void = { _, _ in }
+    /// Reaches `Machine.vsyncPending` (the level-1 IRQ source shared with
+    /// VIA1, docs/hardware-notes.md §5) from `VideoTiming`, which has no
+    /// `Machine`/`Bus` reference of its own -- mirrors `scheduleEvent`'s
+    /// injection pattern. `Machine.init` wires this to `{ [weak self] in
+    /// self?.vsyncPending = $0 }`; defaults to a no-op for bare `Bus` use.
+    public var vsyncInterruptHandler: (Bool) -> Void = { _ in }
     /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.
@@ -450,6 +456,12 @@ public final class Bus {
     /// calls `cops.reset()` (after clearing its own event queue) to
     /// (re-)deliver the power-on byte stream.
     public var cops: COPS { io.cops }
+    /// Vsync timing source (Task 5), owned by `IODispatcher` and wired to
+    /// `vsyncInterruptHandler` above -- see `VideoTiming`'s type doc
+    /// comment. `Machine.reset()` calls `videoTiming.reset()` (after
+    /// clearing its own event queue) to (re-)start the self-rescheduling
+    /// vsync event, mirroring `cops.reset()`.
+    public var videoTiming: VideoTiming { io.videoTiming }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

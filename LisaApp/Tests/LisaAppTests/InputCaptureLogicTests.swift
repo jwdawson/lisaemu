@@ -116,4 +116,22 @@ struct InputCaptureLogicTests {
         let release = state.release()  // later, capture released with the button already up
         #expect(!release.postButtonUp, "must not double-report an up the caller already posted")
     }
+
+    // MARK: - CaptureState / duplicate mouseUp (M1c Task 5 ledger fold)
+
+    @Test func duplicateMouseUpWhileCapturedDoesNotDoubleReportButtonUp() {
+        // THE fold: mouseUp() previously guarded only on `mouseCaptured`,
+        // not `buttonDown` -- so a second mouseUp callback for the same
+        // physical release (still captured, button already balanced)
+        // would report a phantom second button-up to the Lisa.
+        var state = CaptureState()
+        _ = state.mouseDown()
+        let firstUp = state.mouseUp()
+        #expect(firstUp == CaptureState.Effects(postButtonUp: true))
+        #expect(!state.buttonDown)
+
+        let duplicateUp = state.mouseUp()
+        #expect(duplicateUp == CaptureState.Effects(), "button already up -- must not double-report")
+        #expect(state.mouseCaptured, "capture itself is untouched by a spurious up")
+    }
 }

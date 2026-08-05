@@ -400,8 +400,14 @@ struct CaptureState: Equatable {
         return effects
     }
 
+    /// Guards on `buttonDown` (not just `mouseCaptured`) so a duplicate
+    /// `mouseUp` -- e.g. two `NSView` mouse-up callbacks for one physical
+    /// release, or a `mouseUp` arriving after the button was already
+    /// balanced by `release()`'s compensating up -- never double-reports a
+    /// button-up to the Lisa (M1c Task 5 ledger fold: pre-existing shape,
+    /// cheap hardening; see `InputCaptureLogicTests`).
     mutating func mouseUp() -> Effects {
-        guard mouseCaptured else { return Effects() }
+        guard mouseCaptured, buttonDown else { return Effects() }
         buttonDown = false
         return Effects(postButtonUp: true)
     }

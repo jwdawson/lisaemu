@@ -7,6 +7,14 @@ public final class Machine {
     /// interrupt) is *not* halted and does not set this flag. Cleared by
     /// `reset()`.
     public private(set) var halted = false
+    /// Level-1 IRQ source alongside VIA1 (docs/hardware-notes.md §5:
+    /// "Level 1: VIA1 ... Sources: VIA1 timer, vertical retrace, parallel
+    /// port, Twiggy"). Defaults `false`; Task 5 (video timing) is the first
+    /// task to ever set it. Exposed as a plain settable `var` -- unlike
+    /// VIA1/VIA2's interrupt flags, there is no dedicated hardware register
+    /// modeled yet for the vsync source itself (that's Task 5's job), so
+    /// this stands in for it in the IRQ-level computation below.
+    public var vsyncPending = false
 
     private struct Event {
         let cycle: UInt64
@@ -53,12 +61,34 @@ public final class Machine {
         return max(1, Int(bounded))
     }
 
+    /// Caps every `run(until:)` CPU burst to at most this many cycles, even
+    /// when no `Event` is queued sooner. VIA timer ticking and IRQ-level
+    /// computation only happen BETWEEN bursts (see `tickVIAsAndUpdateIRQ`),
+    /// so without this cap a `run(until:)` call spanning a long, event-free
+    /// stretch (the common case: the ROM's boot loop has no `Machine`
+    /// events scheduled against it) would execute the entire span in one
+    /// `cpu.run(cycles:)` call and never let a VIA-generated interrupt
+    /// become visible to Musashi until the call returned -- i.e. never,
+    /// for a single `run(until: 20_000_000)` style call. `1024` is smaller
+    /// than any VIA1/VIA2 timer period this codebase or the ROM has been
+    /// observed to use (docs/hardware-notes.md §3's Pre-/Post-Pepsi T1
+    /// reloads are $CA27/$7B63, i.e. ~10-31K cycles), so an interrupt
+    /// becomes visible within at most two bursts of latency; this is a
+    /// deliberate coarse-grained precision tradeoff, not cycle-exact
+    /// delivery -- see `VIA6522`'s doc comment for the matching tradeoff on
+    /// the timer side. `step()` does not need this: it always executes
+    /// exactly one instruction per call, so its IRQ recognition is already
+    /// exact to the instruction boundary.
+    private static let irqPollQuantum: UInt64 = 1024
+
     public func run(until targetCycle: UInt64) {
         while cycles < targetCycle {
-            let stop = min(targetCycle, queue.first?.cycle ?? targetCycle)
+            let eventStop = queue.first?.cycle ?? targetCycle
+            let stop = min(targetCycle, eventStop, cycles + Machine.irqPollQuantum)
             let slice = Machine.boundedSlice(from: cycles, to: stop)
             let executed = cpu.run(cycles: slice)
             cycles &+= UInt64(executed)
+            tickVIAsAndUpdateIRQ(executed)
             while let first = queue.first, first.cycle <= cycles {
                 queue.removeFirst()
                 first.action(self)
@@ -79,6 +109,23 @@ public final class Machine {
         }
     }
 
+    /// Advances both VIAs by the cycles just executed and recomputes the
+    /// CPU's IRQ level (docs/hardware-notes.md §5 "Interrupt Levels": VIA1
+    /// = level 1 -- OR'd with `vsyncPending`, the not-yet-modeled vsync
+    /// source sharing that level -- VIA2 = level 2; higher level wins when
+    /// both are asserted, matching the 68000's single IPL0-2 input).
+    /// Called once per executed slice/step by both `run(until:)` and
+    /// `step()`, which is also the granularity at which VIA timers are
+    /// ticked -- see `VIA6522`'s doc comment for that precision tradeoff.
+    private func tickVIAsAndUpdateIRQ(_ executed: Int) {
+        guard executed > 0 else { return }
+        bus.via1.tick(cycles: executed)
+        bus.via2.tick(cycles: executed)
+        let level1 = (bus.via1.irqAsserted || vsyncPending) ? 1 : 0
+        let level2 = bus.via2.irqAsserted ? 2 : 0
+        cpu.setIRQ(level: max(level1, level2))
+    }
+
     /// Executes a single CPU instruction, advancing `cycles` by the amount
     /// executed and draining any events now due, in (cycle, seq) order.
     /// Returns 0 immediately -- without touching the CPU -- once `halted`.
@@ -87,6 +134,7 @@ public final class Machine {
         guard !halted else { return 0 }
         let executed = cpu.step()
         cycles &+= UInt64(executed)
+        tickVIAsAndUpdateIRQ(executed)
         while let first = queue.first, first.cycle <= cycles {
             queue.removeFirst()
             first.action(self)

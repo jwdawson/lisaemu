@@ -249,6 +249,47 @@ public final class M68K {
         lisa_cpu_supervisor() != 0
     }
 
+    /// Sets the CPU's interrupt priority level (the IPL0-IPL2 pins), 0-7 --
+    /// a thin wrapper over Musashi's `m68k_set_irq`. `Machine` calls this
+    /// after every executed slice/step with `max(VIA1-derived level 1,
+    /// VIA2-derived level 2)` (docs/hardware-notes.md §5).
+    ///
+    /// No `insideCpuCallback` guard is needed here (unlike
+    /// `pulseBusError`/`forceHalt`): `m68k_set_irq` just stores the level
+    /// into a process-global variable; it does not itself touch CPU state
+    /// or perform a longjmp, so it is safe to call at any time, including
+    /// between `run`/`step` calls (which is exactly when `Machine` calls
+    /// it). IMPORTANT precision note, confirmed by reading `m68k_execute`
+    /// (m68kcpu.c:958-974) rather than assumed: `m68ki_check_interrupts()`
+    /// runs exactly ONCE, at the very top of `m68k_execute`, before its
+    /// per-instruction do-while loop -- NOT at every instruction boundary
+    /// within a single call. So a pending interrupt only becomes visible at
+    /// the START of the NEXT `run(cycles:)`/`step()` call, never mid-burst.
+    /// `M68K.step()` (always exactly one instruction per call) therefore
+    /// recognizes an interrupt with exact, one-instruction latency; a
+    /// multi-instruction `run(cycles:)` burst does not check again until it
+    /// returns and a new call begins -- which is precisely why
+    /// `Machine.run(until:)` bounds its bursts to `irqPollQuantum` cycles
+    /// (see that property's doc comment) rather than relying on any
+    /// mid-burst recognition that does not exist.
+    ///
+    /// Autovectored delivery ($64/$68/... per level, docs/hardware-notes.md
+    /// §5) is Musashi's out-of-the-box behavior here with zero extra
+    /// wiring, confirmed by reading the vendored core rather than assumed:
+    /// `m68ki_exception_interrupt` (m68kcpu.h:2130) resolves the vector via
+    /// `vector = m68ki_int_ack(int_level)`, and with `M68K_EMULATE_INT_ACK`
+    /// left `M68K_OPT_OFF` in the vendored `m68kconf.h`, that macro expands
+    /// to the literal constant `M68K_INT_ACK_AUTOVECTOR` (m68kcpu.h:483) --
+    /// no int-ack callback is even compiled in, let alone consulted, so
+    /// every interrupt this core takes is unconditionally autovectored.
+    /// (`m68k_set_int_ack_callback`/`default_int_ack_callback` in
+    /// m68kcpu.c also default to autovector, but that path is dead code
+    /// here since the option is off.) No shim changes were needed.
+    public func setIRQ(level: Int) {
+        assertOwner()
+        m68k_set_irq(UInt32(level))
+    }
+
     public subscript(_ reg: Register) -> UInt32 {
         get {
             assertOwner()

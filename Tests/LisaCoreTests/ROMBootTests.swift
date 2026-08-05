@@ -93,40 +93,53 @@ extension MusashiSuites {
         ///
         /// Trace checkpoint A (Task 2) mapped the post-boundary territory
         /// fully -- see docs/rom-trace-notes.md "Beyond the M1a boundary".
-        /// The observed PC frontier (via `g` in lisadbg): $FE0F00 at 2M
-        /// (RAM-fill loop), $FE35FE at 5M (delay loop), then by ~5.5M cycles
-        /// the ROM enters the VIA2 register self-test retry loop at $FE08B0
-        /// and STALLS there indefinitely -- 10M/20M/30M/60M all sample PC in
-        /// the $FE07B8-$FE08D2 loop, still setup=OFF / domain=0 / NOT halted.
+        /// The observed PC frontier (via `g` in lisadbg) up to M1b Task 3:
+        /// $FE0F00 at 2M (RAM-fill loop), $FE35FE at 5M (delay loop), then
+        /// by ~5.5M cycles the ROM entered the VIA2 register self-test
+        /// retry loop at $FE08B0 and stalled there indefinitely (this was
+        /// the M1b Task 2 frontier, with a dumb VIA read-back stub at the
+        /// WRONG bases $D801/$DC01).
         ///
-        /// The stall is a live busy-loop, not a fault/halt: $FE07B8 is a
-        /// read/write presence test on VIA2 registers $FCDD8D/$FCDD8F (base
-        /// $DD81, stride 2), which the current stub leaves as unknown IOSpace
-        /// (0xFF reads, dropped writes), so the test never passes and the ROM
-        /// retries forever (D7 sign bit keeps `bmi $fe08b0` taken). Making
-        /// VIA2 a real read/write register file at base $DD81 is Task 3 (VIA
-        /// core) -- confirmed empirically: pointing the stub at the ROM's
-        /// bases lets the ROM advance to $FE099A.
+        /// **M1b Task 3** replaced that stub with a real `VIA6522` at the
+        /// ROM-observed bases ($D901/$DD81, docs/hardware-notes.md §3) --
+        /// T1 latch read-back now genuinely works, so the self-test passes
+        /// and the ROM advances. The NEW frontier (task-3-report.md has the
+        /// full trace): by 10M cycles the ROM is well past $FE08B0, has run
+        /// the VIA1/VIA2 driver-init sequences ($FE0920-$FE093E: ACR2=$01,
+        /// PCR2|=$09, IER2=$7F clear-all, IFR2=$7F clear-all -- matching
+        /// hardware-notes.md §3's "Driver Initialization Sequence"), and is
+        /// parked in the COPS presence/handshake poll (hardware-notes.md
+        /// §4 "Command Protocol" step 2, "Poll CRDY"): `btst
+        /// D4,(A1)`/`bne` at $FE0980/$FE0982, testing VIA2 PORTB2
+        /// ($FCDD81) bit 6 with a ~0x61A-iteration bounded timeout per
+        /// attempt ($FE097C-$FE097E), retried indefinitely from an outer
+        /// caller since no COPS chip is modeled yet (VIA2's `portBInput`
+        /// defaults to a constant all-ones, so CRDY never toggles). This is
+        /// deterministic and stable at 10M cycles (confirmed by direct
+        /// `lisadbg g 10000000` and by re-sampling every 30M cycles out to
+        /// 300M -- PC never leaves this 4-instruction poll body). Exactly
+        /// the COPS/VIA2-Port-A dependency the M1b Task 2 wait-target table
+        /// predicted for Task 4 ("Task 4's requirements must come from a
+        /// post-Task-3 re-trace").
         ///
         /// This assertion is deliberately LOOSE: it pins that the CPU is
-        /// alive, past the old boundary, and parked in the documented VIA2
-        /// self-test loop -- not exact cycle-for-cycle behavior. 10M cycles
-        /// is safely inside the stall.
+        /// alive, past the VIA2 self-test, and parked in the COPS poll --
+        /// not exact cycle-for-cycle behavior. 10M cycles is safely inside
+        /// the new stall.
         @Test
-        func romRunsPastBoundaryAndStallsOnVIA2SelfTest() throws {
+        func romClearsVIA2SelfTestAndStallsOnCOPSPresencePoll() throws {
             let m = try bootedMachine()
             m.run(until: 10_000_000)
 
             #expect(m.bus.setupMode == false, "ROM dropped setup mode (clr.b $fce012)")
             #expect(m.bus.domain == 0, "domain 0 still active")
             #expect(m.halted == false,
-                    "post-boundary the ROM busy-loops on the VIA2 self-test, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
-            // Parked in the VIA2 register self-test retry loop
-            // ($FE07B8 test body + $FE08B0-$FE08D2 retry) -- rom-trace-notes.md
-            // "The hard stall".
+                    "post-boundary the ROM busy-loops on the COPS presence poll, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
+            // Parked in the COPS CRDY poll loop ($FE097C-$FE0982) --
+            // task-3-report.md "New ROM frontier".
             let pc = m.cpu[.pc]
-            #expect((0x00FE_07B8...0x00FE_08D2).contains(pc),
-                    "PC should be in the documented VIA2 self-test loop; got \(String(format: "%08X", pc))")
+            #expect((0x00FE_0920...0x00FE_09B2).contains(pc),
+                    "PC should be in the documented COPS presence-poll region; got \(String(format: "%08X", pc))")
         }
     }
 }

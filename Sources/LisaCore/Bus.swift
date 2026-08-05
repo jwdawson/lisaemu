@@ -430,6 +430,14 @@ public final class Bus {
     public var ioTrace: [IOAccess] { io.ioTrace }
     public var ioTraceDropped: Int { io.ioTraceDropped }
     public var videoPageLatch: UInt8 { io.videoPageLatch }
+    /// VIA1 ($D901, stride 8) / VIA2 ($DD81, stride 2) -- the real 6522
+    /// register files `IODispatcher` routes those IOSpace windows to (see
+    /// `IODispatcher.viaRegisterIndex`). `Machine` reads these each
+    /// slice/step to tick the timers and compute the CPU's IRQ level
+    /// (docs/hardware-notes.md §5 "Interrupt Levels": VIA1 = level 1, VIA2
+    /// = level 2).
+    public var via1: VIA6522 { io.via1 }
+    public var via2: VIA6522 { io.via2 }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

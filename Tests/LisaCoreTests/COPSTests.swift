@@ -42,12 +42,12 @@ private final class FakeScheduler {
     func advance(by delta: UInt64) { advance(to: cycle + delta) }
 }
 
-/// Consumes the full power-on stream (`$80`, keyboard ID, 5 trailing
-/// placeholder bytes -- `COPS.reset()`'s doc comment) via genuine handshake
-/// reads, one delivery-delay hop at a time, so tests that care about
-/// what comes AFTER power-on don't need to hardcode its byte count.
+/// Consumes the full power-on stream (`COPS.powerOnResetPacket`: `$80` +
+/// keyboard ID) via genuine handshake reads, one delivery-delay hop at a
+/// time, so tests that care about what comes AFTER power-on don't need to
+/// hardcode its byte count.
 private func drainPowerOnStream(_ cops: COPS, _ scheduler: FakeScheduler) {
-    let totalBytes = 2 + COPS.placeholderPowerOnTrailingBytes.count
+    let totalBytes = COPS.powerOnResetPacket.count
     for _ in 0..<totalBytes {
         scheduler.advance(by: COPS.byteDeliveryDelayCycles)
         cops.handlePortAAccess(index: 1, value: 0, isWrite: false)

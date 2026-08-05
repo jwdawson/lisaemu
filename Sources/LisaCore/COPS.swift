@@ -85,29 +85,26 @@ import Foundation
 /// mirroring the real CA1-vs-no-handshake register distinction the ROM's
 /// own command routine relies on (`VIA6522.onPortAAccess`'s doc comment).
 ///
-/// ## Power-on stream and the `$02` clock reply -- BEST-EFFORT PLACEHOLDERS
+/// ## Power-on stream and the `$02` clock reply
 ///
-/// Neither is trace-validated yet (the ROM has not reached this far as of
-/// this task -- see task-4-report.md "New ROM frontier"), and hardware-notes
-/// itself gives no byte-level format for the 5-byte clock payload (only that
-/// it exists and updates `ClockHigh`/`ClockLow`). Both are explicitly
-/// flagged placeholders per the task brief, pending Task 5+ trace
-/// validation:
-///
-/// - Power-on: `$80` (reset code follows -- state 4) + a placeholder
-///   keyboard-ID byte (`placeholderKeyboardID`, `$2F` -- hardware-notes
-///   lists no concrete ID) + 5 trailing placeholder bytes
-///   (`placeholderPowerOnTrailingBytes`, all zero) -- the trailing count of
-///   5 IS trace-validated (the ROM unconditionally reads 5 more bytes after
-///   any reset sub-code, not just an `$E0-$EF` one), their zero VALUE is
-///   not.
+/// - Power-on (`powerOnResetPacket`): `$80` (reset code follows -- state 4)
+///   + a placeholder keyboard-ID sub-code (`placeholderKeyboardID`, `$2F` --
+///   hardware-notes lists no concrete ID). M1b Task 7 reached the boot menu
+///   with this and established the packet's shape from the ROM's own
+///   reset-dispatch (a keyboard-ID reset is exactly these 2 bytes) -- see
+///   that constant's doc comment and docs/rom-trace-notes.md "POST
+///   completion (Task 7)". The stream is fidelity-only, not load-bearing:
+///   the ROM draws the identical menu even with no power-on stream at all.
 /// - `$02` (read clock) reply: `$80, $E0, <4-byte big-endian host Unix
-///   time>, $00` -- `$E0` (state-4 "clock start", year nibble left `0`)
-///   framed behind `$80` because state 0's decode only reaches state 4 via
-///   `$80`; a bare `$E0-$EF` byte at state 0 decodes as a keycode instead
-///   (hardware-notes.md §4), so this framing is the only self-consistent
-///   reading of the documented state machine, even though the exact 5-data-
-///   byte encoding is unverified.
+///   time>, $00` -- BEST-EFFORT PLACEHOLDER (hardware-notes gives no
+///   byte-level format for the 5-byte clock payload). `$E0` (state-4 "clock
+///   start", year nibble left `0`) framed behind `$80` because state 0's
+///   decode only reaches state 4 via `$80`; a bare `$E0-$EF` byte at state 0
+///   decodes as a keycode instead (hardware-notes.md §4), so this framing is
+///   the only self-consistent reading of the documented state machine, even
+///   though the exact 5-data-byte encoding is unverified. The boot ROM does
+///   not send `$02` on the path to the menu, so this remains unexercised by
+///   the boot trace.
 public final class COPS {
     // MARK: - Tunable timing ("plausible", not cycle-exact -- see the type
     // doc comment). All comfortably inside the ROM's ~1562-iteration CRDY
@@ -136,20 +133,29 @@ public final class COPS {
 
     /// Flagged placeholder -- see the type doc comment "Power-on stream".
     static let placeholderKeyboardID: UInt8 = 0x2F
-    /// 5 trailing bytes sent after `$80, <keyboard ID>` at power-on.
-    /// TRACE-INFORMED, VALUE-PLACEHOLDER: the boot ROM's reset-dispatch
-    /// handler (`$FE2D82`-`$FE2D9E`) unconditionally falls through to a
-    /// 5-iteration receive loop (`$FE2D9E-$FE2DBA`, storing into
-    /// `$481-$485`) after ANY reset sub-code, regardless of its value --
-    /// confirmed live under trace (docs/rom-trace-notes.md / this task's
-    /// report). hardware-notes.md §4's state machine only documents 5
-    /// trailing bytes after an `$E0-$EF` ("clock start") sub-code, not a
-    /// plain keyboard-ID one, so the ROM evidently expects a fixed 7-byte
-    /// reset packet regardless of sub-code -- but their MEANING when the
-    /// sub-code is a keyboard ID is undocumented. Zero bytes are a
-    /// deliberately inert placeholder (satisfies the ROM's byte COUNT, not
-    /// a validated real value) pending further trace/Task 5+ work.
-    static let placeholderPowerOnTrailingBytes: [UInt8] = [0x00, 0x00, 0x00, 0x00, 0x00]
+    /// The unsolicited reset announcement COPS delivers after its own
+    /// self-test: `$80` ("reset code follows" -- hardware-notes.md §4 State
+    /// 0 -> State 4) + a keyboard-ID sub-code (State 4, `$00-$DF`). Per that
+    /// state machine a keyboard-ID reset packet is EXACTLY these two bytes:
+    /// the 5-byte data payload belongs to State 3, reached only from a
+    /// State-4 CLOCK-START sub-code (`$E0-$EF`), never a keyboard ID -- and
+    /// the ROM's own reset-dispatch confirms this (the keyboard-ID branch at
+    /// `$FE2D7C` stores the ID and loops WITHOUT reading 5 more bytes; only
+    /// the `$E0-$EF` branch `$FE2D82` falls into the 5-byte loop at
+    /// `$FE2D9E`).
+    ///
+    /// M1b Task 7 correction: Task 4 appended 5 trailing `$00` bytes here on
+    /// a misreading of that dispatch as "unconditional 5 bytes after any
+    /// sub-code". Removing them reaches the byte-identical boot menu (same
+    /// framebuffer hash -- see docs/rom-trace-notes.md "POST completion
+    /// (Task 7)"), and each was `$00`, the State-0 MOUSE-packet marker, so
+    /// leaving them queued was a latent phantom-mouse-event hazard. The
+    /// power-on stream is not load-bearing for reaching the menu at all (the
+    /// menu draws even with an empty stream -- it is driven by the
+    /// command-handshake path); this 2-byte packet is kept purely for
+    /// fidelity (a real COPS is not silent at power-on) and exercises the
+    /// reset-dispatch path. The keyboard-ID VALUE remains a placeholder.
+    static let powerOnResetPacket: [UInt8] = [0x80, placeholderKeyboardID]
 
     // MARK: - Command bytes (docs/hardware-notes.md §4 "Command Bytes")
 
@@ -236,9 +242,7 @@ public final class COPS {
         powerCommandLog.removeAll()
         clockSetNibbles.removeAll()
         mouseInterruptsEnabled = false
-        enqueue(0x80)
-        enqueue(Self.placeholderKeyboardID)
-        for byte in Self.placeholderPowerOnTrailingBytes {
+        for byte in Self.powerOnResetPacket {
             enqueue(byte)
         }
     }

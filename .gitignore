@@ -2,3 +2,12 @@
 .DS_Store
 Vendor/
 *.xcodeproj
+# Already covered by the `*.xcodeproj` rule above; listed explicitly too
+# per docs/superpowers/plans/2026-08-05-m1c-app-shell.md's Xcode project
+# convention -- LisaApp/project.yml is the committed source of truth,
+# regenerated via `xcodegen generate --spec LisaApp/project.yml`.
+LisaApp/LisaApp.xcodeproj/
+# XcodeGen also writes the actual Info.plist here from project.yml's
+# inline `info.properties` at generate time -- generated output, not
+# hand-authored, same as the .xcodeproj above.
+LisaApp/Info.plist

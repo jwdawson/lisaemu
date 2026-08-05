@@ -17,7 +17,7 @@ public enum InputEvent {
 /// "Threading" doc comment for the cross-thread contract -- same as
 /// `FramePublisher.onFrame`, the app hops threads itself inside the
 /// closure).
-public struct EmuStatus {
+public struct EmuStatus: Sendable {
     public let cycles: UInt64
     public let halted: Bool
     public let throttled: Bool
@@ -33,7 +33,7 @@ private enum Command {
     case reset
     case setThrottled(Bool)
     case input(InputEvent)
-    case screenshot((Frame) -> Void)
+    case screenshot(@Sendable (Frame) -> Void)
     case debug((Machine) -> Void)
     case shutdown
 }
@@ -100,8 +100,8 @@ private final class Shared {
     let mailbox = Mailbox()
 
     private let lock = NSLock()
-    private var _onStatus: ((EmuStatus) -> Void)?
-    var onStatus: ((EmuStatus) -> Void)? {
+    private var _onStatus: (@Sendable (EmuStatus) -> Void)?
+    var onStatus: (@Sendable (EmuStatus) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onStatus }
         set { lock.lock(); defer { lock.unlock() }; _onStatus = newValue }
     }
@@ -156,7 +156,7 @@ private final class Shared {
 public final class EmulationController {
     public let framePublisher = FramePublisher()
 
-    public var onStatus: ((EmuStatus) -> Void)? {
+    public var onStatus: (@Sendable (EmuStatus) -> Void)? {
         get { shared.onStatus }
         set { shared.onStatus = newValue }
     }
@@ -227,7 +227,11 @@ public final class EmulationController {
     /// published vsync frame's number, or 0 if none yet), not a fabricated
     /// `0` -- see that property's doc comment for why a hardcoded `0` would
     /// wrongly collide with `Frame`'s own "no frame published yet" sentinel.
-    public func requestScreenshot(_ completion: @escaping (Frame) -> Void) {
+    ///
+    /// `@Sendable`: see `FramePublisher.onFrame`'s doc comment for why --
+    /// same cross-thread-callback trap, hit here first during Task 3's
+    /// manual verification checkpoint via `AppModel.requestScreenshotPNG`.
+    public func requestScreenshot(_ completion: @escaping @Sendable (Frame) -> Void) {
         shared.mailbox.post(.screenshot(completion))
     }
 

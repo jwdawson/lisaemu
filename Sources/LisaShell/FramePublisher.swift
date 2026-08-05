@@ -10,7 +10,7 @@ import Foundation
 /// `expand1bppRow`), deliberately NOT done here: this type and its producer
 /// live in the Foundation-only `LisaShell` target, which must stay free of
 /// AppKit/CoreGraphics/vImage (see the plan's Global Constraints).
-public struct Frame {
+public struct Frame: Sendable {
     public let bits: [UInt8]
     public let width: Int
     public let height: Int
@@ -38,6 +38,17 @@ public struct Frame {
 /// `onFrame` implementation can't hold up a concurrent `onFrame =` from
 /// another thread).
 ///
+/// Typed `@Sendable`: this is invoked ON THE EMULATION THREAD, not
+/// whatever actor/thread assigned it -- without `@Sendable`, a closure
+/// literal written inside a `@MainActor`-isolated method (as `LisaApp`'s
+/// `AppModel.wire` does) infers MainActor isolation from its lexical
+/// context by default under Swift 6, and invoking it from a different
+/// thread traps at runtime (`_swift_task_checkIsolatedSwift`/`SIGTRAP`) --
+/// caught the hard way during M1c Task 3's manual verification checkpoint
+/// (see task-3-report.md). `@Sendable` forces the closure to be
+/// non-isolated so it's actually legal to call cross-thread, matching this
+/// doc comment's contract.
+///
 /// Deliberately has no `Machine`/`Bus` reference of its own -- framebuffer
 /// capture is the controller's job (see `EmulationController.makeMachine`'s
 /// `Machine.onVsync` wiring). This mirrors `COPS`/`VideoTiming`'s
@@ -45,8 +56,8 @@ public struct Frame {
 /// type trivially constructible and testable in isolation.
 public final class FramePublisher {
     private let lock = NSLock()
-    private var _onFrame: ((Frame) -> Void)?
-    public var onFrame: ((Frame) -> Void)? {
+    private var _onFrame: (@Sendable (Frame) -> Void)?
+    public var onFrame: (@Sendable (Frame) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onFrame }
         set { lock.lock(); defer { lock.unlock() }; _onFrame = newValue }
     }

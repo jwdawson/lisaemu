@@ -1,0 +1,80 @@
+# XcodeGen spec for LisaApp -- the M1c app shell (SwiftUI window + menus
+# driving `LisaShell.EmulationController`). This file is the committed
+# source of truth; the generated `LisaApp.xcodeproj` is GITIGNORED and
+# regenerated on demand:
+#
+#   xcodegen generate --spec LisaApp/project.yml
+#
+# See docs/superpowers/plans/2026-08-05-m1c-app-shell.md's Global
+# Constraints ("Xcode project convention") for why: keeps the repo's only
+# generated, machine-specific project file out of version control while
+# still giving every contributor/agent an identical, reproducible project.
+name: LisaApp
+
+options:
+  bundleIdPrefix: com.lisaemu
+  deploymentTarget:
+    macOS: "14.0"
+
+# Local Swift package dependency on the repo root package (one level up
+# from this file, LisaApp/project.yml -> ../Package.swift) -- LisaApp
+# links LisaShell's product only; LisaShell in turn depends on LisaCore
+# (see root Package.swift), so both come along transitively.
+packages:
+  LisaEmu:
+    path: ..
+
+targets:
+  LisaApp:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Sources
+    dependencies:
+      - package: LisaEmu
+        product: LisaShell
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.lisaemu.LisaApp
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        SWIFT_VERSION: "6.0"
+        ENABLE_HARDENED_RUNTIME: NO
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_STYLE: Automatic
+        # Sandbox intentionally OFF (no entitlements file at all -- an
+        # Xcode target without CODE_SIGN_ENTITLEMENTS is unsandboxed by
+        # default): LisaApp is a local dev tool that reads ROM files
+        # directly from `LISAEMU_ROM_DIR`/`~/Development/LisaROMs`, a
+        # location outside any app container. App Store distribution
+        # (which would require the sandbox) is an explicit non-goal for
+        # this project -- see the plan's Global Constraints.
+    info:
+      path: Info.plist
+      properties:
+        CFBundleName: LisaApp
+        CFBundleDisplayName: LisaEmu
+        CFBundleIdentifier: com.lisaemu.LisaApp
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundlePackageType: APPL
+        CFBundleExecutable: $(EXECUTABLE_NAME)
+        CFBundleInfoDictionaryVersion: "6.0"
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: "No Apple ROMs, disk images, or Lisa source are included or accepted in this project."
+        NSPrincipalClass: NSApplication
+        NSMainStoryboardFile: ""
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSHighResolutionCapable: true
+
+schemes:
+  LisaApp:
+    build:
+      targets:
+        LisaApp: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    archive:
+      config: Release

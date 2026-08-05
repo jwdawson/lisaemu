@@ -88,13 +88,19 @@ import Foundation
 /// ## Power-on stream and the `$02` clock reply
 ///
 /// - Power-on (`powerOnResetPacket`): `$80` (reset code follows -- state 4)
-///   + a placeholder keyboard-ID sub-code (`placeholderKeyboardID`, `$2F` --
-///   hardware-notes lists no concrete ID). M1b Task 7 reached the boot menu
-///   with this and established the packet's shape from the ROM's own
-///   reset-dispatch (a keyboard-ID reset is exactly these 2 bytes) -- see
-///   that constant's doc comment and docs/rom-trace-notes.md "POST
-///   completion (Task 7)". The stream is fidelity-only, not load-bearing:
-///   the ROM draws the identical menu even with no power-on stream at all.
+///   + the keyboard-ID sub-code (`placeholderKeyboardID`, `$3F` -- Final US,
+///   76-key, per LEGENDS:583-596,660-859 and hardware-notes.md §8
+///   "Keyboard ID"; the byte is masked with `$3F` by software, so
+///   manufacturer bits 7-6 are don't-care -- CAVEAT: no factory log
+///   confirms real hardware's manufacturer bits). M1b Task 7 reached the
+///   boot menu with a `$2F` stand-in and established the packet's SHAPE
+///   from the ROM's own reset-dispatch (a keyboard-ID reset is exactly
+///   these 2 bytes); M1c Task 2's keyboard-input research corrected the
+///   VALUE -- `$2F` is actually a UK layout code, not US -- see that
+///   constant's doc comment and docs/rom-trace-notes.md "POST completion
+///   (Task 7)". The stream is fidelity-only, not load-bearing: the ROM
+///   draws the identical menu even with no power-on stream at all (verified
+///   unaffected by this ID correction too -- see task-2-report.md).
 /// - `$02` (read clock) reply: `$80, $E0, <4-byte big-endian host Unix
 ///   time>, $00` -- BEST-EFFORT PLACEHOLDER (hardware-notes gives no
 ///   byte-level format for the 5-byte clock payload). `$E0` (state-4 "clock
@@ -131,8 +137,19 @@ public final class COPS {
     /// InterruptFlag` calls.
     static let interruptFlagBit: UInt8 = 0x02
 
-    /// Flagged placeholder -- see the type doc comment "Power-on stream".
-    static let placeholderKeyboardID: UInt8 = 0x2F
+    /// US keyboard ID, Final-US 76-key layout: `$3F` (LEGENDS:583-596,
+    /// 660-859; masked with `$3F` by software -- DRIVERS:1106-1108,
+    /// KEYBD:1256 -- so manufacturer bits 7-6 are don't-care). See
+    /// hardware-notes.md §8 "Keyboard ID" for the full derivation.
+    ///
+    /// M1c Task 2 correction: M1b's value here was `$2F`, an unresearched
+    /// stand-in that turns out to be the UK layout code, not US. Still
+    /// named "placeholder" because the CAVEAT from the research stands: no
+    /// factory log confirms real hardware's manufacturer bits, so `$3F`
+    /// (manufacturer bits `00`) is the simplest mask-equivalent choice, not
+    /// a uniquely confirmed byte -- see the type doc comment "Power-on
+    /// stream" for the packet-shape history.
+    static let placeholderKeyboardID: UInt8 = 0x3F
     /// The unsolicited reset announcement COPS delivers after its own
     /// self-test: `$80` ("reset code follows" -- hardware-notes.md §4 State
     /// 0 -> State 4) + a keyboard-ID sub-code (State 4, `$00-$DF`). Per that

@@ -653,6 +653,150 @@ Source: LDASM:68-106
 - **NMI Vector:** Low-core $7C
 - **Trigger:** Debugger break-in signal
 
+## 8. Keyboard and Mouse Input
+
+Source: LIBHW-DRIVERS.TEXT.unix.txt (COPS state machine), libhw-KEYBD.TEXT.unix.txt
+(event/state logic, ShiftTable, EventTable), libhw-LEGENDS.TEXT.unix.txt
+(keycap→ASCII tables, keycode matrix, keyboard IDs), libhw-MOUSE.TEXT.unix.txt.
+All citations below are relative to `LISA_OS/LIBHW/` (mined for M1c Task 2;
+see `.superpowers/sdd/2026-08-05-m1c-app-shell/research-input-codes.md` for
+the full research pass this section transcribes).
+
+### Keycap Code Matrix (Final US, 76 keys)
+
+Source: LEGENDS:618-656 (keycode matrix), LEGENDS:125-133 (primary ASCII
+legends), KEYBD:719-761 (pseudo-keys).
+
+`keycode = (col<<4)|row`. Bit 7 of the COPS byte is the down (`$80`) / up
+(`$00`) flag; the low 7 bits below are the keycap value itself.
+
+- `$01` Disk1Inserted, `$02` Disk1Button, `$03` Disk2Inserted, `$04`
+  Disk2Button, `$05` ParallelPort, **`$06` MOUSE BUTTON**, **`$07` MOUSE
+  PLUG**, `$08` PowerButton (pseudo-key injected via KeyPushed; `$0B`-`$0E`
+  Sony-inserted variants) — KEYBD:719-761
+- **Keypad (`$20`-`$2F`):** `$20` Clear, `$21` `-`, `$22` Left (shift = `+`),
+  `$23` Right (`*`), `$24` `7`, `$25` `8`, `$26` `9`, `$27` Up (`/`), `$28`
+  `4`, `$29` `5`, `$2A` `6`, `$2B` Down (`,`), `$2C` `.`, `$2D` `2`, `$2E`
+  `3`, `$2F` Enter (numeric)
+- **Main block (`$40`-`$7F`)**, keycode → legend (primary ASCII, from
+  LEGENDS:125-133):
+
+  | Code | Legend | Code | Legend | Code | Legend | Code | Legend |
+  |------|--------|------|--------|------|--------|------|--------|
+  | $40  | `-_`   | $41  | `=+`   | $42  | `\|`   | $43  | (unused, US) |
+  | $44  | `p`    | $45  | Backspace (`$08`) | $46 | AlphaEnter (`$03`) | $48 | Return (`$0D`) |
+  | $49  | pad 0  | $4C  | `/?`   | $4D  | pad 1  | $4E  | R-Option |
+  | $50  | `9(`   | $51  | `0)`   | $52  | `u`    | $53  | `i`    |
+  | $54  | `j`    | $55  | `k`    | $56  | `[{`   | $57  | `]}`   |
+  | $58  | `m`    | $59  | `l`    | $5A  | `;:`   | $5B  | `'"`   |
+  | $5C  | Space  | $5D  | `,<`   | $5E  | `.>`   | $5F  | `o`    |
+  | $60  | `e`    | $61  | `6^`   | $62  | `7&`   | $63  | `8*`   |
+  | $64  | `5%`   | $65  | `r`    | $66  | `t`    | $67  | `y`    |
+  | $68  | `` ` ~ `` | $69 | `f`  | $6A  | `g`    | $6B  | `h`    |
+  | $6C  | `v`    | $6D  | `c`    | $6E  | `b`    | $6F  | `n`    |
+  | $70  | `a`    | $71  | `2@`   | $72  | `3#`   | $73  | `4$`   |
+  | $74  | `1!`   | $75  | `q`    | $76  | `s`    | $77  | `w`    |
+  | $78  | Tab (`$09`) | $79 | `z` | $7A  | `x`    | $7B  | `d`    |
+  | $7C  | L-Option | $7D | CapsLock | $7E | Shift  | $7F  | Command |
+
+  `$47`, `$4A`, `$4B`, `$4F` do not appear in the mined matrix — a gap in
+  the source table, not a documented "unused" marker like `$43`.
+
+### Modifiers
+
+Source: ShiftTable, KEYBD:88-97; EventTable `$78`-`$7F` row = `$F0`
+(modifiers never generate OS events on their own — KEYBD:65, 85, 298-301).
+
+- Shift = `$7E` (either physical shift key)
+- L-Option = `$7C`, R-Option = `$4E` (the Old-US keyboard sends `$68`
+  instead, remapped in software — DRIVERS:1101-1117)
+- Command/Apple = `$7F`
+- CapsLock = `$7D` (**latching** — the OS tracks lock state itself)
+- MouseButton = `$06` (ShiftState bit 4)
+
+All of the above arrive as ordinary keycap down/up bytes over the keyboard
+stream; the OS combines them into shift state itself — the COPS protocol
+has no separate "modifier state" message. Emulator behavior: forward
+independent down/up edges for each physical key; mapping both host Option
+keys to `$7C` is acceptable (the OS ORs left/right into a single bit
+anyway).
+
+### Mouse
+
+Source: DRIVERS:1089-1158, MOUSE:241,247 (sign-extension), KEYBD:95,
+301-305, 1062-1070 (button routing), MOUSE:50-83 and DRIVERS:616 (update
+cadence), DRIVERS:109-110 (screen bounds), MOUSE:87-170 (OS-side scaling).
+
+- **Delta packet:** `$00`, `dx` (signed byte), `dy` (signed byte) — 3 bytes
+  total.
+- **Button:** keycap `$06` in the KEYBOARD stream (down = `$86`, up = `$06`)
+  — NOT part of the delta packet. Plug-in = `$87`, unplug = `$07`.
+- **Update cadence:** COPS command `$78|((ms+2)/4 clamped 0-7)`; boot
+  default `$7C` = 16 ms.
+- **Screen bounds:** MaxX = 719, MaxY = 363. OS-side scaling modes exist;
+  the emulator sends raw deltas only.
+
+### Keyboard ID
+
+Source: LEGENDS:583-596, 660-859; masking at DRIVERS:1106-1108, KEYBD:1256.
+
+- **Byte format:** bits 7-6 = manufacturer (`00` TKC, `10` Keytronics),
+  bits 5-0 = layout/legends code. Software masks the received ID with
+  `$3F` before comparing it, so the manufacturer bits are effectively
+  don't-care.
+- **US = `$3F`** (Final US, 76-key — the matrix above). **Old US = `$0F`**
+  (73-key; also the OS's synthesized fallback if no ID arrives by
+  DriverInit end — DRIVERS:642-649). European layouts occupy `$24`-`$2E`.
+  Simplest correct full ID byte: **`$3F`**.
+- **CAVEAT (could-not-find):** no factory log confirms real hardware's
+  manufacturer bits; `$3F`/`$7F`/`$BF`/`$FF` are all equivalent under the
+  `$3F` mask, so `$3F` (manufacturer bits `00`) is the simplest choice, not
+  a uniquely confirmed one.
+- **M1c Task 2 correction:** M1b's `COPS.placeholderKeyboardID` used `$2F`
+  as an unresearched stand-in value. `$2F` is **not** the Final-US ID — per
+  the byte-format rule above (mask `$3F`), US is `$3F`; `$2F` is actually a
+  **UK** layout code. `Sources/LisaCore/COPS.swift`'s constant is corrected
+  to `$3F` in lockstep with this section (both-docs rule); see that file's
+  doc comment for the COPS-side citation and `docs/rom-trace-notes.md`
+  "POST completion (Task 7)" / the keyboard-ID-reset discussion for why the
+  power-on packet's *shape* (2 bytes: `$80` + ID) was already correct and
+  only the ID *value* changes here.
+
+### Special (Power Button, Unplug, Failure)
+
+Source: DRIVERS:1227-1232 (power button), state machine reset-dispatch
+(hardware-notes.md §4 "Input Packet State Machine").
+
+- **Power button:** COPS sends `$FB` in the reset-dispatch stream;
+  software synthesizes pseudo-keycap `$08` down+up (DRIVERS:1227-1232).
+- **Keyboard unplugged:** `$FD` — clears KeyBitmap except mask `$E0`
+  (parallel-port and mouse bits persist).
+- **COPS failure:** `$FE`/`$FF` (bit 0: 0 = I/O COPS, 1 = keyboard COPS).
+
+### Auto-Repeat (Software, Not COPS)
+
+Source: RepeatCheck, KEYBD:600-714; defaults DRIVERS:543-544.
+
+Auto-repeat is entirely a SOFTWARE feature of the OS's keyboard driver
+(`RepeatCheck`), not something COPS or the keyboard hardware generates.
+Defaults are 400 ms initial delay / 100 ms subsequent repeat per the CODE
+at DRIVERS:543-544 (a doc comment nearby says 150 ms; the code is the
+source of truth and wins per the both-docs rule). **The emulator never
+synthesizes repeat keycap events** — only real host key-repeat (if the
+host OS delivers it) or the app layer's own timer would do so, and this
+model does neither at the COPS/KeyMap layer.
+
+### Not Found
+
+- Portuguese/APL/Canadian/Dvorak transformation tables were proposed in
+  the OS source but never implemented — they fall through to FinalUS.
+- The full COPS command opcode table beyond `$78`-`$7F` (mouse-enable) and
+  `$58`-`$6F` (NMI-key ranges) lives in COPS firmware, not this source
+  tree.
+- Dead-key diacriticals use Option-layer pseudo-ASCII `$10`-`$14`
+  (KEYBD:101-151) — this is entirely OS-side processing of ordinary keycap
+  events; no emulator-side work is implied.
+
 ## Known Gaps (Flagged for M1b, Not M1a)
 
 - Parity/bus-error status register bit layout not located. Check SOURCE-EXCEPRES/SOURCE-EXCEPASM BUS_ERR handler.

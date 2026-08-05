@@ -166,6 +166,11 @@ extension MusashiSuites {
         /// 18M through 150M cycles -- PC never leaves this 4-instruction
         /// poll body. 20M cycles is safely inside the new stall.
         ///
+        /// The power-on packet consumed by the driver is the faithful 2-byte
+        /// `$80, keyboardID` (Task 7 reduced this from the Task-4-era 7-byte
+        /// description "$80 + keyboard-ID + 5 trailing bytes" — see COPS.swift
+        /// and hardware-notes §4).
+        ///
         /// **M1b Task 5** (docs/rom-trace-notes.md "Trace checkpoint B")
         /// re-traced this frontier with `VideoTiming` (vsync/`$F801` bit 2/
         /// `$E018`/`$E01A`) live and confirmed it is UNCHANGED: resampled

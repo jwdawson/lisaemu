@@ -220,7 +220,7 @@ That patch was reverted; **making VIA2 a real read/write register file is Task 3
 ### Device base addresses — ROM ground truth (refines hardware-notes §3)
 
 Disassembling the accessors gives the boot ROM's own base/stride for each
-6522, which **differ from `hardware-notes.md §3`** (`$D801`/`$DC01`):
+6522, which **differ from `hardware-notes.md §3` as it then read** (`$D801`/`$DC01`; §3 has since been corrected to the ROM-observed bases):
 
 - **VIA1 = `$FCD901`, stride ×8.** Used at `$FE0802`, `$FE0B6A`, `$FE1138`,
   `$FE1E14`. Register decode confirmed: `(A0)`=PORTB1, `$08`=PORTA1,

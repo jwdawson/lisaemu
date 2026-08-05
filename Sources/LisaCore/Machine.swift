@@ -41,6 +41,13 @@ public final class Machine {
         bus.vsyncInterruptHandler = { [weak self] pending in self?.vsyncPending = pending }
     }
 
+    /// Cold-init only: assumes a freshly constructed Bus (setup mode on, MMU/VIAs pristine). Resets CPU, cycle
+    /// counter, halt flag, and event queue; also re-triggers COPS and VideoTiming periodic events.
+    ///
+    /// NOT a hardware warm reset — VIA registers, setup latch, domain latches, and MMU state are deliberately
+    /// untouched. Calling on a machine that has dropped setup mode would fetch vectors through the
+    /// programmed MMU (wrong for a warm reset). Real RESTART semantics (the boot menu's RESTART button) are
+    /// an M2 task; see the M1b final review.
     public func reset() {
         cpu.reset()
         cycles = 0

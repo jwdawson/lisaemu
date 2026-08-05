@@ -109,18 +109,33 @@ enum ScreenshotError: Error, CustomStringConvertible {
 
 /// Renders a `Bus.framebufferSnapshot()` (720x364, 1 bit/pixel, row-major
 /// MSB-first, `Bus.framebufferByteCount` bytes) to a PNG file at `path`.
-/// "Set bit = black" (task brief) is expressed with a `decode` array rather
-/// than by unpacking bits manually: `CGImage`'s default 1bpp DeviceGray
-/// decode maps component 0 -> black, 1 -> white -- the OPPOSITE of what the
-/// brief specifies -- so `decode: [1, 0]` inverts it (component 0 -> output
-/// 1.0/white, component 1 -> output 0.0/black). This is debugger tooling
-/// only (`lisadbg`, not `LisaCore` -- see that module's "framework-free"
-/// constraint), hence the direct ImageIO/CoreGraphics dependency here.
+///
+/// "Set bit = black" (task brief) is the established M1b/M1c convention --
+/// see `LisaShell/FrameExpansion.swift`'s `expand1bppRow`, which bakes the
+/// same polarity into its 8bpp output (`isSet ? 0 : 255`) and cites this
+/// function as its counterpart. An earlier version of this function tried
+/// to express the polarity via a `decode: [1, 0]` array instead of
+/// inverting the bits, reasoning that `CGImage`'s default 1bpp DeviceGray
+/// decode (component 0 -> black, 1 -> white) is the opposite of what's
+/// wanted, so a `[1, 0]` decode array should flip it back. That reasoning
+/// is correct for on-screen rendering, but **`CGImageDestinationFinalize`
+/// does not honor a custom `decode` array when encoding to PNG** (PNG has
+/// no decode-array concept, so ImageIO silently falls back to writing the
+/// raw sample bits under the *default* decode) -- confirmed by an actual
+/// negative-image regression (`m1b-boot-screen.png`/`live-boot-demo.png`
+/// were negatives of the app's proven-correct render; see task-3's review
+/// and M1c Task 5's ledger fold). The fix inverts the bits up front and
+/// relies on the *default* decode ([0, 1]: component 0 -> black), matching
+/// `expand1bppRow`'s "bake polarity into the data, not a decode array"
+/// approach. This is debugger tooling only (`lisadbg`, not `LisaCore` --
+/// see that module's "framework-free" constraint), hence the direct
+/// ImageIO/CoreGraphics dependency here.
 func writeScreenshotPNG(_ framebuffer: [UInt8], to path: String) throws {
     let width = Bus.framebufferWidth
     let height = Bus.framebufferHeight
     let bytesPerRow = width / 8
-    guard let provider = CGDataProvider(data: Data(framebuffer) as CFData) else {
+    let inverted = framebuffer.map { ~$0 }
+    guard let provider = CGDataProvider(data: Data(inverted) as CFData) else {
         throw ScreenshotError.imageCreationFailed
     }
     let colorSpace = CGColorSpaceCreateDeviceGray()
@@ -133,7 +148,7 @@ func writeScreenshotPNG(_ framebuffer: [UInt8], to path: String) throws {
         space: colorSpace,
         bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
         provider: provider,
-        decode: [1, 0],
+        decode: nil,
         shouldInterpolate: false,
         intent: .defaultIntent
     ) else {
@@ -159,6 +174,15 @@ func writeScreenshotPNG(_ framebuffer: [UInt8], to path: String) throws {
 /// perfectly uniform when the source dimensions don't divide evenly (364 /
 /// 45 isn't exact) -- "block-averaged", not exact-area-averaged, per the
 /// brief's "~90x45" wording.
+///
+/// Unlike `writeScreenshotPNG` (see that function's doc comment for the
+/// PNG-specific polarity bug this module had), this function never touches
+/// `CGImage`/ImageIO -- it counts raw set bits directly, the same way
+/// `expand1bppRow` and `ROMBootTests`' `blackPixels` do, so the "set bit =
+/// black = higher density = darker ramp glyph" mapping below was already
+/// correct under the established convention (confirmed by a side-by-side
+/// comparison against the app's proven-correct render during M1c Task 5's
+/// polarity investigation: the sc bug did not extend here).
 func asciiPreview(_ framebuffer: [UInt8], outCols: Int = 90, outRows: Int = 45) -> String {
     let width = Bus.framebufferWidth
     let height = Bus.framebufferHeight

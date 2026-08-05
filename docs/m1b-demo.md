@@ -65,3 +65,27 @@ invariant, and the exact 64-bit FNV-1a framebuffer fingerprint
 ```sh
 LISAEMU_ROM_DIR=$HOME/Development/LisaROMs swift test --filter ROMBootTests
 ```
+
+## Correction (M1c Task 5)
+
+The `m1b-boot-screen.png` and `live-boot-demo.png` screenshots have been
+**regenerated** — earlier versions were photographic negatives of the real
+screen (black/white swapped). M1c Task 3's review discovered the
+discrepancy: the app's live-window blit pipeline was verified bit-exact
+against `ROMBootTests`' 78,100-set-pixel invariant, but `lisadbg`'s `sc`
+PNG writer produced 183,980 black pixels instead (the framebuffer's
+minority-set "ink" bits rendering white, and the majority-clear
+background rendering black). Root cause: `CGImageDestinationFinalize`
+does not honor a custom CGImage `decode` array when encoding to PNG — the
+`decode: [1, 0]` `sc` used to express "set bit = black" was silently
+ignored, and the raw bits were written under PNG's default polarity
+instead. Fixed in `Sources/lisadbg/main.swift`'s `writeScreenshotPNG` by
+inverting the bits before encoding (matching `LisaShell/FrameExpansion
+.swift`'s `expand1bppRow`, which bakes polarity into the sample data
+rather than relying on a decode array) rather than by changing the
+`decode` array again. The `sca` ASCII preview was checked as part of the
+same investigation and found *not* to be affected — it counts raw bits
+directly (like `expand1bppRow`) rather than going through `CGImage`/PNG,
+so it was already correct. Both screenshots above were regenerated with
+the fixed `sc` and re-verified against the same 78,100-black-pixel count
+(`magick <file>.png -format %c histogram:info:-`).

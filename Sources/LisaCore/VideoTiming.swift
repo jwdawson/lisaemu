@@ -44,6 +44,17 @@ public final class VideoTiming {
     /// `COPS`'s `raiseInterrupt`/`clearInterrupt` injection).
     private let setIRQPending: (Bool) -> Void
 
+    /// M1c shell hook (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
+    /// Task 1): fires on EVERY vsync tick, unconditionally -- unlike
+    /// `setIRQPending`, which only reaches `Machine.vsyncPending` when the
+    /// interrupt has been armed via `$E01A` (see `fireVsync` below). The
+    /// shell's `FramePublisher` needs a "a vsync just happened, snapshot the
+    /// framebuffer now" cadence independent of whether the ROM currently has
+    /// the vsync interrupt armed, so this is a second, narrower closure
+    /// rather than overloading `setIRQPending`'s semantics. `Machine` wires
+    /// this to its own `onVsync` closure (see that property's doc comment).
+    public var onVsyncTick: (() -> Void)?
+
     /// `$F801` bit 2 (vertical retrace pending, docs/hardware-notes.md §5
     /// "Status Register"). Owned entirely here -- nothing else sets this
     /// bit -- and read by `IODispatcher.currentValue` to compose the full
@@ -83,6 +94,7 @@ public final class VideoTiming {
         if armed {
             setIRQPending(true)
         }
+        onVsyncTick?()
         scheduleNextVsync()
     }
 

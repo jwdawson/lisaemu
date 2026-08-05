@@ -203,6 +203,35 @@ public final class COPS {
     /// Set by `$7C` ("enable mouse interrupts (16ms)", hardware-notes.md §4).
     public private(set) var mouseInterruptsEnabled = false
 
+    /// Total bytes currently queued for delivery to the CPU, including one
+    /// already "ready" on Port A (`byteReady`) but not yet consumed via a
+    /// handshake read, if any. Read-only; no behavior depends on it or is
+    /// gated by it.
+    ///
+    /// M1c shell hook (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
+    /// Task 1, "input events reach COPS" test): `EmulationController` runs
+    /// `Machine` on a dedicated thread, so a test can't peek at a live
+    /// `Machine`'s state directly -- it has to go through a synchronous,
+    /// thread-safe debug hook. That hook needs SOME public, synchronous
+    /// signal that changes the instant `postKey`/`postMouse` enqueues a
+    /// byte, without requiring the CPU to run forward through a full
+    /// COPS/VIA2/ROM handshake first (which would make the test dependent
+    /// on real ROM boot timing). The task brief named two options: this
+    /// FIFO-length seam, or an `ioTrace`-based observation. `ioTrace`
+    /// (`IODispatcher.logAccess`) does not cover VIA/COPS port accesses at
+    /// all (only IOSpace latch/decode-level touches -- see
+    /// `Bus.mmuPortWrites`/`ioTrace`'s doc comments and
+    /// `ROMBootTests.romTouchesIOAndProgramsMMU`'s "SLIM/SORG port writes go
+    /// through `Bus.slimSorgPortAccess`, not `ioTrace`"), so an ioTrace-based
+    /// test would need to boot all the way to the menu and race real ROM
+    /// polling timing to observe an indirect side effect. This one-line,
+    /// read-only counter is strictly less invasive: it adds no new behavior,
+    /// changes no existing code path, and gives an immediate, deterministic
+    /// signal with zero cycle advancement required.
+    public var pendingInputCount: Int {
+        inputQueue.count + (byteReady ? 1 : 0)
+    }
+
     // MARK: - VIA2 wiring
 
     /// Assign directly to `via2.portAInput`.

@@ -17,6 +17,19 @@ public final class Machine {
     /// the IRQ-level computation below.
     public var vsyncPending = false
 
+    /// M1c shell hook (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
+    /// Task 1): called on the emulation thread at every `VideoTiming` vsync
+    /// tick, regardless of whether the vsync interrupt is currently armed
+    /// (contrast `vsyncPending`, which only reflects the IRQ-relevant
+    /// subset). `LisaShell.FramePublisher` hooks this to snapshot
+    /// `bus.framebufferSnapshot()` at the real ~60Hz cadence. Not used
+    /// anywhere in LisaCore itself; `nil` by default so tests that don't
+    /// care about frame cadence pay nothing. Forwarded from
+    /// `bus.videoTiming.onVsyncTick` (assigned once in `init`, below);
+    /// `reset()` does not need to reassign it since `Bus`/`VideoTiming` are
+    /// not recreated by `reset()`, only re-initialized in place.
+    public var onVsync: (() -> Void)?
+
     private struct Event {
         let cycle: UInt64
         let seq: UInt64
@@ -39,6 +52,7 @@ public final class Machine {
             self.schedule(at: self.cycles &+ delay) { _ in action() }
         }
         bus.vsyncInterruptHandler = { [weak self] pending in self?.vsyncPending = pending }
+        bus.videoTiming.onVsyncTick = { [weak self] in self?.onVsync?() }
     }
 
     /// Cold-init only: assumes a freshly constructed Bus (setup mode on, MMU/VIAs pristine). Resets CPU, cycle

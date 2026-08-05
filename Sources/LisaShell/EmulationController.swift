@@ -1,0 +1,373 @@
+import Foundation
+import LisaCore
+
+/// Lisa-side input event, forwarded 1:1 onto the existing `COPS.postKey`/
+/// `postMouse` seams (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
+/// Task 1 "Interfaces"). Deliberately Lisa-keycap-shaped, not
+/// host-keycap-shaped -- translating host (macOS) key codes into these is
+/// Task 2's `KeyMap`, which lives in the app layer, not here.
+public enum InputEvent {
+    case keyDown(UInt8)
+    case keyUp(UInt8)
+    case mouseDelta(dx: Int8, dy: Int8)
+    case mouseButton(down: Bool)
+}
+
+/// Published ~4Hz on the emulation thread (see `EmulationController`'s
+/// "Threading" doc comment for the cross-thread contract -- same as
+/// `FramePublisher.onFrame`, the app hops threads itself inside the
+/// closure).
+public struct EmuStatus {
+    public let cycles: UInt64
+    public let halted: Bool
+    public let throttled: Bool
+    public let emulatedSeconds: Double
+}
+
+/// Commands crossing from any external thread into the emulation thread's
+/// mailbox (see `Mailbox`, below). Internal: the public surface is
+/// `EmulationController`'s methods, which just enqueue these.
+private enum Command {
+    case start
+    case pause
+    case reset
+    case setThrottled(Bool)
+    case input(InputEvent)
+    case screenshot((Frame) -> Void)
+    case debug((Machine) -> Void)
+    case shutdown
+}
+
+/// Locked command queue crossing from any thread into the emulation
+/// thread's loop, drained between run slices (see `EmulationController`'s
+/// "Threading" doc comment). Backed by a plain `NSLock` + array: the task
+/// brief named two shapes ("NSCondition or os_unfair_lock + array"); this
+/// is functionally the same shape as the latter (a lock + array) using the
+/// portable, non-`@unchecked` `NSLock` rather than the lower-level
+/// `os_unfair_lock` C API. `NSCondition`'s wait/signal semantics buy
+/// nothing here because the mailbox is drained by POLLING once per loop
+/// iteration -- never a blocking wait for a command to arrive.
+private final class Mailbox {
+    private let lock = NSLock()
+    private var commands: [Command] = []
+    private var _throttled = false
+
+    func post(_ command: Command) {
+        lock.lock()
+        commands.append(command)
+        if case .setThrottled(let value) = command { _throttled = value }
+        lock.unlock()
+    }
+
+    /// `throttled`'s cached last-set value, readable synchronously from any
+    /// thread without waiting for the emulation loop to drain the
+    /// corresponding `.setThrottled` command -- satisfies the brief's
+    /// "`var throttled: Bool` (mailbox-set)": the SETTER goes through the
+    /// mailbox like any other cross-thread command (so the emulation loop
+    /// applies it, and `EmuStatus.throttled` reflects it, between slices),
+    /// while the GETTER can answer immediately from this lock-protected
+    /// cache rather than round-tripping through the loop.
+    var throttledSnapshot: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _throttled
+    }
+
+    /// Drains and returns every command queued since the last drain, in
+    /// FIFO order. Called once per emulation-loop iteration.
+    func drain() -> [Command] {
+        lock.lock()
+        defer { lock.unlock() }
+        let drained = commands
+        commands.removeAll(keepingCapacity: true)
+        return drained
+    }
+}
+
+/// Cross-thread shared state: everything the emulation thread's loop reads
+/// or writes that isn't purely local to that thread's own call stack.
+///
+/// A separate object from `EmulationController` itself, on purpose: the
+/// `Thread`'s closure is built and started from inside
+/// `EmulationController.init`, BEFORE `self` is fully initialized, and
+/// Swift forbids capturing `self` (even weakly) in an escaping closure
+/// before all stored properties are set ("definite initialization").
+/// Routing everything the thread needs through this fully-constructed-first
+/// object sidesteps that entirely.
+private final class Shared {
+    let romDirectory: URL
+    let framePublisher: FramePublisher
+    let mailbox = Mailbox()
+
+    private let lock = NSLock()
+    private var _onStatus: ((EmuStatus) -> Void)?
+    var onStatus: ((EmuStatus) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onStatus }
+        set { lock.lock(); defer { lock.unlock() }; _onStatus = newValue }
+    }
+
+    /// Set only from the emulation thread's startup failure path (before
+    /// `startupGate.signal()`), read only from `EmulationController.init`
+    /// after `startupGate.wait()` returns -- the semaphore itself is the
+    /// happens-before edge, so this doesn't need its own lock.
+    var startupError: Error?
+
+    init(romDirectory: URL, framePublisher: FramePublisher) {
+        self.romDirectory = romDirectory
+        self.framePublisher = framePublisher
+    }
+}
+
+/// Owns a dedicated emulation thread that creates and exclusively drives a
+/// `Machine`, per `docs/superpowers/plans/2026-08-05-m1c-app-shell.md`'s
+/// threading rule: "the `Machine` is created ON the emulation thread and
+/// never touched from any other thread." `M68K`'s own `assertOwner()`
+/// (`Sources/LisaCore/M68K.swift`) is the enforcement backstop -- it
+/// records its creation thread and traps in debug builds if ever called
+/// from another one, which is exactly why `Machine(...)` is constructed
+/// inside the thread's own entry point (`runEmulationThread`/`makeMachine`
+/// below) rather than in `init` on the caller's thread.
+///
+/// ## Threading
+///
+/// All cross-thread traffic goes through either:
+/// - the `Mailbox` (commands: start/pause/reset/throttle/input/screenshot),
+///   drained once per loop iteration between run slices, or
+/// - immutable published snapshots: `FramePublisher.onFrame` (called once
+///   per vsync) and `onStatus` (called ~4Hz) -- both invoked ON THE
+///   EMULATION THREAD; the app is responsible for hopping to its own
+///   thread inside those closures, this type never does it for them.
+///
+/// ## Pacing
+///
+/// Throttled mode paces `Machine.run(until:)` calls using `Governor`
+/// (above), anchored to a nominal start time recomputed whenever
+/// start/reset/throttle-toggle re-enters the throttled branch. Unthrottled
+/// mode runs continuous one-vsync-sized slices (`VideoTiming.cyclesPerVsync`
+/// cycles) back-to-back with no sleep, still draining the mailbox between
+/// slices so input/pause/etc. stay responsive.
+///
+/// ## reset() interim semantics
+///
+/// `reset()` tears down and recreates the `Machine` on the emulation thread
+/// (a fresh `Machine(ramSize:)` + `loadROM` + `reset()`), NOT a hardware
+/// warm reset -- that lands in M2 (see `Machine.reset()`'s own doc comment
+/// for the same interim-semantics precedent at the `LisaCore` layer).
+public final class EmulationController {
+    public let framePublisher = FramePublisher()
+
+    public var onStatus: ((EmuStatus) -> Void)? {
+        get { shared.onStatus }
+        set { shared.onStatus = newValue }
+    }
+
+    /// Mailbox-set (see `Mailbox.throttledSnapshot`'s doc comment): the
+    /// setter posts `.setThrottled` for the emulation loop to apply between
+    /// slices; the getter answers from a lock-protected cache, not a
+    /// mailbox round-trip. Defaults to `false` (unthrottled) -- `LisaApp`
+    /// (Task 5) is where "throttle default ON" becomes the shipped default;
+    /// this layer stays neutral.
+    public var throttled: Bool {
+        get { shared.mailbox.throttledSnapshot }
+        set { shared.mailbox.post(.setThrottled(newValue)) }
+    }
+
+    private let shared: Shared
+    private let startupGate = DispatchSemaphore(value: 0)
+    private let shutdownGate = DispatchSemaphore(value: 0)
+
+    /// PLACEHOLDER Lisa keycap for the mouse button, pending Task 2's
+    /// `KeyMap`/hardware-notes.md §8 research into whether the real Lisa
+    /// delivers mouse-button state as a keycode-shaped event (like the
+    /// documented power-button synthesis, "$FB: power button (synthesized
+    /// as key $08 down/up)", hardware-notes.md "Input Packet State
+    /// Machine" State 4) or some other mechanism. Mirrors `COPS`'s own
+    /// established "flagged placeholder" precedent
+    /// (`COPS.placeholderKeyboardID`). `$7F` chosen only to be a
+    /// syntactically valid 7-bit keycap value, not because it's known to be
+    /// correct or even unused by a real key.
+    static let placeholderMouseButtonKeycap: UInt8 = 0x7F
+
+    public init(romDirectory: URL) throws {
+        let framePublisher = self.framePublisher
+        let shared = Shared(romDirectory: romDirectory, framePublisher: framePublisher)
+        self.shared = shared
+
+        let startupGate = self.startupGate
+        let shutdownGate = self.shutdownGate
+        let thread = Thread {
+            EmulationController.runEmulationThread(shared: shared, startupGate: startupGate,
+                                                     shutdownGate: shutdownGate)
+        }
+        thread.name = "LisaEmu.EmulationController"
+        thread.stackSize = 4 << 20
+        thread.start()
+
+        startupGate.wait()
+        if let error = shared.startupError {
+            throw error
+        }
+    }
+
+    deinit {
+        shared.mailbox.post(.shutdown)
+        shutdownGate.wait()
+    }
+
+    public func start() { shared.mailbox.post(.start) }
+    public func pause() { shared.mailbox.post(.pause) }
+    public func reset() { shared.mailbox.post(.reset) }
+    public func post(_ event: InputEvent) { shared.mailbox.post(.input(event)) }
+
+    /// Returns the raw 1bpp framebuffer snapshot + dimensions via `Frame`
+    /// (PNG-encoding stays app-side, per the plan's Task 1 interfaces).
+    public func requestScreenshot(_ completion: @escaping (Frame) -> Void) {
+        shared.mailbox.post(.screenshot(completion))
+    }
+
+    /// Test-only observability seam
+    /// (docs/superpowers/plans/2026-08-05-m1c-app-shell.md Task 1, "input
+    /// events reach COPS" test discussion in task-1-report.md):
+    /// synchronously fetches a value computed from the LIVE `Machine`,
+    /// blocking the caller until the emulation thread has drained the
+    /// mailbox up to and including this request and run `body`.
+    ///
+    /// Deliberately `internal`, not `public`: defeats the entire point of
+    /// the async mailbox/thread-ownership design if called from the app's
+    /// UI thread (it blocks the CALLER, not the emulation thread, but a
+    /// production caller has no legitimate reason to reach into `Machine`
+    /// directly anyway -- that's exactly the boundary this type exists to
+    /// enforce). `@testable import LisaShell` is how `LisaShellTests`
+    /// reaches this.
+    func debugSync<T>(_ body: @escaping (Machine) -> T) -> T {
+        var result: T!
+        let sem = DispatchSemaphore(value: 0)
+        shared.mailbox.post(.debug { machine in
+            result = body(machine)
+            sem.signal()
+        })
+        sem.wait()
+        return result
+    }
+
+    // MARK: - Emulation thread
+
+    private static func makeMachine(romBytes: [UInt8], shared: Shared) -> Machine {
+        let machine = Machine(ramSize: 0x20_0000)   // 2 MB, hardware max -- matches ROMBootTests.
+        machine.bus.loadROM(romBytes)
+        machine.reset()
+        // [weak machine]: `onVsync` is a property ON `machine` itself, so a
+        // strong capture here would be a genuine retain cycle.
+        machine.onVsync = { [weak machine] in
+            guard let machine else { return }
+            shared.framePublisher.publish(bits: machine.bus.framebufferSnapshot(),
+                                           width: Bus.framebufferWidth,
+                                           height: Bus.framebufferHeight)
+        }
+        return machine
+    }
+
+    private static func apply(_ event: InputEvent, to machine: Machine) {
+        switch event {
+        case .keyDown(let code):
+            machine.bus.cops.postKey(code: code, down: true)
+        case .keyUp(let code):
+            machine.bus.cops.postKey(code: code, down: false)
+        case .mouseDelta(let dx, let dy):
+            machine.bus.cops.postMouse(dx: dx, dy: dy)
+        case .mouseButton(let down):
+            machine.bus.cops.postKey(code: placeholderMouseButtonKeycap, down: down)
+        }
+    }
+
+    /// Runs entirely on the dedicated emulation thread; never touches
+    /// `EmulationController` (`self`) -- see `Shared`'s doc comment for why.
+    private static func runEmulationThread(shared: Shared, startupGate: DispatchSemaphore,
+                                            shutdownGate: DispatchSemaphore) {
+        let romBytes: [UInt8]
+        var machine: Machine
+        do {
+            romBytes = try ROMImage.load(directory: shared.romDirectory)
+            machine = makeMachine(romBytes: romBytes, shared: shared)
+        } catch {
+            shared.startupError = error
+            startupGate.signal()
+            shutdownGate.signal()
+            return
+        }
+        startupGate.signal()
+
+        var running = false
+        // `nil` means "recompute on next throttled slice" -- forces a fresh
+        // anchor whenever we (re-)enter throttled running (start/reset/
+        // throttle-toggle), so pacing always resumes relative to "now",
+        // never replays a stale wall-clock anchor from before a pause.
+        var throttleAnchor: TimeInterval?
+        var lastStatusPublish = ProcessInfo.processInfo.systemUptime
+
+        while true {
+            for command in shared.mailbox.drain() {
+                switch command {
+                case .start:
+                    running = true
+                    throttleAnchor = nil
+                case .pause:
+                    running = false
+                case .reset:
+                    machine = makeMachine(romBytes: romBytes, shared: shared)
+                    running = false
+                    throttleAnchor = nil
+                case .setThrottled:
+                    throttleAnchor = nil
+                case .input(let event):
+                    apply(event, to: machine)
+                case .screenshot(let completion):
+                    completion(Frame(bits: machine.bus.framebufferSnapshot(),
+                                      width: Bus.framebufferWidth,
+                                      height: Bus.framebufferHeight,
+                                      sequence: 0))
+                case .debug(let body):
+                    body(machine)
+                case .shutdown:
+                    shutdownGate.signal()
+                    return
+                }
+            }
+
+            guard running, !machine.halted else {
+                // Avoid a hot spin while paused/halted; mailbox is still
+                // drained every iteration so commands stay responsive.
+                Thread.sleep(forTimeInterval: 0.005)
+                continue
+            }
+
+            if shared.mailbox.throttledSnapshot {
+                let now = ProcessInfo.processInfo.systemUptime
+                let anchor = throttleAnchor ?? {
+                    let a = now - Double(machine.cycles) / Governor.cyclesPerSecond
+                    throttleAnchor = a
+                    return a
+                }()
+                let target = Governor.targetCycles(anchor: anchor, now: now)
+                let sliceStart = now
+                machine.run(until: target)
+                let sliceDuration = ProcessInfo.processInfo.systemUptime - sliceStart
+                let sleep = Governor.sleepInterval(sliceDuration: sliceDuration)
+                if sleep > 0 { Thread.sleep(forTimeInterval: sleep) }
+            } else {
+                throttleAnchor = nil
+                machine.run(until: machine.cycles + VideoTiming.cyclesPerVsync)
+            }
+
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - lastStatusPublish >= 0.25 {
+                lastStatusPublish = now
+                shared.onStatus?(EmuStatus(cycles: machine.cycles,
+                                            halted: machine.halted,
+                                            throttled: shared.mailbox.throttledSnapshot,
+                                            emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond))
+            }
+        }
+    }
+}
+

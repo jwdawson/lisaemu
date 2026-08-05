@@ -771,7 +771,11 @@ Source: DRIVERS:1227-1232 (power button), state machine reset-dispatch
   software synthesizes pseudo-keycap `$08` down+up (DRIVERS:1227-1232).
 - **Keyboard unplugged:** `$FD` — clears KeyBitmap except mask `$E0`
   (parallel-port and mouse bits persist).
-- **COPS failure:** `$FE`/`$FF` (bit 0: 0 = I/O COPS, 1 = keyboard COPS).
+- **COPS failure:** `$FE`/`$FF` (bit 0 semantics per §4,
+  LIBHW-DRIVERS.TEXT:1244-1252: 0 = I/O COPS, 1 = keyboard COPS).
+- **Dead-key diacriticals:** Option-layer pseudo-ASCII `$10`-`$14`
+  (KEYBD:101-151) — found in the source, but entirely OS-side processing
+  of ordinary keycap events; no emulator-side work is implied.
 
 ### Auto-Repeat (Software, Not COPS)
 
@@ -793,9 +797,6 @@ model does neither at the COPS/KeyMap layer.
 - The full COPS command opcode table beyond `$78`-`$7F` (mouse-enable) and
   `$58`-`$6F` (NMI-key ranges) lives in COPS firmware, not this source
   tree.
-- Dead-key diacriticals use Option-layer pseudo-ASCII `$10`-`$14`
-  (KEYBD:101-151) — this is entirely OS-side processing of ordinary keycap
-  events; no emulator-side work is implied.
 
 ## Known Gaps (Flagged for M1b, Not M1a)
 

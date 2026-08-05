@@ -292,21 +292,49 @@ Source: libhw-DRIVERS:592-620
 - ACR2 = $01
 - IER2 = $82
 
-## 4. COPS (via VIA2 Port A)
+## 4. COPS (via VIA2 Port A for data; Port B for the CRDY handshake)
+
+### CRDY lives on PORTB2 bit 6 — REFUTES the OS-source claim below
+
+**M1b Task 4 ground truth (primary source — use this):** the Rev H boot
+ROM's own COPS command-send routine (`$FE0956`-`$FE09C0`, disassembled live
+under trace — see docs/rom-trace-notes.md "COPS" section and
+task-4-report.md for the full transcript) polls CRDY exclusively via `btst
+#6,(A1)` with `A1 = $FCDD81` — VIA2 base + offset **0**, i.e. **PORTB2**, not
+PORTA2 (`$FCDD81 + 2 = $FCDD83`). Independently confirmed by a direct
+register dump at the ROM's COPS-poll stall (`m fcdd80 20` under `lisadbg`):
+`DDRB2 = $0E` (only bits 1/2/3 are outputs — bit 6 is an input, consistent
+with CRDY being COPS-driven) while `DDRA2 = $00` (Port A still fully input,
+before the routine's own `DDRA2 = $FF` step even runs). Command/reply DATA
+is on Port A exactly as documented below; only the handshake bit's PORT was
+wrong.
+
+**Historical OS-source claim (libhw-DRIVERS:822-887), REFUTED for the Rev H
+boot path** — kept for provenance only:
+
+- ~~Poll CRDY (Port A bit 6, aka VIA2 base + bit 6)~~
+
+Per the both-docs ROM-wins rule, PORTB2 bit 6 is the corrected reading; the
+flow steps below are otherwise unchanged (and re-confirmed by the same
+trace, including the byte-order refinement noted in step 1).
 
 ### Command Protocol
 
-Source: libhw-DRIVERS:822-887
+Source: libhw-DRIVERS:822-887, corrected/refined by the M1b Task 4 ROM trace.
 
-**Flow:**
-1. Write command byte to IORA2
-2. Poll CRDY (Port A bit 6, aka VIA2 base + bit 6)
-3. Wait for transition: ready → not-ready
-4. ~10-cycle wait
-5. Set DDRA2 = $FF (output)
-6. Send command
-7. Poll CRDY again
-8. Set DDRA2 = $00 (input)
+**Flow (ROM's `$FE0956` "SendCOPSCommand", corrected step order):**
+1. Write command byte to IORA2 (register 15, the no-handshake ORA alias, offset `$1E`) — while DDRA2 is still `$00` (input): this STAGES the byte without yet driving Port A's pins (real 6522 DDR-gates-OR-to-pins behavior).
+2. Poll CRDY (**PORTB2** bit 6) until it reads 0 ("ready → not-ready").
+3. A short delay, then poll CRDY == 0 again (observed as a near-instant second check in practice).
+4. Set DDRA2 = $FF (output) — Port A now actually drives the staged byte. This is the real "send" (not a separate step 6 — the ROM does not re-write the data byte here).
+5. Poll CRDY until it reads 1 again ("not-ready → ready" — COPS acknowledging).
+6. A further short delay, then set DDRA2 = $00 (input).
+7. `IER2 |= $82` (register 14, set-mode, bit 1) — enables VIA2's "COPS interrupt pending" source (§3's IFR2 bit 1) for whatever input follows.
+
+Step numbering above is the ROM's actual order (DDRA2 → output happens
+AFTER, not before, the "wait for not-ready" poll) — the original OS-source
+listing's step numbering implied output-then-poll; the ROM trace is the
+primary source for the corrected order.
 
 ### Command Bytes
 
@@ -323,6 +351,13 @@ All citations from libhw-TIMERS, libhw-MACHINE, or libhw-DRIVERS:
 | $2D   | Disable timer enable, set clock for reboot alarm | MACHINE:462     |
 | $23   | Power off, reboot later             | MACHINE:473                 |
 | $7C   | Enable mouse interrupts (16ms)      | libhw-DRIVERS:616           |
+
+**M1b Task 4 trace note:** the boot ROM's own POST presence probe
+(`$FE093E-$FE0954`) sends `$00`, `$70`, `$50`, `$60` in sequence — none of
+which are in this OS-derived table. These read as boot-ROM-only
+diagnostic/self-test opcodes with no documented meaning; the ROM only
+requires the CRDY handshake to complete for each, not any particular
+COPS-side effect.
 
 ### Input Packet State Machine
 
@@ -346,6 +381,20 @@ Source: libhw-DRIVERS:1074-1252 (COPS/COPSX handlers)
 - $FB: power button (synthesized as key $08 down/up)
 - $FD: keyboard unplugged
 - $FE-$FF: COPS failure (bit 0: 0 = I/O COPS, 1 = keyboard COPS)
+
+**M1b Task 4 trace note — reset packet is a fixed 7 bytes, not
+sub-code-dependent:** the boot ROM's reset-dispatch handler
+(`$FE2D82`-`$FE2D9E`) stores whatever State-4 sub-code byte it received into
+`$480` and then UNCONDITIONALLY falls through to a 5-iteration receive loop
+(`$FE2D9E-$FE2DBA`, storing into `$481-$485`) — regardless of whether the
+sub-code was `$00-$DF` (keyboard ID) or `$E0-$EF` (clock start). This
+contradicts reading State 3 ("receive 5 clock bytes") as conditional on the
+`$E0-$EF` case only: at least at power-on, the ROM expects a fixed 7-byte
+reset packet (`$80`, sub-code, 5 more bytes) no matter what the sub-code is.
+The MEANING of those 5 bytes when the sub-code is a plain keyboard ID is
+undocumented and unvalidated (task-4-report.md's COPS model sends 5 zero
+placeholder bytes — the trailing byte COUNT is trace-validated, the VALUE is
+not).
 
 ## 5. Interrupts
 

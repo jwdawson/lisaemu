@@ -298,11 +298,79 @@ recorded here as a future serial-device requirement.
 |-------------------|--------------------------------------------------------------|------|
 | VIA2 `$DD81` (stride 2), esp. `$DD8D`/`$DD8F` (T1 latches) | real 6522 registers that read back written values (DDR/latch/port). **This is the current hard stall.** | **Task 3** |
 | VIA1 `$D901` (stride 8): DDRB1/PORTB1/DDRA1/PORTA1/T1LL1/T1LH1 | real 6522 register file; timer-1 latch loads | **Task 3** |
-| COPS / VIA2 Port A (`$DD83`/`$DD87`=DDRA2/`$DD9F`=IORA2)   | **not reached before the stall** — no COPS handshake, DDRA2, or IORA2 access observed yet; Task 4's requirements must come from a post-Task-3 re-trace (once VIA2 is real and the ROM gets past `$FE08B0`) | **Task 4** |
+| COPS / VIA2 Port A+B (`$DD81`=CRDY/PORTB2, `$DD83`/`$DD87`=DDRA2/`$DD9F`=IORA2) | **DONE (Task 4)** — real HLE `COPS` endpoint; see "COPS" section below | ~~Task 4~~ |
 | `$F801` status register (`btst #1`)                       | real status bits (bit1 meaning undetermined — only bit2=vsync is documented, `hardware-notes §5`) | Task 5 |
 | `$E018/$E01A/$E01C/$E01E` video strobes                   | vsync/vertical-retrace strobe + interrupt semantics; `$E01C/$E01E` are newly observed | Task 5 |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
+
+## COPS (Task 4)
+
+Full trace, TDD evidence, and design rationale: task-4-report.md. This
+section records only the ROM-observed protocol facts (the wait-target
+table row above points here); it does not attempt the Task 5 "checkpoint B"
+broad re-sweep of the whole post-boundary territory.
+
+### The presence-probe stall clears — and CRDY is on PORT B, not Port A
+
+The `$FE0920-$FE09B2` stall the Task 2/3 wait-target table left for this
+task (`btst D4,(A1)`, `A1=$FCDD81`, `D4=6`) is a poll of **PORTB2 bit 6**,
+not Port A — see hardware-notes.md §4 for the full correction (the
+OS-source listing's "CRDY = Port A bit 6" claim is refuted). Adding a real
+`COPS` HLE endpoint behind VIA2 (command handshake + input FIFO, wired to
+`via2.portAInput`/`portBInput`/`onPortAAccess`) clears this stall entirely:
+the ROM's presence probe (4 commands: `$00,$70,$50,$60`, none in the
+OS-derived command table — hardware-notes.md §4) succeeds, the driver-init
+sequence (`ACR2=$01, PCR2|=$09, IER2=$7F, IFR2=$7F` — already documented by
+Task 3) completes, and the ROM proceeds into a long pre-Pepsi contrast-DAC
+calibration delay loop (`$FE0AE2`, a `subq.l`/`bne` spin burning ~3-9M
+cycles depending on which of three delay constants is selected — unrelated
+to COPS, board-revision contrast/DAC bit-banging per hardware-notes.md §2's
+"Board-revision-dependent write paths").
+
+### The reset packet is a fixed 7 bytes — not sub-code-conditional
+
+The ROM's reset-dispatch handler (`$FE2D82`-`$FE2D9E`) stores the received
+State-4 sub-code into `$480` and then UNCONDITIONALLY reads 5 more bytes
+(`$FE2D9E-$FE2DBA`, into `$481-$485`), regardless of the sub-code's value —
+see hardware-notes.md §4's added trace note. `COPS`'s power-on stream models
+this as `$80, <keyboard ID>, 0,0,0,0,0` (5 zero placeholder bytes — the
+COUNT is trace-validated, the VALUE is not).
+
+### New frontier: an unconditional wait for the next COPS byte (`$FE2DBE`)
+
+After the full power-on packet is consumed, the ROM reaches a NEW, stable
+stall by ~18M cycles at `$FE2DCE` (`beq $fe2dc6`, inside
+`$FE2DBE-$FE2DD6`): an unconditional (no-timeout) poll of VIA2 IFR2 bit 1,
+waiting for another COPS input byte. Call chain: `$FE2624` (sets flag bit 5
+of low-RAM cell `$2A2`) → `$FE2C46` (tests bit 3 of the same cell) →
+`$FE2D38` → `$FE2DBE`. This reads as a later, on-going "wait for next COPS
+event" primitive (distinct from the bounded-timeout receive routine at
+`$FE0A7E`-`$FE0AA8` used during power-on/clock-byte reception), not part of
+the documented reset-packet protocol — task-4-report.md has the full
+disassembly and register-dump evidence. `COPS` has nothing further queued
+to deliver at this point, so the ROM legitimately waits forever; this is the
+new frontier left for a later task (task-4-report.md's "New ROM frontier"
+and `ROMBootTests.romClearsCOPSPresencePollAndStallsAwaitingNextInputByte`).
+
+### The IFR2 desync (found and fixed under trace)
+
+Confirmed live via a `lisadbg m fcdd80 20` register dump at an early attempt
+of this same stall: VIA2 PORTA2 (`peek(1)`) read back `$80` (COPS's pending
+power-on reset byte, still undelivered) while IFR2 (`peek(13)`) read `$00`
+(the "byte ready" flag already clear) — a permanent desync. Root cause: the
+ROM's own VIA2 driver-init does a blanket `IFR2 = $7F` ("clear all") shortly
+after `COPS`'s power-on interrupt has already raised IFR2 bit 1, days (in
+cycle terms) before the ROM gets around to actually reading Port A. That
+write reaches `VIA6522` directly and has no way to notify `COPS`, so
+`COPS`'s internal "byte pending" state and the VIA's actual flag drift out
+of sync, and the ROM's later no-timeout poll (`$FE2DC6-$FE2DCE`) hangs
+forever. Fixed with a self-reasserting "data ready" timer (`COPS
+.armReassertTimer`, task-4-report.md has the design rationale) that keeps
+re-raising the flag on a fixed cadence for as long as a byte remains
+genuinely undelivered — modeling how a real level-sensitive peripheral
+signal would behave, since a one-shot pulse cannot survive a premature
+external flag clear it has no visibility into.
 
 ## Answers to the Task 5 open questions
 

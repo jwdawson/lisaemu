@@ -53,6 +53,13 @@ public final class Bus {
     /// these tests), matching `supervisorProvider`/`busErrorHandler`'s
     /// pattern of Machine-supplied closures.
     public var cycleProvider: () -> UInt64 = { 0 }
+    /// Schedules `action` to run after `delay` elapsed cycles from now.
+    /// `Machine.init` wires this to `Machine.schedule(at: cycles + delay)`.
+    /// Defaults to a no-op for bare `Bus` use, matching
+    /// `cycleProvider`/`busErrorHandler`'s pattern -- Task 4's `COPS`
+    /// (owned by `IODispatcher`) is the first real caller, for CRDY-ack and
+    /// input-byte-delivery timing (docs/hardware-notes.md §4).
+    public var scheduleEvent: (UInt64, @escaping () -> Void) -> Void = { _, _ in }
     /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.
@@ -438,6 +445,11 @@ public final class Bus {
     /// = level 2).
     public var via1: VIA6522 { io.via1 }
     public var via2: VIA6522 { io.via2 }
+    /// HLE COPS microcontroller (Task 4), owned by `IODispatcher` and wired
+    /// to `via2`'s ports -- see `COPS`'s type doc comment. `Machine.reset()`
+    /// calls `cops.reset()` (after clearing its own event queue) to
+    /// (re-)deliver the power-on byte stream.
+    public var cops: COPS { io.cops }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

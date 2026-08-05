@@ -123,11 +123,11 @@ extension MusashiSuites {
         /// post-Task-3 re-trace").
         ///
         /// This assertion is deliberately LOOSE: it pins that the CPU is
-        /// alive, past the VIA2 self-test, and parked in the COPS poll --
+        /// alive, past the VIA2 self-test, and parked at the COPS poll --
         /// not exact cycle-for-cycle behavior. 10M cycles is safely inside
-        /// the new stall.
+        /// that stall (task-3-report.md's frontier, superseded below).
         @Test
-        func romClearsVIA2SelfTestAndStallsOnCOPSPresencePoll() throws {
+        func romClearsVIA2SelfTestAndReachesCOPSPresencePoll() throws {
             let m = try bootedMachine()
             m.run(until: 10_000_000)
 
@@ -135,11 +135,50 @@ extension MusashiSuites {
             #expect(m.bus.domain == 0, "domain 0 still active")
             #expect(m.halted == false,
                     "post-boundary the ROM busy-loops on the COPS presence poll, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
-            // Parked in the COPS CRDY poll loop ($FE097C-$FE0982) --
-            // task-3-report.md "New ROM frontier".
+            // Parked in the pre-Task-4-COPS-device era of the COPS CRDY poll
+            // loop ($FE097C-$FE0982), or already just past it (the two live
+            // side-by-side in ROM: `$FE0AE2` is the very next block, a
+            // long-running contrast-DAC calibration delay some boot paths
+            // hit around here too) -- task-3-report.md "New ROM frontier".
             let pc = m.cpu[.pc]
-            #expect((0x00FE_0920...0x00FE_09B2).contains(pc),
-                    "PC should be in the documented COPS presence-poll region; got \(String(format: "%08X", pc))")
+            #expect((0x00FE_0920...0x00FE_0AE6).contains(pc),
+                    "PC should be in the documented COPS presence-poll/post-poll region; got \(String(format: "%08X", pc))")
+        }
+
+        /// **M1b Task 4** (task-4-report.md has the full trace) added a real
+        /// `COPS` HLE endpoint behind VIA2 -- CRDY (corrected to PORTB2 bit
+        /// 6, refuting hardware-notes.md §4's Port-A claim -- see that
+        /// file's "COPS" section), the command handshake, and an input FIFO
+        /// delivering the power-on reset packet. That clears the
+        /// `$FE0920-$FE09B2` presence-poll stall entirely: the ROM now runs
+        /// the VIA2 driver-init, the pre-Pepsi contrast-DAC calibration
+        /// delay (`$FE0AE2`, ~5-9M cycles), the COPS presence probe (4
+        /// commands: `$00,$70,$50,$60`), consumes the full power-on packet
+        /// (`$80` + keyboard-ID + 5 trailing bytes) via the driver's bounded
+        /// and unbounded receive routines, and reaches a NEW stable stall by
+        /// ~18M cycles at `$FE2DCE` (`beq $fe2dc6`, inside
+        /// `$FE2DBE-$FE2DD6`): an UNCONDITIONAL (no-timeout) poll of VIA2
+        /// IFR2 bit 1 waiting for the CPU's *next* COPS input byte -- one
+        /// this task's COPS model has nothing further queued to deliver
+        /// (task-4-report.md "New ROM frontier" has the full call chain:
+        /// `$FE2624` (sets flag `$2A2` bit 5) -> `$FE2C46` -> `$FE2D38` ->
+        /// `$FE2DBE`). Confirmed stable by direct `lisadbg g` sampling from
+        /// 18M through 150M cycles -- PC never leaves this 4-instruction
+        /// poll body. 20M cycles is safely inside the new stall.
+        @Test
+        func romClearsCOPSPresencePollAndStallsAwaitingNextInputByte() throws {
+            let m = try bootedMachine()
+            m.run(until: 20_000_000)
+
+            #expect(m.bus.setupMode == false, "ROM dropped setup mode (clr.b $fce012)")
+            #expect(m.bus.domain == 0, "domain 0 still active")
+            #expect(m.halted == false,
+                    "post-COPS-handshake the ROM busy-loops awaiting the next COPS byte, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
+            // Parked in the unconditional "wait for next COPS input byte"
+            // poll ($FE2DC6-$FE2DCE) -- task-4-report.md "New ROM frontier".
+            let pc = m.cpu[.pc]
+            #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pc),
+                    "PC should be in the documented post-COPS-handshake input-wait region; got \(String(format: "%08X", pc))")
         }
     }
 }

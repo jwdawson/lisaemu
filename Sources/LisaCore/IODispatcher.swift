@@ -50,11 +50,35 @@ final class IODispatcher {
     let via1 = VIA6522()
     let via2 = VIA6522()
 
+    /// HLE keyboard/mouse/clock/power-management microcontroller (Task 4),
+    /// reachable only through VIA2 -- see `COPS`'s type doc comment for the
+    /// full protocol (and the CRDY-lives-on-Port-B correction to
+    /// hardware-notes.md §4).
+    let cops: COPS
+
     private var contextBit1 = false
     private var contextBit2 = false
 
     init(bus: Bus) {
         self.bus = bus
+        // `via2` (not `self`) captured below -- `self` cannot escape into a
+        // closure until every stored property (including `cops`, being
+        // computed right here) has a value; `via2` itself is already fully
+        // initialized (its own default initializer ran before this body).
+        let via2Ref = via2
+        cops = COPS(
+            scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
+            currentCycle: { [weak bus] in bus?.cycleProvider() ?? 0 },
+            raiseInterrupt: { [weak via2Ref] in via2Ref?.setInterruptFlag(COPS.interruptFlagBit) },
+            clearInterrupt: { [weak via2Ref] in via2Ref?.clearInterruptFlag(COPS.interruptFlagBit) }
+        )
+        // `self` is fully initialized as of the line above -- safe to
+        // capture from here on.
+        via2.portAInput = cops.portAInput
+        via2.portBInput = cops.portBInput
+        via2.onPortAAccess = { [weak self] index, value, isWrite in
+            self?.cops.handlePortAAccess(index: index, value: value, isWrite: isWrite)
+        }
     }
 
     /// A real (non-peek) read: applies any latch side effect (setup/context

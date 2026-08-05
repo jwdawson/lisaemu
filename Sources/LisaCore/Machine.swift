@@ -33,6 +33,10 @@ public final class Machine {
         }
         bus.forceHaltHandler = { [weak cpu] in cpu?.forceHalt() }
         bus.cycleProvider = { [weak self] in self?.cycles ?? 0 }
+        bus.scheduleEvent = { [weak self] delay, action in
+            guard let self else { return }
+            self.schedule(at: self.cycles &+ delay) { _ in action() }
+        }
     }
 
     public func reset() {
@@ -40,6 +44,10 @@ public final class Machine {
         cycles = 0
         halted = false
         queue.removeAll()
+        // COPS.reset() schedules the power-on byte stream -- must happen
+        // AFTER queue.removeAll() above, or that clear would wipe the very
+        // event it just scheduled. See `COPS.reset()`'s doc comment.
+        bus.cops.reset()
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {

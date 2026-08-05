@@ -175,12 +175,37 @@ Source: libhw-DRIVERS:936-962; independent confirmation OS/source-SERNUM.TEXT.un
 
 ### Base Addresses
 
-Source: libhw-DRIVERS:137-138
+**Rev H boot ROM ground truth (primary source — use these):**
 
-- **VIA1:** IOSpace + $D801 (hard disk / parallel VIA; alternate decode: $D101)
-- **VIA2:** IOSpace + $DC01 (keyboard / COPS VIA; alternate decode: $D181)
+The Rev H boot ROM was traced under the emulator (docs/rom-trace-notes.md
+"Beyond the M1a boundary (Trace checkpoint A)"), and the register base each
+VIA is actually programmed at was read straight off the disassembly of the
+accessing code:
 
-Note: Use $D801/$DC01 (Lisa 2/10-era decodes).
+- **VIA1:** IOSpace + **$D901**, stride ×8. Base loads at `$FE0802`
+  (`movea.l #$fcd901,A0`), `$FE0B6A`, `$FE1138`, `$FE1E14`; register decode
+  confirmed there (e.g. `($10,A0)`=DDRB1, `($18,A0)`=DDRA1, `($08,A0)`=PORTA1,
+  T1 latch loads `$FCD931`/`$FCD939` = T1LL1/T1LH1).
+- **VIA2:** IOSpace + **$DD81**, stride ×2. Base loads at `$FE0494`
+  (`movea.l #$fcdd81,A0`), `$FE0920`, `$FE0B06`, `$FE11D0`, …; register decode
+  confirmed at `$FE0B0C-1E` (`($04,A0)`=DDRB2, `(A0)`=PORTB2, `($16,A0)`=ACR2;
+  the boot self-test targets `$FCDD8D`/`$FCDD8F` = T1LL2/T1LH2).
+
+**M1b Task 3 (VIA core) must implement the ROM-observed bases $D901/$DD81** (or
+model the partial chip-select decode that makes the historical aliases below
+alias onto the same chips) — the ROM never touches $D801/$DC01.
+
+**Historical OS-source equates (libhw-DRIVERS:137-138), REFUTED for the Rev H
+2/10 boot path** — kept for provenance only:
+
+- ~~VIA1: IOSpace + $D801 (hard disk / parallel VIA; alternate decode: $D101)~~
+- ~~VIA2: IOSpace + $DC01 (keyboard / COPS VIA; alternate decode: $D181)~~
+
+The prior "Use $D801/$DC01 (Lisa 2/10-era decodes)" note was an OS-source
+assumption; the ROM trace (primary source) shows the Rev H boot code uses
+$D901/$DD81, so per the both-docs ROM-wins rule the ROM values above take
+precedence. (The register *offset* tables and stride below are unchanged and
+were independently re-confirmed by the same trace.)
 
 ### VIA1 Register Offsets
 

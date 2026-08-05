@@ -179,9 +179,11 @@ and special `$4000+` → `0xFF`).
 
 Still `setup=OFF`, `domain=0`, `halted=false` throughout. This is a **live
 busy-loop, not a halt**: the CPU never faults, it just never satisfies a device
-presence test. (The `ioTrace` cap of 4096 entries fills by ~30 M, so `g`'s
-per-slice I/O dump goes empty after that — an artifact of the trace buffer, not
-of the CPU going quiet; the PC samples confirm it is still spinning.)
+presence test. (The `ioTrace` cap of 4096 entries saturates by ~5.5-6 M cycles
+— i.e. right as the retry loop begins hammering `$DD8D`/`$DD8F` — so `g`'s
+per-slice I/O dump goes empty for every later slice: an artifact of the trace
+buffer filling, not of the CPU going quiet; the PC samples confirm it is still
+spinning.)
 
 ### The hard stall — VIA2 register self-test (`$FE07B8`, target `$FCDD81`)
 
@@ -296,7 +298,8 @@ recorded here as a future serial-device requirement.
 |-------------------|--------------------------------------------------------------|------|
 | VIA2 `$DD81` (stride 2), esp. `$DD8D`/`$DD8F` (T1 latches) | real 6522 registers that read back written values (DDR/latch/port). **This is the current hard stall.** | **Task 3** |
 | VIA1 `$D901` (stride 8): DDRB1/PORTB1/DDRA1/PORTA1/T1LL1/T1LH1 | real 6522 register file; timer-1 latch loads | **Task 3** |
-| `$F801` status register (`btst #1`)                       | real status bits (bit1, plus bit2 vsync)     | Task 5 |
+| COPS / VIA2 Port A (`$DD83`/`$DD87`=DDRA2/`$DD9F`=IORA2)   | **not reached before the stall** — no COPS handshake, DDRA2, or IORA2 access observed yet; Task 4's requirements must come from a post-Task-3 re-trace (once VIA2 is real and the ROM gets past `$FE08B0`) | **Task 4** |
+| `$F801` status register (`btst #1`)                       | real status bits (bit1 meaning undetermined — only bit2=vsync is documented, `hardware-notes §5`) | Task 5 |
 | `$E018/$E01A/$E01C/$E01E` video strobes                   | vsync/vertical-retrace strobe + interrupt semantics; `$E01C/$E01E` are newly observed | Task 5 |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |

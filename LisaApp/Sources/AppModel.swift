@@ -84,6 +84,19 @@ final class AppModel {
     /// vsync -- sized once the first frame's dimensions are known.
     private var pixelScratch: [UInt8] = []
 
+    /// Latest-frame coalescing slot for `wire(_:)`'s `onFrame` callback
+    /// (whole-branch-review Important finding: "unthrottled mode can flood
+    /// the main thread with CGImage rebuilds"). `nonisolated let`, not a
+    /// plain `@MainActor`-isolated stored property: `onFrame` fires ON THE
+    /// EMULATION THREAD (see `EmulationController`'s "Threading" doc
+    /// comment), so `wire(_:)`'s closure needs to touch this BEFORE hopping
+    /// to main -- `FrameCoalescer` is its own lock-protected, `@unchecked
+    /// Sendable` type specifically so that cross-thread touch is safe
+    /// without requiring the whole of `AppModel` to lose its `@MainActor`
+    /// isolation. See `FrameCoalescer`'s own doc comment for the
+    /// offer/take protocol.
+    private nonisolated let frameCoalescer = FrameCoalescer()
+
     init() {
         showActualSize = UserDefaults.standard.object(forKey: Self.showActualSizeDefaultsKey) as? Bool ?? false
         let romDirectory = AppModel.resolveROMDirectory()
@@ -116,9 +129,33 @@ final class AppModel {
     }
 
     private func wire(_ controller: EmulationController) {
+        // CODE-REVIEW FIX (whole-branch-review Important finding:
+        // "unthrottled mode can flood the main thread with CGImage
+        // rebuilds"): unthrottled mode runs continuous back-to-back vsync
+        // slices with no sleep between them (`EmulationController`'s
+        // "Pacing" doc comment), so `onFrame` can fire far faster than the
+        // main thread can drain `DispatchQueue.main.async` blocks -- the
+        // OLD code scheduled one such block, each doing a full 1bpp ->
+        // 8bpp `CGImage` rebuild (`apply(_:)`/`makeCGImage`), PER FRAME,
+        // unconditionally. Under sustained flooding that queue only grows,
+        // starving every other main-queue work item (menu actions, window
+        // events) behind an ever-lengthening backlog of stale-by-the-time-
+        // they-run image rebuilds. `frameCoalescer.offer(frame)` always
+        // records the LATEST frame but returns `true` (schedule a main-
+        // queue apply) only when none is already scheduled; the scheduled
+        // block itself calls `take()` to consume whatever the latest frame
+        // turned out to be BY THE TIME IT RUNS, dropping every
+        // intermediate one -- so there is at most one pending `apply` at
+        // any moment, no matter how fast frames arrive. Throttled mode
+        // publishes at a much lower, already-paced rate, so this never
+        // actually coalesces there in practice -- see `FrameCoalescer`'s
+        // doc comment for why the offer/take protocol is harmless (a no-op
+        // beyond one extra lock/unlock pair) when frames aren't flooding.
         controller.framePublisher.onFrame = { [weak self] frame in
-            DispatchQueue.main.async {
-                self?.apply(frame)
+            guard let self, self.frameCoalescer.offer(frame) else { return }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let frame = self.frameCoalescer.take() else { return }
+                self.apply(frame)
             }
         }
         controller.onStatus = { [weak self] status in
@@ -316,5 +353,60 @@ final class AppModel {
                 }
             }
         }
+    }
+}
+
+/// Lock-guarded latest-frame slot backing `AppModel.wire(_:)`'s coalescing
+/// fix (whole-branch-review Important finding: "unthrottled mode can flood
+/// the main thread with CGImage rebuilds"). Two operations, matching the
+/// producer (emulation thread, every vsync) / consumer (main queue, once
+/// per scheduled apply) split:
+///
+/// - `offer(_:)`: called by the PRODUCER. Always stores `frame` as the
+///   latest pending one (overwriting whatever was there -- a not-yet-
+///   applied older frame is by definition stale once a newer one exists).
+///   Returns `true` exactly when no apply is currently scheduled (i.e. the
+///   caller should schedule one); once `true` has been returned, every
+///   subsequent `offer` returns `false` until the next `take()`, so at
+///   most one scheduled apply is ever outstanding no matter how many
+///   frames arrive in between.
+/// - `take()`: called by the CONSUMER (the scheduled main-queue block).
+///   Returns whatever the latest offered frame was and clears the slot +
+///   the "scheduled" flag, re-arming `offer` to return `true` again for
+///   the next frame.
+///
+/// `final class ... @unchecked Sendable`: an `NSLock` guards every access
+/// to the two `var`s below, which is exactly the shape `@unchecked
+/// Sendable` exists for -- the compiler cannot verify a hand-rolled lock's
+/// correctness itself, but the invariant (never touch `pending`/
+/// `scheduled` without holding `lock`) is upheld by every method in this
+/// type, the only place either property is touched.
+final class FrameCoalescer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var pending: Frame?
+    private var scheduled = false
+
+    /// Records `frame` as the latest pending frame; returns whether the
+    /// caller should schedule a consuming apply (see this type's doc
+    /// comment for the full offer/take protocol).
+    func offer(_ frame: Frame) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        pending = frame
+        if scheduled { return false }
+        scheduled = true
+        return true
+    }
+
+    /// Consumes and returns the latest pending frame (`nil` if somehow
+    /// called with nothing pending), clearing both `pending` and
+    /// `scheduled` so the next `offer(_:)` call schedules again.
+    func take() -> Frame? {
+        lock.lock()
+        defer { lock.unlock() }
+        scheduled = false
+        let frame = pending
+        pending = nil
+        return frame
     }
 }

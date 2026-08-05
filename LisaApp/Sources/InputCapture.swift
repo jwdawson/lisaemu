@@ -99,6 +99,25 @@ final class InputCapture {
     private var resignKeyObserver: NSObjectProtocol?
     private var previousModifierFlags: NSEvent.ModifierFlags = []
 
+    /// Lisa keycaps `handleFlagsChanged` has forwarded a `.keyDown` for
+    /// without (yet) a balancing `.keyUp` -- drives the focus-loss resync,
+    /// below (whole-branch-review Important finding: "keyboard modifier
+    /// state never resynced on focus loss (stuck Command after
+    /// Command-Tab)"). See `ModifierKeycapTracker`'s doc comment for why
+    /// this is a separate pure type rather than an inline `Set`.
+    private var modifierKeycapTracker = ModifierKeycapTracker()
+
+    /// Lisa keycaps `handle(_:)`'s `.keyDown` case has forwarded without
+    /// (yet) a balancing `.keyUp` -- NON-modifier keys only (`handleFlags
+    /// Changed` has its own tracker, above; a physical key and a modifier
+    /// chord are independent axes and a key can legitimately be a
+    /// non-modifier while a modifier is also held). Read by the `.keyUp`
+    /// case to let down-tracking override reserved-shortcut suppression --
+    /// see `shouldForwardKeyUp(...)`'s doc comment (whole-branch-review
+    /// Important finding: "per-event shortcut suppression can leave a
+    /// keycap stuck down").
+    private var forwardedDownKeycaps: Set<UInt8> = []
+
     /// Pure pointer-capture/button state machine -- see `CaptureState`'s
     /// own doc comment (code-review fix, M1c Task 4 fix round: "capture
     /// release with the button held leaves the emulated button stuck
@@ -181,6 +200,7 @@ final class InputCapture {
             // that's already synchronously on main.
             MainActor.assumeIsolated {
                 self?.releaseCapture()
+                self?.resyncModifiers()
             }
         }
     }
@@ -232,17 +252,39 @@ final class InputCapture {
             } else if isReservedMenuShortcut(event) {
                 break // Let LisaEmuApp.swift's menu command handle it -- see "Keyboard precedence" above.
             } else if !event.isARepeat, let keycap = KeyMap.lisaKeycap(forMacKeyCode: event.keyCode) {
+                forwardedDownKeycaps.insert(keycap)
                 model?.post(.keyDown(keycap))
             }
         case .keyUp:
-            if !isReservedMenuShortcut(event), let keycap = KeyMap.lisaKeycap(forMacKeyCode: event.keyCode) {
-                model?.post(.keyUp(keycap))
+            // CODE-REVIEW FIX: down-tracking wins over per-event shortcut
+            // suppression -- see `shouldForwardKeyUp(...)`'s doc comment.
+            // Without this, releasing an ordinary key (e.g. P) while
+            // Command happens to also be held (pressed AFTER P went down)
+            // misclassified the UP event alone as "Command-P, a reserved
+            // shortcut" and swallowed it, even though the DOWN was
+            // forwarded and never suppressed -- leaving the Lisa believing
+            // that keycap was still held forever.
+            if let keycap = KeyMap.lisaKeycap(forMacKeyCode: event.keyCode) {
+                let wasForwardedDown = forwardedDownKeycaps.remove(keycap) != nil
+                if Self.shouldForwardKeyUp(wasForwardedDown: wasForwardedDown,
+                                           isReservedMenuShortcut: isReservedMenuShortcut(event)) {
+                    model?.post(.keyUp(keycap))
+                }
             }
         case .flagsChanged:
             handleFlagsChanged(event)
         default:
             break
         }
+    }
+
+    /// Pure decision for the `.keyUp` case, above -- extracted the same way
+    /// as `isReservedMenuShortcut`/`CaptureState` so it's directly testable
+    /// without a real `NSEvent`. `nonisolated`: a pure function of its
+    /// parameters, for the same reason `isReservedMenuShortcut` is (see
+    /// that function's doc comment).
+    nonisolated static func shouldForwardKeyUp(wasForwardedDown: Bool, isReservedMenuShortcut: Bool) -> Bool {
+        wasForwardedDown || !isReservedMenuShortcut
     }
 
     /// Diffs `event.modifierFlags` against the previous snapshot -- see
@@ -255,8 +297,32 @@ final class InputCapture {
             let was = previousModifierFlags.contains(bit)
             let now = current.contains(bit)
             guard was != now, let keycap = KeyMap.lisaKeycap(forMacKeyCode: event.keyCode) else { continue }
+            modifierKeycapTracker.setKeycap(keycap, down: now)
             model?.post(now ? .keyDown(keycap) : .keyUp(keycap))
         }
+    }
+
+    /// Focus-loss modifier resync (whole-branch-review Important finding:
+    /// "keyboard modifier state never resynced on focus loss (stuck
+    /// Command after Command-Tab)"). Called from `start()`'s resign-key
+    /// observer (the same one that already releases mouse capture on focus
+    /// loss, above): host focus changes (Command-Tab away, a system dialog
+    /// stealing focus, clicking another app) can swallow the matching
+    /// `flagsChanged` release -- macOS only delivers `flagsChanged` to the
+    /// key window, so releasing a modifier while this window ISN'T key
+    /// produces no event here at all, leaving `modifierKeycapTracker`
+    /// (and, via it, the Lisa) believing that modifier is still held even
+    /// after the physical key is long since up. Posts a balancing `.keyUp`
+    /// for every keycap the tracker believes is down, then clears both the
+    /// tracker and `previousModifierFlags` (so the next `flagsChanged`
+    /// after refocus starts from a clean "nothing held" baseline instead of
+    /// diffing against a stale snapshot that no longer matches reality).
+    /// Idempotent: a no-op (no posts) when nothing is tracked as down.
+    private func resyncModifiers() {
+        for keycap in modifierKeycapTracker.resync() {
+            model?.post(.keyUp(keycap))
+        }
+        previousModifierFlags = []
     }
 
     // MARK: - Mouse (called by `MouseCaptureView.swift`'s `NSView`)
@@ -426,5 +492,40 @@ struct CaptureState: Equatable {
         mouseCaptured = false
         effects.shouldRelease = true
         return effects
+    }
+}
+
+/// Pure down-tracking for `handleFlagsChanged`'s forwarded modifier
+/// keycaps, extracted out of `InputCapture` for the same reason as
+/// `CaptureState` above: unit-testable without a real `NSEvent`/`AppModel`
+/// (whole-branch-review Important finding: "keyboard modifier state never
+/// resynced on focus loss"). `InputCapture.handleFlagsChanged` calls
+/// `setKeycap(_:down:)` every time it forwards a modifier `.keyDown`/
+/// `.keyUp`; `InputCapture.resyncModifiers` calls `resync()` on focus loss
+/// to get back exactly the keycaps still owed a balancing `.keyUp`.
+struct ModifierKeycapTracker: Equatable {
+    private(set) var down: Set<UInt8> = []
+
+    /// See `CaptureState.init()`'s doc comment for why this explicit `init`
+    /// exists (the compiler-synthesized memberwise init would be `private`,
+    /// matching `private(set)`'s setter access).
+    init() {}
+
+    mutating func setKeycap(_ keycap: UInt8, down isDown: Bool) {
+        if isDown {
+            down.insert(keycap)
+        } else {
+            down.remove(keycap)
+        }
+    }
+
+    /// Returns every keycap currently tracked as down (sorted only for
+    /// deterministic test assertions -- the Lisa keyboard driver has no
+    /// notion of "order" between independent keyup events) and clears the
+    /// tracked set. Idempotent: calling this again immediately afterward
+    /// (nothing tracked as down) returns `[]` and is a no-op.
+    mutating func resync() -> [UInt8] {
+        defer { down.removeAll() }
+        return down.sorted()
     }
 }

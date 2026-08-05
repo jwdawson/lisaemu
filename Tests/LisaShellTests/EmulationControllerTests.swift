@@ -42,6 +42,61 @@ enum LisaShellMusashiSuites {}
     #expect(EmulationController.mouseButtonKeycap == 0x06)
 }
 
+// MARK: - haltedStatusPublish (Important finding: "HALTED status almost
+// never published"; no ROM/CPU/thread needed -- pure decision function)
+
+/// Driving a genuine double-fault halt THROUGH `EmulationController` was
+/// judged impractical for this regression: unlike `BusErrorTests`
+/// (`Tests/LisaCoreTests/BusErrorTests.swift`), which constructs a bare
+/// `Machine` directly and hand-loads a two-instruction double-fault program
+/// at a chosen PC/SSP, `EmulationController` only ever creates its
+/// `Machine` internally (`makeMachine`, private) and boots the REAL ROM
+/// from `romDirectory` -- there is no seam to inject a synthetic program
+/// before the ROM's own boot code starts running, and driving the real ROM
+/// all the way to a genuine CPU halt (as opposed to `BusErrorTests`'
+/// deliberately minimal repro) is not a documented/discovered path. Per
+/// the finding's own fallback guidance, the transition-publish DECISION is
+/// instead extracted into `EmulationController.haltedStatusPublish(
+/// machineHalted:alreadyPublished:)`, a pure function taking no `Machine`
+/// at all, and tested directly here -- this pins the exact logic bug (the
+/// old code's publish was reachable only from the `running` branch, so
+/// once `guard running, !machine.halted` started failing every iteration,
+/// the transition published only if it happened to also cross the
+/// independent 0.25s gate in the one iteration where the halt was
+/// discovered -- empirically ~7% of transitions) without needing a live
+/// halt to reproduce it.
+@Suite
+struct HaltedStatusPublishTests {
+    @Test func firstIterationAfterHaltAlwaysForcesAPublish() {
+        #expect(EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: false))
+    }
+
+    @Test func subsequentIterationsWhileStillHaltedDoNotRepublish() {
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: true))
+    }
+
+    @Test func neverForcesAPublishWhileNotHalted() {
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: false))
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: true))
+    }
+
+    /// The old bug's exact shape, pinned as a regression: a decision made
+    /// EVERY iteration while halted (as the guard-continue branch now is)
+    /// must publish EXACTLY ONCE across a run of iterations, not once per
+    /// iteration and not zero times.
+    @Test func publishesExactlyOnceAcrossManyIterationsOfTheSameHalt() {
+        var alreadyPublished = false
+        var publishCount = 0
+        for _ in 0..<1_000 {
+            if EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: alreadyPublished) {
+                publishCount += 1
+                alreadyPublished = true
+            }
+        }
+        #expect(publishCount == 1)
+    }
+}
+
 private let romDir = ProcessInfo.processInfo.environment["LISAEMU_ROM_DIR"]
 
 extension LisaShellMusashiSuites {

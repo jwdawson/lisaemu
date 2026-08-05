@@ -314,6 +314,12 @@ public final class EmulationController {
         // never replays a stale wall-clock anchor from before a pause.
         var throttleAnchor: TimeInterval?
         var lastStatusPublish = ProcessInfo.processInfo.systemUptime
+        // Whether a HALTED status has already been force-published for the
+        // CURRENT halt (see `haltedStatusPublish(...)`, below, and this
+        // function's "guard running, !machine.halted" branch) -- reset
+        // whenever the machine is not halted (including a fresh `.reset`)
+        // so the next halt gets its own forced publish.
+        var haltedPublished = false
 
         while true {
             for command in shared.mailbox.drain() {
@@ -327,6 +333,7 @@ public final class EmulationController {
                     machine = makeMachine(romBytes: romBytes, shared: shared)
                     running = false
                     throttleAnchor = nil
+                    haltedPublished = false
                 case .setThrottled:
                     throttleAnchor = nil
                 case .input(let event):
@@ -347,6 +354,36 @@ public final class EmulationController {
             guard running, !machine.halted else {
                 // Avoid a hot spin while paused/halted; mailbox is still
                 // drained every iteration so commands stay responsive.
+                //
+                // HALTED force-publish (whole-branch-review Important
+                // finding: "HALTED status almost never published"): without
+                // this, the ~4Hz publish below only ever runs from the
+                // `running`/still-executing branch. The instant
+                // `machine.halted` flips true (discovered by `Machine.run
+                // (until:)` INSIDE the slice below, on some earlier
+                // iteration), THIS branch is taken on every subsequent
+                // iteration instead, and the publish below is unreachable
+                // forever after -- so the one iteration where `run(until:)`
+                // just discovered the halt was the ONLY chance to publish
+                // it, and that iteration only actually published if it also
+                // happened to cross the independent 0.25s `lastStatusPublish`
+                // gate (empirically ~7% of transitions, per the review). Use
+                // `haltedStatusPublish` (pure decision function, see below)
+                // to force exactly one publish per halt, regardless of the
+                // 0.25s gate, from right here -- both immediately after the
+                // transition (next loop iteration after `run(until:)`
+                // discovers it) and, defensively, from this branch on any
+                // subsequent iteration if that first attempt were ever
+                // somehow missed.
+                if EmulationController.haltedStatusPublish(machineHalted: machine.halted,
+                                                             alreadyPublished: haltedPublished) {
+                    haltedPublished = true
+                    lastStatusPublish = ProcessInfo.processInfo.systemUptime
+                    shared.onStatus?(EmuStatus(cycles: machine.cycles,
+                                                halted: true,
+                                                throttled: shared.mailbox.throttledSnapshot,
+                                                emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond))
+                }
                 Thread.sleep(forTimeInterval: 0.005)
                 continue
             }
@@ -358,7 +395,9 @@ public final class EmulationController {
                     throttleAnchor = a
                     return a
                 }()
-                let target = Governor.targetCycles(anchor: anchor, now: now)
+                let (target, newAnchor) = Governor.clampedTargetCycles(anchor: anchor, now: now,
+                                                                        cyclesDone: machine.cycles)
+                throttleAnchor = newAnchor
                 let sliceStart = now
                 machine.run(until: target)
                 let sliceDuration = ProcessInfo.processInfo.systemUptime - sliceStart
@@ -378,6 +417,17 @@ public final class EmulationController {
                                             emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond))
             }
         }
+    }
+
+    /// Pure decision function for the HALTED force-publish, above --
+    /// extracted so the transition logic is unit-testable without a real
+    /// `Machine`/ROM/thread (see `EmulationControllerHaltedPublishTests`).
+    /// Answers "should THIS iteration force-publish a HALTED status": true
+    /// exactly once per halt (`machineHalted && !alreadyPublished`), never
+    /// while not halted, and never a second time for the same halt once
+    /// `alreadyPublished` is true.
+    static func haltedStatusPublish(machineHalted: Bool, alreadyPublished: Bool) -> Bool {
+        machineHalted && !alreadyPublished
     }
 }
 

@@ -79,4 +79,67 @@ struct GovernorTests {
         #expect(Double(cyclesDone) >= idealFinal - 1)
         #expect(Double(cyclesDone) <= idealFinal + 1)
     }
+
+    // MARK: - clampedTargetCycles (Important finding: "unbounded catch-up
+    // slice after host suspend can hang quit")
+
+    /// Small, in-budget gaps behave exactly like plain `targetCycles`
+    /// (unclamped) -- the clamp must never interfere with ordinary
+    /// frame-to-frame pacing, only genuine marathon catch-ups.
+    @Test
+    func clampedTargetCyclesPassesThroughWhenWithinBudget() {
+        let anchor: TimeInterval = 100
+        let now = anchor + Governor.nominalSlice // one nominal ~16.7ms slice's worth
+        let cyclesDone: UInt64 = 0
+        let (target, newAnchor) = Governor.clampedTargetCycles(anchor: anchor, now: now, cyclesDone: cyclesDone,
+                                                                 maxCatchUpCycles: Governor.defaultMaxCatchUpCycles)
+        #expect(target == Governor.targetCycles(anchor: anchor, now: now))
+        #expect(newAnchor == anchor, "anchor must be untouched when no clamp is needed")
+    }
+
+    /// The core regression: a multi-hour gap (host suspended, e.g. system
+    /// sleep) must NOT hand `machine.run(until:)` an hours-long target --
+    /// it must re-anchor to `now` (relative to `cyclesDone` already run)
+    /// instead, so the slice that actually executes stays bounded.
+    @Test
+    func clampedTargetCyclesReanchorsInsteadOfMarathonCatchUp() {
+        let anchor: TimeInterval = 1_000
+        let cyclesDone: UInt64 = 42
+        let now = anchor + 3 * 3_600 // 3 hours later -- e.g. the host slept
+        let maxCatchUp: UInt64 = Governor.defaultMaxCatchUpCycles
+
+        let naive = Governor.targetCycles(anchor: anchor, now: now)
+        #expect(naive - cyclesDone > maxCatchUp, "sanity: the naive target really would demand a marathon slice")
+
+        let (target, newAnchor) = Governor.clampedTargetCycles(anchor: anchor, now: now, cyclesDone: cyclesDone,
+                                                                 maxCatchUpCycles: maxCatchUp)
+        #expect(target == cyclesDone, "clamped target must ask for zero NEW cycles this slice, not the marathon")
+        #expect(target < naive, "must be far below the unclamped marathon target")
+
+        // The re-anchored value must make the VERY NEXT call resume
+        // tracking real elapsed time from `cyclesDone` forward, with no
+        // discontinuity -- i.e. targetCycles(newAnchor, now) == cyclesDone.
+        #expect(Governor.targetCycles(anchor: newAnchor, now: now) == cyclesDone)
+
+        // And pacing from here on tracks real time normally again (no
+        // permanent drift/lag introduced by the clamp).
+        let later = now + 1.0 // one second further
+        let nextTarget = Governor.targetCycles(anchor: newAnchor, now: later)
+        #expect(nextTarget == cyclesDone + UInt64(Governor.cyclesPerSecond))
+    }
+
+    /// A gap exactly AT the ceiling must not clamp (only gaps that exceed
+    /// it) -- a boundary check on the `>` in `clampedTargetCycles`.
+    @Test
+    func clampedTargetCyclesDoesNotClampExactlyAtTheCeiling() {
+        let anchor: TimeInterval = 0
+        let maxCatchUp: UInt64 = 1_000
+        let cyclesDone: UInt64 = 0
+        // Choose `now` so the naive target is exactly `cyclesDone + maxCatchUp`.
+        let now = Double(maxCatchUp) / Governor.cyclesPerSecond
+        let (target, newAnchor) = Governor.clampedTargetCycles(anchor: anchor, now: now, cyclesDone: cyclesDone,
+                                                                 maxCatchUpCycles: maxCatchUp)
+        #expect(target == Governor.targetCycles(anchor: anchor, now: now))
+        #expect(newAnchor == anchor)
+    }
 }

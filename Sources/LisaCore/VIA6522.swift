@@ -80,6 +80,21 @@ public final class VIA6522 {
     public var portAInput: () -> UInt8 = { 0xFF }
     public var portBInput: () -> UInt8 = { 0xFF }
 
+    /// Fired after a REAL (non-peek) access -- read or write -- to ORA
+    /// (register index 1 or 15), with the register index actually used and
+    /// the value read/written. Lets an external device on Port A (Task 4's
+    /// COPS is the first: VIA2 Port A is the COPS data bus,
+    /// docs/hardware-notes.md §4) observe port A transactions without this
+    /// generic VIA core needing to know anything about what's wired to it --
+    /// mirrors `portAInput`'s read-side hook but for the access-completion
+    /// side, and doubles as the real-hardware CA1-auto-clear distinction
+    /// this core does not otherwise model (see the type doc comment "we do
+    /// not model CA1/CA2"): index 1 is the handshake register, index 15 is
+    /// explicitly "no handshake" -- callers that care about that distinction
+    /// (e.g. COPS clearing its input-ready interrupt only on a genuine
+    /// handshake read) can branch on `registerIndex`. Never fired for peeks.
+    public var onPortAAccess: ((_ registerIndex: Int, _ value: UInt8, _ isWrite: Bool) -> Void)?
+
     // MARK: - Register storage
 
     private var orb: UInt8 = 0
@@ -137,6 +152,10 @@ public final class VIA6522 {
             let value = UInt8(truncatingIfNeeded: t2Counter)
             ifr &= ~Self.t2FlagBit
             return value
+        case 1, 15:
+            let value = peek(index)
+            onPortAAccess?(index, value, false)
+            return value
         default:
             return peek(index)
         }
@@ -172,7 +191,7 @@ public final class VIA6522 {
     public func write(_ index: Int, _ value: UInt8) {
         switch index {
         case 0: orb = value
-        case 1: ora = value
+        case 1: ora = value; onPortAAccess?(1, value, true)
         case 2: ddrb = value
         case 3: ddra = value
         case 4: t1LatchLow = value
@@ -200,9 +219,29 @@ public final class VIA6522 {
             } else {
                 ier &= ~(value & 0x7F)
             }
-        case 15: ora = value
+        case 15: ora = value; onPortAAccess?(15, value, true)
         default: break
         }
+    }
+
+    /// Sets an interrupt flag bit from OUTSIDE this register file -- for a
+    /// handshake line this generic core does not model itself (CA1/CA2;
+    /// see the type doc comment). Mirrors the internal `ifr |= flagBit`
+    /// timer-underflow path. Task 4's COPS is the intended first caller:
+    /// VIA2 IFR2 bit 1 is "COPS interrupt pending" (docs/hardware-notes.md
+    /// §3), raised the instant COPS has a new input byte ready on Port A.
+    public func setInterruptFlag(_ bit: UInt8) {
+        ifr |= (bit & 0x7F)
+    }
+
+    /// Clears an interrupt flag bit from outside this register file -- the
+    /// counterpart to `setInterruptFlag`, for a device that auto-acks its
+    /// own flag on some condition real hardware ties to CA1 (e.g. COPS
+    /// clearing IFR2 bit 1 the instant its input byte is consumed via a
+    /// genuine handshake read -- see `onPortAAccess`'s doc comment on the
+    /// register-1-vs-15 distinction).
+    public func clearInterruptFlag(_ bit: UInt8) {
+        ifr &= ~(bit & 0x7F)
     }
 
     // MARK: - Timer advance

@@ -80,6 +80,48 @@ extension MusashiSuites {
             #expect(m.cpu[.d2] == 1, "one-shot T1 must not refire after acknowledge")
         }
 
+        /// The counterpart to `viaTimerInterruptRunsLevel1AutovectorHandler`
+        /// that actually exercises the path the real ROM boot uses: driven
+        /// purely through `run(until:)`, never `step()`. This is the one
+        /// that proves `Machine.irqPollQuantum`'s interplay of
+        /// event-stop/quantum-stop/target-stop with
+        /// `tickVIAsAndUpdateIRQ` actually delivers an interrupt asserted
+        /// mid-run, rather than losing it: `m68ki_check_interrupts()` runs
+        /// exactly once, at the very top of each `m68k_execute` call (see
+        /// `M68K.setIRQ`'s doc comment) -- an UNBOUNDED `run(until:)` burst
+        /// spanning the whole target would call `m68k_execute` exactly
+        /// once, check interrupts before VIA1 has even been programmed,
+        /// then run every instruction (including the underflow and the
+        /// eventual `tickVIAsAndUpdateIRQ` call, which only happens AFTER
+        /// that single `cpu.run` returns) without ever re-checking -- D2
+        /// would stay 0 forever. The quantum forces multiple
+        /// `m68k_execute` calls, so the interrupt set by one burst's
+        /// trailing `tickVIAsAndUpdateIRQ` is recognized at the very start
+        /// of the next.
+        @Test
+        func viaTimerInterruptViaRunUntilIsRecognizedWithinAQuantum() {
+            let m = Machine(ramSize: 0x10000)
+            loadProgram(m)
+
+            #expect(m.cpu[.d2] == 0)
+
+            // One quantum (Machine.irqPollQuantum = 1024 cycles) is enough
+            // for the ~5 setup instructions plus T1's 6-cycle period to
+            // fire -- but per the doc comment above, that first burst
+            // cannot itself recognize the interrupt; it only becomes
+            // pending for the SECOND burst. 8000 cycles is comfortably
+            // more than two quanta, so this run(until:) call spans several
+            // bursts and must land on D2 == 1 well before it returns.
+            m.run(until: 8000)
+
+            #expect(m.cpu[.d2] == 1, "level-1 autovector handler should have run via run(until:) alone")
+            #expect(m.halted == false)
+
+            // One-shot T1 must not refire on further running either.
+            m.run(until: 16000)
+            #expect(m.cpu[.d2] == 1, "one-shot T1 must not refire after acknowledge")
+        }
+
         @Test
         func viaTimerInterruptIsBlockedWhileSRMaskIsHigh() {
             // Sanity check on the other side of the mask: if the program

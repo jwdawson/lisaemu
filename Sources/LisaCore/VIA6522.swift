@@ -48,8 +48,14 @@
 /// delivery would require scheduling a `Machine` event for every timer
 /// reload, which the ROM's current requirements (a register read/write
 /// presence test, and -- for `InterruptTests` -- a coarse "did the handler
-/// run" check) do not need. `Machine.run(until:)` bounds each CPU burst to
-/// a small quantum specifically so this per-slice tick still delivers
+/// run" check) do not need. (A related, narrower known discrepancy: real
+/// 6522 silicon takes an extra half-to-one clock to reload T1 from the
+/// latches after a free-run underflow -- one more cycle before the next
+/// countdown truly starts -- whereas `advance` below reloads and resumes
+/// counting on the very same cycle, a uniform N+1 with no extra
+/// reload-settling cycle; this is folded into the same "not cycle-exact"
+/// tradeoff, not modeled separately.) `Machine.run(until:)` bounds each CPU
+/// burst to a small quantum specifically so this per-slice tick still delivers
 /// interrupts with bounded (not exact) latency -- see that file's doc
 /// comment. If a later task's ROM timing loop turns out to need exact
 /// underflow-cycle delivery, this is the seam to refine (schedule a

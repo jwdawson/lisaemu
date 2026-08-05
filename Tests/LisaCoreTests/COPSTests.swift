@@ -230,6 +230,32 @@ private func makeCOPS(clockBytes: @escaping () -> [UInt8] = { COPS.defaultHostCl
     #expect(cops.portAInput() == 0x41, "bit7 clear = key up")
 }
 
+/// Regression pin for hardware-notes.md §8 "Mouse": "Button: keycap `$06`
+/// in the KEYBOARD stream (down = `$86`, up = `$06`) -- NOT part of the
+/// delta packet." M1c Task 4's `LisaShell.EmulationController` briefly
+/// posted Task 1's placeholder keycap (`$7F`, Command/Apple) instead --
+/// caught by a ROM-gated integration test
+/// (`EmulationControllerTests.mouseAndClickDriveTheRealBootMenu`) but not
+/// by anything in the default (no-`LISAEMU_ROM_DIR`) `swift test` path.
+/// This pins the correct byte-level COPS behavior for `$06` directly, no
+/// ROM/CPU required, so a future regression on the constant is caught by
+/// every `swift test` run, not only the ROM-gated one.
+@Test func mouseButtonKeycapProducesTheDocumentedCOPSBytes() {
+    let (cops, scheduler, _) = makeCOPS()
+    cops.reset()
+    drainPowerOnStream(cops, scheduler)
+
+    cops.postKey(code: 0x06, down: true)
+    cops.postKey(code: 0x06, down: false)
+
+    scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+    #expect(cops.portAInput() == 0x86, "mouse-button down = $86 (bit 7 set | $06)")
+    cops.handlePortAAccess(index: 1, value: 0, isWrite: false)
+
+    scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+    #expect(cops.portAInput() == 0x06, "mouse-button up = $06 (bit 7 clear)")
+}
+
 @Test func postMouseEnqueuesAThreeBytePacket() {
     let (cops, scheduler, _) = makeCOPS()
     cops.reset()

@@ -67,14 +67,43 @@ targets:
         LSApplicationCategoryType: public.app-category.developer-tools
         NSHighResolutionCapable: true
 
+  # Unit tests for InputCapture's pure logic (CaptureState, isReservedMenu
+  # Shortcut) -- code-review fix round, M1c Task 4: these two bugs
+  # (Caps Lock defeating menu-shortcut recognition, capture-release leaving
+  # the emulated mouse button stuck down) were found by hand-review, not by
+  # a test, precisely because there was no automated coverage of
+  # InputCapture's logic before this. Hosted by LisaApp (TEST_HOST/
+  # BUNDLE_LOADER) -- the standard Xcode pattern for `@testable import`-ing
+  # an application target's internal symbols, which a plain unhosted bundle
+  # can't link against (app targets don't export a symbol table the way
+  # frameworks do).
+  LisaAppTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - path: Tests/LisaAppTests
+    dependencies:
+      - target: LisaApp
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/LisaApp.app/Contents/MacOS/LisaApp"
+        BUNDLE_LOADER: "$(TEST_HOST)"
+
 schemes:
   LisaApp:
     build:
       targets:
         LisaApp: all
+        LisaAppTests: [test]
     run:
       config: Debug
     test:
       config: Debug
+      targets:
+        - LisaAppTests
     archive:
       config: Release

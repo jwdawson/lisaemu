@@ -82,20 +82,31 @@ import Observation
 ///
 /// See `MouseCaptureView.swift` for the `NSView`/`NSTrackingArea` side
 /// (view-scoped hit-testing, so this class never does manual window-space
-/// coordinate math) and `handleMouseMoved`/`captureMouse`/`releaseCapture`
+/// coordinate math) and `handleMouseMoved`/`applyCapture`/`releaseCapture`
 /// below for delta scaling, fractional-remainder accumulation, and the
 /// capture/escape-hatch mechanics.
 @MainActor
 @Observable
 final class InputCapture {
     /// Drives `ScreenView`'s "click to capture / Command-Escape to
-    /// release" status-bar hint.
-    private(set) var mouseCaptured = false
+    /// release" status-bar hint. Forwards through `captureState` (below)
+    /// rather than being its own stored `Bool` -- see that property's doc
+    /// comment.
+    var mouseCaptured: Bool { captureState.mouseCaptured }
 
     private weak var model: AppModel?
     private var keyMonitor: Any?
     private var resignKeyObserver: NSObjectProtocol?
     private var previousModifierFlags: NSEvent.ModifierFlags = []
+
+    /// Pure pointer-capture/button state machine -- see `CaptureState`'s
+    /// own doc comment (code-review fix, M1c Task 4 fix round: "capture
+    /// release with the button held leaves the emulated button stuck
+    /// down"). `private(set)`, not `private`: `mouseCaptured` below reads
+    /// through it, and `@Observable` needs the read to go through an
+    /// actual stored-property access for `ScreenView`'s status-bar hint to
+    /// update reactively.
+    private(set) var captureState = CaptureState()
 
     /// Fractional leftover from the last `handleMouseMoved` scaling pass,
     /// per axis -- see that method's doc comment for why this exists (slow
@@ -112,7 +123,14 @@ final class InputCapture {
     /// no shared source of truth to derive this from (SwiftUI's
     /// `.keyboardShortcut` isn't introspectable from outside the view
     /// builder that declared it).
-    private static let reservedMenuShortcutKeyCodes: Set<UInt16> = [0x23, 0x0F, 0x11] // P, R, T
+    /// `nonisolated`: read by the `nonisolated static func
+    /// isReservedMenuShortcut`, below -- a `Set<UInt16>` constant is
+    /// trivially `Sendable`/safe to read from any isolation domain, but
+    /// static stored properties of a `@MainActor` type default to
+    /// `@MainActor` isolation regardless (only certain "simple literal"
+    /// types get an automatic exemption; a collection literal doesn't), so
+    /// this needs the explicit annotation.
+    private nonisolated static let reservedMenuShortcutKeyCodes: Set<UInt16> = [0x23, 0x0F, 0x11] // P, R, T
 
     /// `kVK_Escape` -- not in `KeyMap` (the Lisa keyboard predates
     /// Escape), used here only to recognize Command-Escape, the pointer
@@ -147,7 +165,23 @@ final class InputCapture {
         resignKeyObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.didResignKeyNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            self?.releaseCapture()
+            // CODE-REVIEW FIX: `queue: .main` guarantees this closure runs
+            // synchronously on the main thread/main actor's executor, but
+            // `NotificationCenter`'s closure parameter type isn't (can't
+            // be -- it's a non-isolated, non-`@Sendable`-by-contract
+            // framework signature) statically known to the compiler as
+            // `@MainActor`-isolated, so calling the `@MainActor`-isolated
+            // `releaseCapture()` here without asserting isolation was a
+            // real (reproduced) build warning: "call to main actor-isolated
+            // instance method 'releaseCapture()' in a synchronous
+            // nonisolated context." `MainActor.assumeIsolated` asserts (and
+            // dynamically checks in debug builds) exactly the guarantee
+            // `queue: .main` already provides, rather than adding a
+            // pointless extra `DispatchQueue.main.async` hop for something
+            // that's already synchronously on main.
+            MainActor.assumeIsolated {
+                self?.releaseCapture()
+            }
         }
     }
 
@@ -161,9 +195,33 @@ final class InputCapture {
 
     // MARK: - Keyboard
 
+    /// Pure predicate, extracted out of `NSEvent` (which unit tests can't
+    /// cheaply synthesize) so it's directly testable -- see
+    /// `LisaAppTests/InputCaptureLogicTests.swift`.
+    ///
+    /// CODE-REVIEW FIX: the original version compared
+    /// `modifierFlags.intersection(.deviceIndependentFlagsMask) ==
+    /// .command` exactly. With Caps Lock physically engaged, `modifierFlags`
+    /// also carries `.capsLock`, so `mods` became `[.command, .capsLock] !=
+    /// .command` -- the reserved-shortcut check silently failed, and
+    /// Command-P/R/T would ALSO forward to the Lisa while the menu action
+    /// still fired (AppKit's own key-equivalent matching ignores Caps Lock
+    /// for letter shortcuts, so the menu was never the thing that broke).
+    /// `.capsLock` is subtracted before the comparison so its state is
+    /// irrelevant to shortcut recognition, matching AppKit's own behavior.
+    /// `nonisolated`: a pure function of its parameters (no access to any
+    /// `InputCapture` instance/actor-isolated state) -- without this,
+    /// static members of a `@MainActor`-isolated type inherit that
+    /// isolation by default, which would force test callers (running in a
+    /// plain nonisolated/background test executor) to `await` a call that
+    /// touches no actor-isolated state at all.
+    nonisolated static func isReservedMenuShortcut(modifierFlags: NSEvent.ModifierFlags, keyCode: UInt16) -> Bool {
+        let mods = modifierFlags.intersection(.deviceIndependentFlagsMask).subtracting(.capsLock)
+        return mods == .command && reservedMenuShortcutKeyCodes.contains(keyCode)
+    }
+
     private func isReservedMenuShortcut(_ event: NSEvent) -> Bool {
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        return mods == .command && Self.reservedMenuShortcutKeyCodes.contains(event.keyCode)
+        Self.isReservedMenuShortcut(modifierFlags: event.modifierFlags, keyCode: event.keyCode)
     }
 
     private func handle(_ event: NSEvent) {
@@ -210,14 +268,19 @@ final class InputCapture {
     /// concerned too, matching how the Lisa's relative-only mouse protocol
     /// (hardware-notes.md §8 "Mouse": delta packets, no absolute position)
     /// has no notion of "where the host cursor is" to get out of sync with.
+    /// All actual state transitions (what counts as "captured," whether a
+    /// compensating up is owed later) live in `captureState`, below --
+    /// this method only translates its reported `Effects` into real
+    /// side effects (AppKit calls, posting to the Lisa).
     func handleMouseDown() {
-        if !mouseCaptured { captureMouse() }
-        model?.post(.mouseButton(down: true))
+        let effects = captureState.mouseDown()
+        if effects.shouldCapture { applyCapture() }
+        if effects.postButtonDown { model?.post(.mouseButton(down: true)) }
     }
 
     func handleMouseUp() {
-        guard mouseCaptured else { return }
-        model?.post(.mouseButton(down: false))
+        let effects = captureState.mouseUp()
+        if effects.postButtonUp { model?.post(.mouseButton(down: false)) }
     }
 
     /// `viewSize` is the tracking `NSView`'s own `bounds.size` at the
@@ -267,22 +330,95 @@ final class InputCapture {
 
     // MARK: - Capture / release
 
-    private func captureMouse() {
-        guard !mouseCaptured else { return }
-        mouseCaptured = true
+    private func applyCapture() {
         NSCursor.hide()
         CGAssociateMouseAndMouseCursorPosition(0) // de-associate: raw deltas keep flowing past screen edges while hidden
     }
 
     /// Called by: Command-Escape (`handle(_:)`), window resign-key
     /// (`start()`'s observer), and `stop()`. Idempotent -- safe to call
-    /// when not currently captured.
+    /// when not currently captured (`captureState.release()` is a no-op
+    /// then).
+    ///
+    /// CODE-REVIEW FIX: previously this only flipped `mouseCaptured` and
+    /// undid the cursor hide/associate -- with no compensating mouse-button
+    /// event. If the user pressed the physical button, then released
+    /// capture WHILE STILL HOLDING IT (Command-Escape or a window
+    /// resign-key mid-drag both reach here without an intervening
+    /// `handleMouseUp()`), the Lisa would be stuck believing its mouse
+    /// button was held down forever -- the next `handleMouseUp()` after a
+    /// fresh capture would see `captureState.mouseCaptured == true` again
+    /// but never balance the phantom down. `captureState.release()` now
+    /// reports a compensating `postButtonUp` itself whenever a button was
+    /// left down, applied here BEFORE the cursor is restored.
     func releaseCapture() {
-        guard mouseCaptured else { return }
-        mouseCaptured = false
+        let effects = captureState.release()
+        if effects.postButtonUp { model?.post(.mouseButton(down: false)) }
+        guard effects.shouldRelease else { return }
         pendingDX = 0
         pendingDY = 0
         CGAssociateMouseAndMouseCursorPosition(1)
         NSCursor.unhide()
+    }
+}
+
+/// Pure pointer-capture/button state machine, extracted out of
+/// `InputCapture` for unit testing without needing real `NSCursor`/
+/// `CGAssociateMouseAndMouseCursorPosition`/`AppModel` side effects
+/// (code-review fix, M1c Task 4 fix round: "capture release with the
+/// button held leaves the emulated button stuck down" -- see
+/// `LisaAppTests/InputCaptureLogicTests.swift`). Every mutating method
+/// reports the concrete side effects its caller should perform; this type
+/// performs none of them itself, which is exactly what makes it testable
+/// with plain `#expect` assertions on its return value.
+struct CaptureState: Equatable {
+    private(set) var mouseCaptured = false
+    private(set) var buttonDown = false
+
+    /// Explicit, so callers (including tests) get a plain, internally
+    /// accessible `CaptureState()` -- without this, the compiler-synthesized
+    /// memberwise init would be `private` (matching the `private(set)`
+    /// properties' setter access), making `CaptureState()` uncallable from
+    /// outside this file, including `@testable import`.
+    init() {}
+
+    struct Effects: Equatable {
+        var shouldCapture = false
+        var postButtonDown = false
+        var postButtonUp = false
+        var shouldRelease = false
+    }
+
+    mutating func mouseDown() -> Effects {
+        var effects = Effects()
+        if !mouseCaptured {
+            mouseCaptured = true
+            effects.shouldCapture = true
+        }
+        buttonDown = true
+        effects.postButtonDown = true
+        return effects
+    }
+
+    mutating func mouseUp() -> Effects {
+        guard mouseCaptured else { return Effects() }
+        buttonDown = false
+        return Effects(postButtonUp: true)
+    }
+
+    /// If the button is still down when capture is released (see
+    /// `InputCapture.releaseCapture`'s doc comment for the exact scenario
+    /// this guards against), reports a COMPENSATING button-up FIRST so the
+    /// emulated Lisa button is never left stuck down.
+    mutating func release() -> Effects {
+        guard mouseCaptured else { return Effects() }
+        var effects = Effects()
+        if buttonDown {
+            effects.postButtonUp = true
+            buttonDown = false
+        }
+        mouseCaptured = false
+        effects.shouldRelease = true
+        return effects
     }
 }

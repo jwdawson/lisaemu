@@ -26,6 +26,22 @@ import LisaCore
 @Suite(.serialized)
 enum LisaShellMusashiSuites {}
 
+// MARK: - Mouse-button keycap constant (no ROM/CPU needed -- runs in every
+// `swift test`, ROM-gated or not; see `COPSTests
+// .mouseButtonKeycapProducesTheDocumentedCOPSBytes` for the byte-level
+// version of the same regression pin, one layer down)
+
+/// Cheap constant regression pin, mirroring the reasoning in
+/// `COPSTests.mouseButtonKeycapProducesTheDocumentedCOPSBytes`: this
+/// constant briefly regressed to Task 1's placeholder (`$7F`) during M1c
+/// Task 4 and was only caught by a ROM-gated integration test. Doesn't
+/// need `makeController()`/a ROM/a `Machine` at all -- just asserts the
+/// constant `EmulationController.apply(_:to:)` posts for `.mouseButton`
+/// matches hardware-notes.md §8's researched value.
+@Test func mouseButtonKeycapConstantMatchesHardwareNotesSection8() {
+    #expect(EmulationController.mouseButtonKeycap == 0x06)
+}
+
 private let romDir = ProcessInfo.processInfo.environment["LISAEMU_ROM_DIR"]
 
 extension LisaShellMusashiSuites {

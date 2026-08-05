@@ -6,7 +6,7 @@
 
 **Architecture:** A new `LisaShell` library target (Foundation-only, fully testable) hosts `EmulationController`: a dedicated emulation thread that owns the `Machine` (satisfying the Musashi single-thread discipline — the M68K owner assertion enforces it for free), a command mailbox in, and vsync-cadence framebuffer snapshots + status out. `LisaApp` (SwiftUI executable target) stays thin: a framebuffer view (vImage 1-bit expansion → CGImage, aspect-corrected), menus, and NSEvent capture translated through a `KeyMap` (Lisa keycap table mined from the OS source) into `COPS.postKey`/`postMouse`. LisaCore is untouched except where seams already exist.
 
-**Tech Stack:** SwiftUI + AppKit event monitors (LisaApp only), Accelerate/vImage + CoreGraphics for the blit (LisaApp only), Foundation-only LisaShell. LisaCore stays framework-free.
+**Tech Stack:** SwiftUI + AppKit event monitors (LisaApp only), Accelerate/vImage + CoreGraphics for the blit (LisaApp only), Foundation-only LisaShell. LisaCore stays framework-free. **LisaApp is a real Xcode app project** (user decision): generated headlessly via XcodeGen 2.46 (installed at /opt/homebrew/bin/xcodegen) from a committed `project.yml`, depending on the repo's SPM package for LisaShell/LisaCore; built/verified via `xcodebuild`; developed/run in Xcode 27.
 
 ## Global Constraints
 
@@ -17,7 +17,8 @@
 - CPU-driving tests under MusashiSuites; Swift warning-free; existing suites stay green; SwiftUI target must not break `swift test` (test target does not import LisaApp).
 - Pacing: throttled mode targets real time (5,000,000 cycles/sec) with a drift-corrected governor (anchor to nominal time, not accumulated sleeps — the M1b vsync-drift lesson, cited); unthrottled runs flat out. Frame publication on the VideoTiming vsync cadence in both modes.
 - Lisa pixel aspect: 720×364 displayed on a ~3:2 CRT area — vertical stretch ≈1.48. Default view applies aspect correction; a View menu toggle offers 1:1. (Exact factor documented in the view code; cosmetic, not hardware-modeled.)
-- One process at a time for tests; the app itself is run manually at checkpoints (`swift run LisaApp`).
+- Xcode project convention: `LisaApp/project.yml` is the source of truth (committed); the generated `LisaApp/LisaApp.xcodeproj` is GITIGNORED and regenerated via `xcodegen generate --spec LisaApp/project.yml`; headless verification via `xcodebuild -project LisaApp/LisaApp.xcodeproj -scheme LisaApp build`. App is NOT sandboxed (dev tool reading ~/Development/LisaROMs directly; App Store is a non-goal — documented in project.yml comments). macOS deployment target 14.0 matching the package.
+- One process at a time for tests; the app itself is run manually at checkpoints (build with xcodebuild, then `open` the built .app, or run from Xcode).
 
 ---
 
@@ -53,18 +54,20 @@
 
 ---
 
-### Task 3: LisaApp — window, framebuffer view, menus
+### Task 3: LisaApp — Xcode project, window, framebuffer view, menus
 
 **Files:**
-- Create: `Sources/LisaApp/LisaApp.swift` (App/Scene), `Sources/LisaApp/ScreenView.swift` (blit view), `Sources/LisaApp/AppModel.swift` (@Observable glue: controller lifecycle, frame → CGImage on main thread)
-- Modify: `Package.swift` (executable target `LisaApp` depending on LisaShell; LisaCore stays UI-free — enforce by grep in the task)
+- Create: `LisaApp/project.yml` (XcodeGen spec: app target "LisaApp", platform macOS 14.0, sources LisaApp/Sources, local package dependency on the repo root package for LisaShell, Info.plist properties inline, sandbox OFF with comment, scheme included), `LisaApp/Sources/LisaApp.swift` (App/Scene), `LisaApp/Sources/ScreenView.swift` (blit view), `LisaApp/Sources/AppModel.swift` (@Observable glue: controller lifecycle, frame → CGImage on main thread)
+- Modify: `.gitignore` (add `LisaApp/LisaApp.xcodeproj/`), `README.md` (one line: generate with xcodegen)
+- LisaCore/LisaShell stay UI-free — enforce by grep in the task. Package.swift is NOT modified (the app lives in the Xcode project, not as an SPM executable).
+- Reference material for the implementer: macOS window/menu patterns in /Users/jdawson/.claude/plugins/cache/axiom-marketplace/axiom/3.1.2/skills/axiom-macos/skills/windows.md and menus-and-commands.md (WindowGroup/commands API).
 
 **Interfaces:**
-- `swift run LisaApp` opens a window titled "LisaEmu": the live screen (vImage 1bpp→8bpp expand → CGImage per published frame; aspect-corrected default, View menu 1:1 toggle), a status bar (cycles, emulated seconds, throttle state, halted flag), menus: Machine → Start/Pause (⌘P), Reset (⌘R), Throttle (⌘T checkbox); File → Save Screenshot… (writes PNG via the controller's raw-frame request + app-side encoding, NSSavePanel default path outside any repo); ROM directory resolved from `LISAEMU_ROM_DIR` or `~/Development/LisaROMs` fallback, with a clear error alert if missing.
+- `xcodegen generate --spec LisaApp/project.yml && xcodebuild -project LisaApp/LisaApp.xcodeproj -scheme LisaApp build` produces LisaApp.app; running it opens a window titled "LisaEmu": the live screen (vImage 1bpp→8bpp expand → CGImage per published frame; aspect-corrected default, View menu 1:1 toggle), a status bar (cycles, emulated seconds, throttle state, halted flag), menus via SwiftUI `.commands`: Machine → Start/Pause (⌘P), Reset (⌘R), Throttle (⌘T checkbox); File → Save Screenshot… (writes PNG via the controller's raw-frame request + app-side encoding, NSSavePanel default path outside any repo); ROM directory resolved from `LISAEMU_ROM_DIR` or `~/Development/LisaROMs` fallback, with a clear error alert if missing.
 - Blit correctness is unit-testable at one seam: the 1bpp→CGImage conversion function lives in LisaShell-adjacent pure code? NO — vImage/CG allowed only in LisaApp per constraints; instead extract `expand1bppRow(_:into:)` pure-Swift bit-unpacking into LisaShell with tests, and LisaApp wraps it with CG. (Keeps the testable math tested without polluting layer rules.)
 - Manual verification checkpoint (documented in the task report with a screenshot): app launches, POST runs LIVE (visible drawing), menu appears, status bar ticks. This is a human-visible milestone — the implementer captures it via the app's own Save Screenshot.
 
-- [ ] **Step 1:** Failing tests for `expand1bppRow` (bit order matches the established MSB-first convention — cite Task 5/M1b). **Step 2:** Implement app + model + view. **Step 3:** `swift build` all targets + suites green; manual run checkpoint documented. **Step 4:** Commit.
+- [ ] **Step 1:** Failing tests for `expand1bppRow` (bit order matches the established MSB-first convention — cite Task 5/M1b; the function lives in LisaShell so `swift test` covers it). **Step 2:** Write project.yml, generate, implement app + model + view; iterate `xcodebuild` until green. **Step 3:** `swift test` suites green + `xcodebuild` build succeeds warning-free (app sources); manual run checkpoint documented via the app's own Save Screenshot. **Step 4:** Commit (project.yml + sources + .gitignore; NOT the .xcodeproj).
 
 ---
 

@@ -299,8 +299,11 @@ recorded here as a future serial-device requirement.
 | VIA2 `$DD81` (stride 2), esp. `$DD8D`/`$DD8F` (T1 latches) | real 6522 registers that read back written values (DDR/latch/port). **This is the current hard stall.** | **Task 3** |
 | VIA1 `$D901` (stride 8): DDRB1/PORTB1/DDRA1/PORTA1/T1LL1/T1LH1 | real 6522 register file; timer-1 latch loads | **Task 3** |
 | COPS / VIA2 Port A+B (`$DD81`=CRDY/PORTB2, `$DD83`/`$DD87`=DDRA2/`$DD9F`=IORA2) | **DONE (Task 4)** — real HLE `COPS` endpoint; see "COPS" section below | ~~Task 4~~ |
-| `$F801` status register (`btst #1`)                       | real status bits (bit1 meaning undetermined — only bit2=vsync is documented, `hardware-notes §5`) | Task 5 |
-| `$E018/$E01A/$E01C/$E01E` video strobes                   | vsync/vertical-retrace strobe + interrupt semantics; `$E01C/$E01E` are newly observed | Task 5 |
+| `$F801` status register bit 2 (`btst #2`, vsync)          | **DONE (Task 5)** — real `VideoTiming`; see "Trace checkpoint B" below | ~~Task 5~~ |
+| `$E018/$E01A` video strobes (VertReset/VRIRDIS, VRIRENB)  | **DONE (Task 5)** — arm/clear semantics validated against ROM's own access order; see "Trace checkpoint B" | ~~Task 5~~ |
+| `$E01C/$E01E` video strobes                               | **DIAGNOSED, no model change (Task 5)** — bare bracketing strobes around a RAM-sizing/checksum routine, result never branched on; see "Trace checkpoint B" | ~~Task 5~~ |
+| `$F801` status register bit 1 (`btst #1`)                 | still undetermined — new context found (NMI/bus-error RAM-probe, not vsync); see "Trace checkpoint B" | later task |
+| `$FE2DBE` unconditional "next COPS input byte" wait        | genuine open frontier — confirmed NOT vsync-related (SR interrupt mask blocks all levels here regardless); needs either a real unsolicited COPS event or further call-chain tracing to determine what, if anything, the ROM expects | later task |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
 | `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
 
@@ -371,6 +374,186 @@ re-raising the flag on a fixed cadence for as long as a byte remains
 genuinely undelivered — modeling how a real level-sensitive peripheral
 signal would behave, since a one-shot pulse cannot survive a premature
 external flag clear it has no visibility into.
+
+## Trace checkpoint B (Task 5)
+
+With `VideoTiming` live (vsync every 83,333 cycles, `$F801` bit 2, `$E018`
+disarm+clear / `$E01A` arm), this section re-traces the post-COPS-handshake
+territory the task brief asked checkpoint B to cover: does the `$FE2DBE`
+frontier resolve, is the `$E018`/`$E01A` polarity right, what are
+`$E01C`/`$E01E`, and does the ROM ever reach the SNUM region. Reproduced with
+`swift run -c release lisadbg --rom $HOME/Development/LisaROMs`, `g
+<cycles>`, and a throwaway `@testable import LisaCore` scratch test (deleted
+before commit) that single-stepped through the transition and printed
+`Machine`/`VideoTiming` state — not committed, but every finding below is
+independently reproducible from the `lisadbg` commands shown.
+
+### The `$FE2DBE` frontier is UNCHANGED — confirmed NOT vsync-related
+
+Resampled at 20M, 25M, 30M, 35M, 40M, 50M, 70M, 120M, and 220M cycles (`g`):
+PC never leaves `$FE2DBE-$FE2DD6` (the same unconditional `IFR2` bit-1 poll
+task-4-report.md documented), and `Machine.halted` stays `false` throughout.
+Two independent reasons this task's video timing cannot resolve it, both
+confirmed live:
+
+1. **The CPU's own SR interrupt mask is 7 throughout this whole region**
+   (`SR=$2704`/`$2700`/`$2710`/... — bits 10-8 always `111`), sampled from
+   well before $FE0BA2's vsync self-test through the $FE2DBE stall itself.
+   Mask 7 blocks levels 1-6 unconditionally, so even a continuously-asserted
+   level-1 vsync IRQ (`Machine.vsyncPending == true`, confirmed below) cannot
+   preempt this loop — the ROM runs this entire stretch of POST with
+   interrupts globally disabled.
+2. **Independent of masking, `$FE2DBE`'s poll only reads VIA2 `IFR2` bit
+   1** (`move.b ($1a,A0),D0` / `btst #1,D0`, `A0=$FCDD81`) — a different
+   register, different device, and different interrupt level (2) than vsync
+   (level 1, `$F801`/VIA1's shared line). There is no code path by which a
+   vsync tick could set that bit.
+
+So the answer to the brief's core checkpoint-B question is definitive: **the
+`$FE2DBE` wait does not resolve via a vsync-timed COPS byte** — it is exactly
+what task-4-report.md already characterized it as, an unconditional wait for
+a *new, unsolicited* COPS input byte that this model's `COPS` has nothing
+queued to deliver. No further evidence surfaced pointing to a specific
+COPS message (clock reply, keyboard ID, or otherwise) that would satisfy
+it — the call chain (`$FE2624` sets low-RAM flag `$2A2` bit 5 → `$FE2C46`
+tests it → `$FE2D38` → `$FE2DBE`) reads as a generic "wait for the next
+COPS event" primitive, not a specific reply this task's COPS model is
+positioned to synthesize without inventing un-evidenced protocol content.
+**Left open, precisely as before — this is beyond Task 5's video/COPS scope
+as currently understood; resolving it needs either a real unsolicited event
+(a later task's keyboard/mouse harness) or further disassembly of what
+`$2A2` bit 5's setter (`$FE2624`) is actually gating on.**
+
+### `$E018`/`$E01A` arm/reset polarity — validated by the ROM's own access order, model's default outcome confirmed harmless
+
+The ROM's own vsync/vertical-retrace self-test lives at `$FE0BA2-$FE0DE4`,
+reached from the pre-Pepsi contrast-DAC delay loop via
+`$FE0AEA`→`$FE0B96`→...→`$FE0BA2` (confirmed live: a single-stepped trace
+from 10M cycles hits `$FE0BA2` at cycle 11,880,588, ~1.88M cycles — about 22
+vsync periods — after the 10M sample, well inside the documented 3-9M-cycle
+contrast-DAC delay window):
+
+```
+FE0BA2: movea.l #$fce018, A3      ; A3 = VertReset/VRIRDIS
+FE0BA8: movea.l #$fce01a, A4      ; A4 = VRIRENB
+FE0BAE: movea.l #$fcf801, A5      ; A5 = status register
+FE0BB4: move.w  #$df4, D0         ; timeout count (0xDF4 = 3572)
+FE0BB8: moveq   #$2, D2           ; bit 2 (vsync pending)
+FE0BBA: tst.w   (A3)              ; $E018 -- ANY access, ROM does this FIRST
+FE0BBC: tst.w   (A4)              ; $E01A -- ANY access, SECOND
+FE0BBE: btst    D2, (A5)          ; test $F801 bit 2
+FE0BC0: beq     $fe0bc8
+FE0BC2: dbra    D0, $fe0bbe
+FE0BC6: bra     $fe0bd4
+FE0BC8: tst.w   (A3)              ; $E018 again
+FE0BCA: tst.w   (A4)              ; $E01A again
+FE0BCC: btst    D2, (A5)
+FE0BCE: beq     $fe0bd4           ; -> fail-mark path (bset #2,D7), non-fatal
+FE0BD0: tst.w   (A3)              ; $E018 once more
+FE0BD2: bra     $fe0be0           ; success path
+FE0BD4: bset    #$2, D7           ; record failure flag (does NOT retry/abort)
+FE0BD8: tst.l   D7
+FE0BDA: bmi     $fe0ba2           ; only retries if D7's sign bit (unrelated,
+                                   ; accumulated earlier) is set
+FE0BDC: bra     $fe139a           ; otherwise falls through -- POST continues
+```
+
+The ROM's own access order is exactly `$E018` (clear/disarm) THEN `$E01A`
+(arm) — matching this model's `VideoTiming.handleVertResetAccess` /
+`handleVertEnableAccess` naming and the VRIRDIS/VRIRENB (DISable/ENable)
+labels in `hardware-notes.md` §2, which this model follows over the same
+section's more ambiguous "write re-arms/clears" phrasing (see
+`VideoTiming.swift`'s type doc comment). A single-stepped trace of the actual
+run (`armed` transitions `false`→`true` at cycle 11,880,652, immediately
+after the `$E01A` access at `$FE0BBC`, exactly as the model predicts) confirms
+the wiring reacts correctly to both registers in the ROM's real order.
+
+**The self-test's own outcome is a soft, non-fatal failure under this
+model — and, from the timing alone, would very likely be a soft failure on
+real hardware too.** The full poll window from `$E018` (clear) to the final
+`btst` is roughly 130 cycles in the observed run — several orders of
+magnitude short of one 83,333-cycle vsync period — so `$F801` bit 2 has no
+realistic chance of having flipped again by the time the routine samples it,
+whichever of the two check sites (`$FE0BBE`/`$FE0BCC`) actually executes.
+The observed run takes the immediate-fail branch both times (`beq` taken at
+`$FE0BC0` and `$FE0BCE`), landing on `$FE0BD4` (`bset #2,D7`, a diagnostic
+flag — not a `btst #2,D7` site was found anywhere else in the ROM, so this
+flag's downstream consequence, if any, is not chased here) and then falling
+straight through to `$FE0BDC`/`$FE139A` — POST continues normally. No infinite
+retry occurred in the traced run (the `bmi $fe0ba2` retry only fires if
+D7's *sign* bit, set by an unrelated earlier diagnostic, happens to be set;
+in the traced run it was not). **No model change is needed or evidenced**:
+the routine tolerates this outcome by design, and the frontier is reached
+identically whether this self-test's own bit-2 sample happens to land inside
+or outside a live vsync window.
+
+### `$E01C`/`$E01E` diagnosed: bare bracketing strobes around a RAM-sizing/checksum routine, result discarded
+
+Both addresses appear repeatedly, always as a `tst.b`/`tst.b` pair (or a lone
+`tst.b $fce01c` at a few sites), bracketing the RAM-size/checksum probe at
+`$FE0D68-$FE0FCC` (which computes RAM size via `$2A4`/`$fcf000`, installs an
+NMI handler at `$7C`, and probes memory presence) — e.g.:
+
+```
+FE0D6E: tst.b   $fce01c.l
+...
+FE0D96: tst.b   $fce01e.l
+...
+FE0DB4: tst.b   $fce01c.l
+...
+FE0F52: tst.b   $fce01c.l
+FE0F58: tst.b   $fce01e.l
+```
+
+In every occurrence the very next instructions never test the Z/N flags a
+`tst.b` of these addresses would set — they instead branch on unrelated
+computed values (`D2`, `D4`, a checksum comparison) already in registers.
+This is the same "bare strobe, result unused" shape `hardware-notes.md`'s
+Setup/Domain-context latches document for `$E010/$E012`/`$E008-$E00E`, so
+these read as two more address-decoded latches in that family — but WHICH
+latches, and what they actually do on real hardware, is not determinable
+from this evidence (no cited hardware-notes entry, and the ROM never
+observably depends on their value). **Evidence-gated per the brief: no
+behavior is modeled beyond the existing "unknown I/O offset, 0xFF stub,
+logged" default** — and this default is confirmed sufficient: the ROM
+reaches the (unchanged) `$FE2DBE` frontier regardless, having touched
+`$E01C`/`$E01E` dozens of times along the way with no ill effect.
+
+### `$F801` bit 1 — new context, still undetermined, unrelated to vsync
+
+`hardware-notes.md` §5 already flagged bit 1's meaning as undetermined. This
+task found the actual usage site: `$FE0F46-$FE0F72`, inside the same
+RAM-sizing/checksum routine referenced above. `$FE0F46` installs a handler
+at low-core `$7C` (the NMI vector, `hardware-notes.md` §7) whose body
+(`$FE0F72`) does `bsr $fe0f68` (`btst #$1,$fcf801` / `rts`) then branches on
+the result. This reads as an NMI-or-bus-error-driven memory-presence probe
+(consistent with `hardware-notes.md`'s "Known Gaps: Parity/bus-error status
+register bit layout not located"), not anything vsync-related — bit 1 and
+bit 2 are evidently independent status-register sources. This model already
+treats undriven status bits as always-0 (`IODispatcher.statusByte` defaults
+to 0, OR'd only with `videoTiming.pending` for bit 2), which is a safe
+default here too: the RAM-sizing routine completes and the frontier is
+reached regardless. Precisely pinning bit 1's real semantics is left for a
+later task (Task 6, board-ID/bus-error territory, is the natural home).
+
+### SNUM ($FE8000+, special-space `$4000+`) — still unreached, now confirmed across the ENTIRE ROM image
+
+Task 2's "Beyond the M1a boundary" section confirmed no special-space
+`$4000+` access occurs before the (then-current) stall. This task re-checked
+more strongly: a full linear disassembly of the entire 16KB ROM image
+(`d fe0000 9000` under `lisadbg`, confirmed to cover exactly `$FE0000
+-$FE3FFE` — the disassembly desyncs into garbage past `$FE3FFE`, the
+documented ROM end / version-word address) contains exactly two absolute
+references in the `$FE4000+` range anywhere in the ROM's code: `$fe8000.l`
+and `$fe8008.l` — both are the segment-127 SLIM/SORG MMU ports (used
+repeatedly through the setup-mode MMU-programming code at `$FE0120-$FE0420`,
+already documented under "MMU programming" above), not a SNUM data read.
+**No instruction anywhere in the ROM references the SNUM range.** This is a
+stronger statement than Task 2's ("before the stall") since it covers the
+whole image, not just the pre-frontier portion — SNUM access, if the ROM
+ever performs one, is either data-driven (a computed/indexed address this
+static disassembly can't discover) or simply not exercised by this boot
+ROM's revision at all.
 
 ## Answers to the Task 5 open questions
 

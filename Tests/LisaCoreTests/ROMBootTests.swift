@@ -165,6 +165,18 @@ extension MusashiSuites {
         /// `$FE2DBE`). Confirmed stable by direct `lisadbg g` sampling from
         /// 18M through 150M cycles -- PC never leaves this 4-instruction
         /// poll body. 20M cycles is safely inside the new stall.
+        ///
+        /// **M1b Task 5** (docs/rom-trace-notes.md "Trace checkpoint B")
+        /// re-traced this frontier with `VideoTiming` (vsync/`$F801` bit 2/
+        /// `$E018`/`$E01A`) live and confirmed it is UNCHANGED: resampled
+        /// stable from 20M through 220M cycles. Two independent reasons
+        /// video timing cannot resolve it -- both confirmed live: the SR
+        /// interrupt mask is 7 (all levels 0-6 blocked) throughout this
+        /// entire region regardless of `Machine.vsyncPending`, and the poll
+        /// itself only reads VIA2 IFR2 bit 1, an unrelated register/level
+        /// from vsync's level-1/`$F801` source. This remains a genuine
+        /// "await the next unsolicited COPS byte" wait with no further
+        /// evidence of what specific content would satisfy it.
         @Test
         func romClearsCOPSPresencePollAndStallsAwaitingNextInputByte() throws {
             let m = try bootedMachine()

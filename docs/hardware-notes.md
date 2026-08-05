@@ -143,6 +143,15 @@ Source: libhw-MACHINE:97-99, 38-41
 - **Framebuffer:** 32,760 bytes
 - **Refresh rate:** ~60 Hz
 
+**M1b Task 5 modeling note (not a cited hardware fact):** bit order within
+each framebuffer byte is assumed MSB-first, row-major (bit 7 = leftmost
+pixel of each 8-pixel group, 90 bytes/row × 364 rows = 32,760) — the
+conventional 1bpp bitmap convention and consistent with 720/8 = 90 dividing
+evenly, but not independently confirmed against OS source or a real
+screen dump. `Bus.framebufferSnapshot()`/`lisadbg`'s `sc`/`sca` commands
+follow this assumption; revisit if a later task finds contradicting
+evidence (e.g. once the OS actually draws something recognizable).
+
 ### Low-Core Screen Cells
 
 Source: libhw-DRIVERS:127-131
@@ -161,6 +170,37 @@ Source: libhw-DRIVERS:936-962; independent confirmation OS/source-SERNUM.TEXT.un
 - StatusRegister bit 2: vertical retrace pending
 - VRIRENB (V-Retrace Interrupt Enable): $E01A + IOMMU
 - VRIRDIS (V-Retrace Interrupt Disable): $E018 + IOMMU
+
+**M1b Task 5 ground truth / polarity resolution:** this section's own two
+phrasings are in tension ("VertReset... write re-arms/clears pending" vs.
+"VRIRDIS" = DISable) — the Rev H boot ROM's own vsync self-test
+(`$FE0BA2-$FE0DE4`, disassembled live under trace, docs/rom-trace-notes.md
+"Trace checkpoint B") resolves it: the ROM's OWN access order is `$E018`
+(ANY access) THEN `$E01A` (ANY access) before polling bit 2 — i.e. clear/
+disarm first, then arm, matching the VRIRDIS/VRIRENB (DISable/ENable)
+labels, not a "re-arms" reading of $E018. M1b's `VideoTiming` implements
+$E018 = disarm the interrupt + clear the pending status bit; $E01A = arm
+(and assert immediately if bit 2 is already pending). The ROM's own
+self-test tolerates either outcome of its bit-2 poll (a non-fatal
+diagnostic flag on failure, not a retry-forever or abort) because its
+poll window (~130 cycles, observed) is far shorter than one ~83,333-cycle
+(5 MHz / 60 Hz) vsync period — so this ROM code does not, by itself,
+discriminate the polarity choice; the VRIRDIS/VRIRENB naming plus the
+ROM's own access order are the basis for this model's semantics.
+
+**$E01C/$E01E — diagnosed, not modeled (Task 5):** bare `tst.b` strobes
+(data irrelevant, like the Setup/Domain-context latches above) bracketing
+a RAM-sizing/checksum routine (`$FE0D68-$FE0FCC`); the ROM never branches
+on the result. Purpose undetermined (no hardware-notes source located);
+docs/rom-trace-notes.md "Trace checkpoint B" has the full citation. Model:
+falls through to the existing generic "unknown I/O offset" stub, confirmed
+sufficient (the ROM proceeds past every occurrence regardless).
+
+**StatusRegister bit 1 — new context, still undetermined:** tested inside
+an NMI-vector-installing RAM/bus-error presence probe (`$FE0F46-$FE0F72`,
+installs a handler at low-core `$7C`) within the same RAM-sizing routine —
+likely related to the "Known Gaps" parity/bus-error status noted below,
+not vsync. See docs/rom-trace-notes.md "Trace checkpoint B" for the trace.
 
 **Interrupt:** Level 1 (autovector $64) — libhw-DRIVERS:895-898
 
@@ -578,4 +618,11 @@ Source: LDASM:68-106
 ## Known Gaps (Flagged for M1b, Not M1a)
 
 - Parity/bus-error status register bit layout not located. Check SOURCE-EXCEPRES/SOURCE-EXCEPASM BUS_ERR handler.
+  M1b Task 5 found the ROM's own usage SITE for `$F801` bit 1 (an
+  NMI-vector-installing RAM-probe at `$FE0F46-$FE0F72`, see §2 "Vertical
+  Retrace" above and docs/rom-trace-notes.md "Trace checkpoint B") but not
+  the bit's exact semantics — still open.
 - RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.
+- `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
+  site found (bracketing a RAM-sizing/checksum routine, result discarded),
+  purpose not identified. See §2 "Vertical Retrace" above.

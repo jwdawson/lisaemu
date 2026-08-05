@@ -91,32 +91,42 @@ extension MusashiSuites {
         /// `.special` (and $9 as `.io`) -- see docs/rom-trace-notes.md OQ2
         /// -- so that fetch now succeeds and the ROM keeps running.
         ///
-        /// Running the SAME 2,000,000-cycle budget the old halt-boundary
-        /// test used, the real Rev H ROM is observed (via `t`/`g` trace,
-        /// `swift run lisadbg --rom $LISAEMU_ROM_DIR`, then `g 2000000`) to
-        /// reach PC=$FE0F00 (`move.l D1,(A0)+`) with mmuPortWrites=4384 (up
-        /// from 4132 at setup-drop -- 252 MORE SLIM/SORG writes happen past
-        /// the old boundary, unexplored territory), still setup=OFF /
-        /// domain=0, NOT halted -- having also touched VIA-shaped I/O
-        /// offsets ($D241, $D931/$D939) and the video page latch ($E800)
-        /// that the M1a trace never reached. Continuing further (checked to
-        /// 2.5M cycles during investigation) keeps making forward progress
-        /// (PC reaches $FE3154), i.e. this is not a new stall either.
+        /// Trace checkpoint A (Task 2) mapped the post-boundary territory
+        /// fully -- see docs/rom-trace-notes.md "Beyond the M1a boundary".
+        /// The observed PC frontier (via `g` in lisadbg): $FE0F00 at 2M
+        /// (RAM-fill loop), $FE35FE at 5M (delay loop), then by ~5.5M cycles
+        /// the ROM enters the VIA2 register self-test retry loop at $FE08B0
+        /// and STALLS there indefinitely -- 10M/20M/30M/60M all sample PC in
+        /// the $FE07B8-$FE08D2 loop, still setup=OFF / domain=0 / NOT halted.
         ///
-        /// This assertion is deliberately LOOSE: Task 2 ("Trace checkpoint
-        /// A") is the one that documents this new post-boundary territory
-        /// fully in rom-trace-notes.md. This test only pins down that the
-        /// CPU is alive and past the old boundary, not what it's doing
-        /// there.
+        /// The stall is a live busy-loop, not a fault/halt: $FE07B8 is a
+        /// read/write presence test on VIA2 registers $FCDD8D/$FCDD8F (base
+        /// $DD81, stride 2), which the current stub leaves as unknown IOSpace
+        /// (0xFF reads, dropped writes), so the test never passes and the ROM
+        /// retries forever (D7 sign bit keeps `bmi $fe08b0` taken). Making
+        /// VIA2 a real read/write register file at base $DD81 is Task 3 (VIA
+        /// core) -- confirmed empirically: pointing the stub at the ROM's
+        /// bases lets the ROM advance to $FE099A.
+        ///
+        /// This assertion is deliberately LOOSE: it pins that the CPU is
+        /// alive, past the old boundary, and parked in the documented VIA2
+        /// self-test loop -- not exact cycle-for-cycle behavior. 10M cycles
+        /// is safely inside the stall.
         @Test
-        func romRunsPastTheFormerHaltBoundary() throws {
+        func romRunsPastBoundaryAndStallsOnVIA2SelfTest() throws {
             let m = try bootedMachine()
-            m.run(until: 2_000_000)
+            m.run(until: 10_000_000)
 
             #expect(m.bus.setupMode == false, "ROM dropped setup mode (clr.b $fce012)")
-            #expect(m.bus.domain == 0, "domain 0 still active at 2M cycles")
+            #expect(m.bus.domain == 0, "domain 0 still active")
             #expect(m.halted == false,
-                    "M1b Task 1: translated-mode prom fetch ($FE0446, nibble $F) now decodes via .special instead of double-bus-faulting; PC=\(String(format: "%08X", m.cpu[.pc])) at 2M cycles (was garbage post-halt PC under M1a)")
+                    "post-boundary the ROM busy-loops on the VIA2 self-test, it does not halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
+            // Parked in the VIA2 register self-test retry loop
+            // ($FE07B8 test body + $FE08B0-$FE08D2 retry) -- rom-trace-notes.md
+            // "The hard stall".
+            let pc = m.cpu[.pc]
+            #expect((0x00FE_07B8...0x00FE_08D2).contains(pc),
+                    "PC should be in the documented VIA2 self-test loop; got \(String(format: "%08X", pc))")
         }
     }
 }

@@ -171,6 +171,35 @@ import Testing
     #expect(bus.ioTrace.contains { $0.offset == 0x4000 && !$0.isWrite })
 }
 
+/// **M3 Task 4 (OQ1′) -- supervisor-mode translation uses the OS domain
+/// (0), ignoring the context latch.** Domain 0 is the OS/system domain;
+/// domains 1-3 are per-user-process (SYSGLOBAL:60/137 "user's domain",
+/// SCHED Set_Address_Space, DCT/LRU). The context (ctbit) latch selects the
+/// domain ONLY for user-mode accesses. Supervisor (kernel/loader/trap)
+/// accesses always translate through domain 0 -- which is the ONLY way
+/// `do_an_mmu` (LDASM:364-425) and `SET_DOMAIN` (starasm1:232-258) can flip
+/// the latch to an as-yet-empty user domain (setup OFF) and keep fetching
+/// their own supervisor code across the switch. See rom-trace-notes.md
+/// "Kernel push (M3 Task 4)".
+@Test func supervisorTranslationUsesOSDomainZeroRegardlessOfContextLatch() {
+    let bus = Bus(ramSize: 0x100000)
+    bus.write8(0x40000, 0x99)                                              // physical target (setup mode)
+    bus.mmu.domains[0][0] = .make(originPage: 0x200, limitPages: 256, access: .readWrite)
+    bus._setSetupModeForTesting(false)                                     // translation active
+    bus.domain = 1                                                         // context latched to empty user domain 1
+
+    // Supervisor keeps translating through domain 0 despite the latch.
+    bus.supervisorProvider = { true }
+    #expect(bus.read8(0x0) == 0x99)
+    let supPulses = bus.busErrorPulseCount
+
+    // A user-mode access at the same address follows the latch into the
+    // empty domain 1 and faults.
+    bus.supervisorProvider = { false }
+    #expect(bus.read8(0x0) == 0xFF)
+    #expect(bus.busErrorPulseCount > supPulses)
+}
+
 @Test func mirrorIsGoneOnceSetupModeClearsWithAnMMUMapping() {
     let bus = Bus(ramSize: 0x100000)
     var rom = [UInt8](repeating: 0xAA, count: 0x4000)

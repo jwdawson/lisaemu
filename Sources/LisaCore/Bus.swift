@@ -27,6 +27,40 @@ public final class Bus {
             _domain = newValue
         }
     }
+
+    /// The domain `MMU.translate` actually resolves a CPU access through --
+    /// **domain 0 whenever the CPU is in supervisor mode, otherwise the
+    /// latched `domain`.** This is the OQ1′ mechanism (M3 Task 4).
+    ///
+    /// The Lisa's 2-bit context (`ctbit`) latch names four domains, but they
+    /// are NOT four fully-independent maps for supervisor code. Domain 0 is
+    /// the OS/system domain (`initmmutil` LDASM:215 "establish domain 0, the
+    /// OS domain"); domains 1-3 are per-user-process, LRU-assigned from the
+    /// DCT (SYSGLOBAL:60/137 `domainRange`/`domvalue` "user's domain on sys
+    /// call entry"; SCHED `Set_Address_Space`/`SelectDomain`). The context
+    /// latch selects the domain ONLY for **user-mode** accesses; the OS,
+    /// running in **supervisor** mode, always translates through domain 0.
+    ///
+    /// This is what lets the OS switch the latch to an as-yet-empty user
+    /// domain and keep executing supervisor code across the switch --
+    /// exactly what `do_an_mmu` (LDASM:364-425) and `SET_DOMAIN`
+    /// (starasm1:232-258, "can only be called from the supervisor stack")
+    /// require: both flip `ctbit` to the target domain with **SETUP OFF**,
+    /// then keep fetching their own seg-84 / caller code and (for
+    /// `do_an_mmu`) read the SMT, BEFORE any register is programmed there. A
+    /// per-domain-independent supervisor map would fault on that first fetch
+    /// -- and no Lisa would boot. Deterministic single-step confirms it:
+    /// `do_an_mmu`'s domain-1 pivot fetches `$A84034` in the newly-latched,
+    /// empty domain 1 with `setup=OFF`, having written nothing to domain 1
+    /// (rom-trace-notes.md "Kernel push (M3 Task 4)").
+    ///
+    /// SLIM/SORG *register* programming is a separate mechanism and is NOT
+    /// affected: `slimSorgPortAccess` keeps writing to the raw latched
+    /// `domain`, so the loader still builds domain 1's registers (for later
+    /// user-mode execution) while running in domain-0 supervisor code.
+    private var translationDomain: Int {
+        supervisorProvider() ? 0 : domain
+    }
     public private(set) var lastFault: MMUFault?
     public private(set) var unmappedAccesses: [UInt32] = []
     public private(set) var unmappedDropped = 0
@@ -355,13 +389,13 @@ public final class Bus {
             // programmed -- still falls through to flat exactly as before; only
             // code running from an already-mapped segment (the loader) changes.
             if case .memory(let p) = mmu.translate(
-                a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
+                a, domain: translationDomain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
                 return ramAccess(address, Int(p), isWrite: isWrite, value: value)
             }
             return ramAccess(address, Int(a), isWrite: isWrite, value: value)
         }
 
-        switch mmu.translate(a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
+        switch mmu.translate(a, domain: translationDomain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
         case .memory(let p):
             if !peeking { faultPendingResolution = false }
             if p >= 0xFE_0000 && p <= 0xFE_3FFF {

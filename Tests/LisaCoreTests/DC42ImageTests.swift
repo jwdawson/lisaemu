@@ -149,6 +149,73 @@ private func makeDC42Container(
     }
 }
 
+// MARK: - Tagless containers (M2 review Finding 1 -- FloppyController's
+// `performRead` used to trap calling `image.tag(block:)` on an empty tag
+// plane; the fix is here, at load time: synthesize zero tags rather than
+// storing an empty plane)
+
+@Test func taglessContainerInsertsAndTagReadsReturnSynthesizedZeroTags() throws {
+    // tagLen == 0 in the header, and no tag plane bytes in the container at
+    // all -- exactly what a wild Mac-disk DC42 (or any tagless source) looks
+    // like, and exactly what drag-and-drop invites.
+    let blockCount = 2
+    let dataPlane = (0..<(blockCount * 512)).map { UInt8($0 & 0xFF) }
+    let container = makeDC42Container(dataPlane: dataPlane, tagPlane: [])
+
+    let image = try DC42Image(data: container)
+    #expect(image.blockCount == blockCount)
+
+    for block in 0..<blockCount {
+        // Data plane is untouched by the tagless fix.
+        let data = image.data(block: block)
+        #expect(data.count == 512)
+
+        // Tag plane is synthesized, not left empty -- must not trap, and
+        // must read back as all zeros.
+        let tag = image.tag(block: block)
+        #expect(tag.count == 12)
+        #expect(tag.allSatisfy { $0 == 0 }, "tagless container should synthesize zero tags for block \(block)")
+    }
+}
+
+@Test func rejectsTagLengthThatIsNeitherZeroNorBlockAligned() throws {
+    // 1 block of data -> the only valid tag lengths are 0 (tagless) or 12
+    // (blockCount * 12). 6 is neither.
+    let dataPlane = [UInt8](repeating: 0xAA, count: 512)
+    let tagPlane = [UInt8](repeating: 0xBB, count: 12)
+    var container = makeDC42Container(dataPlane: dataPlane, tagPlane: tagPlane)
+
+    var wrongTagLen = UInt32(6).bigEndian   // header field is big-endian
+    container.replaceSubrange(68..<72, with: Data(bytes: &wrongTagLen, count: 4))
+
+    var caught: DC42Image.Error?
+    do {
+        _ = try DC42Image(data: container)
+    } catch let error as DC42Image.Error {
+        caught = error
+    }
+    #expect(caught == .tagLengthMismatch(expected: 12, found: 6),
+            "expected a typed tagLengthMismatch, got \(String(describing: caught))")
+}
+
+@Test func rejectsDataLengthThatIsNotAMultipleOf512() throws {
+    let dataPlane = [UInt8](repeating: 0xAA, count: 512)
+    let tagPlane = [UInt8](repeating: 0xBB, count: 12)
+    var container = makeDC42Container(dataPlane: dataPlane, tagPlane: tagPlane)
+
+    var wrongDataLen = UInt32(500).bigEndian   // header field is big-endian; not a multiple of 512
+    container.replaceSubrange(64..<68, with: Data(bytes: &wrongDataLen, count: 4))
+
+    var caught: DC42Image.Error?
+    do {
+        _ = try DC42Image(data: container)
+    } catch let error as DC42Image.Error {
+        caught = error
+    }
+    #expect(caught == .dataLengthNotBlockAligned(500),
+            "expected a typed dataLengthNotBlockAligned, got \(String(describing: caught))")
+}
+
 @Test func returnsZeroBasedArraysForNonZeroBlocks() throws {
     // Verify that returned arrays are zero-based, not parent-indexed.
     // This is critical for Task 4 (FloppyController) to safely index block data.

@@ -101,6 +101,37 @@ private func makeSyntheticImage(blockCount: Int = 800) -> DC42Image {
     return try! DC42Image(data: container)   // swiftlint:disable:this force_try -- hand-built, always valid
 }
 
+/// Same shape as `makeSyntheticImage`, but tagless (`tagLen == 0` in the
+/// header, no tag-plane bytes in the container) -- the M2 review Finding 1
+/// regression case: before the fix, `DC42Image` stored an empty tag plane
+/// for this container and `performRead`'s `image.tag(block:)` call trapped
+/// on the first read (crashing the emulation thread). `DC42Image.init` now
+/// synthesizes a zero tag plane instead, so this must insert and read clean.
+private func makeTaglessSyntheticImage(blockCount: Int = 4) -> DC42Image {
+    var dataPlane = [UInt8](repeating: 0, count: blockCount * 512)
+    for block in 0..<blockCount {
+        for i in 0..<512 {
+            dataPlane[block * 512 + i] = UInt8(truncatingIfNeeded: block &* 7 &+ i)
+        }
+    }
+
+    var container = Data()
+    let name = "TEST"
+    var pascalString = Data([UInt8(name.utf8.count)])
+    pascalString.append(contentsOf: Array(name.utf8))
+    container.append(pascalString)
+    container.append(Data(repeating: 0, count: 64 - pascalString.count))
+    var dataLen = UInt32(dataPlane.count).bigEndian
+    container.append(Data(bytes: &dataLen, count: 4))
+    var tagLen: UInt32 = 0
+    container.append(Data(bytes: &tagLen, count: 4))
+    container.append(Data(repeating: 0, count: 8))
+    container.append(Data(repeating: 0, count: 4))
+    container.append(Data(dataPlane))
+    // Deliberately no tag-plane bytes appended -- tagless container.
+    return try! DC42Image(data: container)   // swiftlint:disable:this force_try -- hand-built, always valid
+}
+
 /// Forward CONVERT, implemented independently from the §9 zone table (NOT
 /// derived from `FloppyController.blockNumber`, which is the "inverse"
 /// under test): linear block -> (track, sector, side 0). Used both by the
@@ -292,6 +323,29 @@ private func issueRead(_ floppy: FloppyController, _ scheduler: FakeScheduler,
     #expect(floppy.read(FloppyController.Cell.diskErr) == 0, "write is accepted (no error), just discarded")
     #expect(floppy.blocksRead == 0, "M2 is read-only -- no image mutation, and this isn't a read")
     #expect(logged.contains { $0.contains("writedisk") }, "logged warning per the task brief")
+}
+
+// MARK: - Tagless image read (M2 review Finding 1 regression)
+
+@Test func readCommandOnTaglessImageSynthesizesZeroTagsWithoutCrashing() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insert(makeTaglessSyntheticImage())
+
+    issueRead(floppy, scheduler, track: 0, sector: 0, side: 0)
+
+    // The crash this regression test targets was `image.tag(block:)`
+    // trapping mid-read; simply reaching these assertions (rather than
+    // crashing above) is most of the point.
+    for i in 0..<12 {
+        #expect(floppy.read(FloppyController.Cell.diskHdr + 1 + 2 * i) == 0,
+                "tagless image should synthesize zero tags, not crash -- tag byte \(i)")
+    }
+    #expect(floppy.read(FloppyController.Cell.diskErr) == 0, "read still succeeds despite no real tags")
+    #expect(floppy.read(FloppyController.Cell.diskCmd) == 0)
+    #expect(floppy.completionLineAsserted == true)
+    #expect(level1() == true)
+    #expect(floppy.blocksRead == 1)
+    #expect(floppy.lastError == 0)
 }
 
 // MARK: - Media insertion / DISKIN / reset

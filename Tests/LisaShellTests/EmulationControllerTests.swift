@@ -505,6 +505,80 @@ extension LisaShellMusashiSuites {
                     "EmuStatus.diskInserted should reflect the attached image")
         }
 
+        /// Same shape as `makeSyntheticDC42File`, but tagless (`tagLen == 0`,
+        /// no tag-plane bytes) -- the through-the-controller regression case
+        /// for M2 review Finding 1: a valid but tagless DC42 container
+        /// (common for wild Mac-disk DC42s -- exactly what drag-and-drop
+        /// invites) used to crash the emulation thread on its first block
+        /// read (`DC42Image` stored an empty tag plane, and
+        /// `FloppyController.performRead`'s `image.tag(block:)` trapped on
+        /// it). `DC42Image.init` now synthesizes zero tags for a tagless
+        /// container instead, so insertion must succeed cleanly here.
+        private func makeTaglessSyntheticDC42File(blockCount: Int = 4) throws -> URL {
+            var dataPlane = [UInt8](repeating: 0, count: blockCount * 512)
+            for block in 0..<blockCount {
+                for i in 0..<512 { dataPlane[block * 512 + i] = UInt8(truncatingIfNeeded: block &* 7 &+ i) }
+            }
+            var container = Data()
+            let name = "TAGLESS"
+            var pascalString = Data([UInt8(name.utf8.count)])
+            pascalString.append(contentsOf: Array(name.utf8))
+            container.append(pascalString)
+            container.append(Data(repeating: 0, count: 64 - pascalString.count))
+            var dataLen = UInt32(dataPlane.count).bigEndian
+            container.append(Data(bytes: &dataLen, count: 4))
+            var tagLen: UInt32 = 0
+            container.append(Data(bytes: &tagLen, count: 4))
+            container.append(Data(repeating: 0, count: 8))
+            container.append(Data(repeating: 0, count: 4))
+            container.append(Data(dataPlane))
+            // Deliberately no tag-plane bytes -- tagless container.
+
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("EmulationControllerFloppyTests-tagless-\(UUID().uuidString).dc42")
+            try container.write(to: url)
+            return url
+        }
+
+        // MARK: insertFloppy of a tagless image -> no crash, disk shows inserted
+        // (M2 review Finding 1 -- through-the-controller regression test)
+
+        @Test
+        func insertFloppyWithTaglessImageDoesNotCrashAndReportsDiskInserted() throws {
+            let controller = try makeController()
+            let diskURL = try makeTaglessSyntheticDC42File()
+
+            controller.insertFloppy(url: diskURL)
+            let inserted = controller.debugSync { $0.bus.floppy.isInserted }
+            #expect(inserted, "a tagless-but-otherwise-valid DC42 container should insert successfully")
+
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller) { $0.diskInserted },
+                    "EmuStatus.diskInserted should reflect the attached tagless image")
+
+            // Never a crash: drive an actual block read through the go-byte
+            // protocol (the exact path that used to trap on the empty tag
+            // plane) and confirm the emulation thread is still alive and
+            // answering afterward. Same literal-offset technique as
+            // `diskActivityFlipsTrueWhenFloppyProcessesACommand` above
+            // (`LisaCore.FloppyController.Cell`/`GoByte`/`SubCommand` are
+            // internal, not visible from this module's non-`@testable`
+            // `import LisaCore`): DISKPARM=$03 readdisk(0), DISKHEAD=$07,
+            // DISKSEC=$09, DISKTRAK=$0B, DISKCMD=$01 excmd($81).
+            controller.debugSync { m in
+                m.bus.write8(0x00FC_C003, 0)      // DISKPARM = readdisk
+                m.bus.write8(0x00FC_C007, 0)      // DISKHEAD
+                m.bus.write8(0x00FC_C009, 0)      // DISKSEC
+                m.bus.write8(0x00FC_C00B, 0)      // DISKTRAK
+                m.bus.write8(0x00FC_C001, 0x81)   // DISKCMD = excmd
+            }
+            #expect(waitForStatus(controller) { $0.diskActivity },
+                    "the read command should complete (and not crash the emulation thread) on a tagless image")
+            let cycles = controller.debugSync { $0.cycles }
+            #expect(cycles > 0, "the emulation thread should still be alive and answering debugSync after the read")
+        }
+
         // MARK: ejectFloppy -> Bus/FloppyController state + EmuStatus.diskInserted
 
         @Test

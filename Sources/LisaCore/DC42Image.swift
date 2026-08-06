@@ -16,12 +16,34 @@ import Foundation
 /// For a standard 400KB floppy:
 /// - Data length: 409,600 bytes (800 blocks × 512 bytes)
 /// - Tag length: 9,600 bytes (800 blocks × 12 bytes)
+///
+/// ## Tagless containers
+///
+/// Some DC42 containers in the wild -- commonly ones sourced from Mac disks
+/// rather than Lisa disks, which is exactly what drag-and-drop invites --
+/// carry `tagLen == 0`: a valid container with no tag plane at all. This
+/// type accepts those: `init(data:)` synthesizes an all-zero tag plane
+/// (`blockCount * 12` bytes) so every other API behaves exactly as if a
+/// real, all-zero tag plane had been read from the container -- `tag(block:)`
+/// never traps. Zero tags read as "no filesystem metadata" to the Lisa FS;
+/// the ROM's read path itself just copies tag bytes through regardless of
+/// content, so a tagless image inserts and reads back fine here, and the
+/// Lisa-side boot fails benignly (not a crash) if it needed real tags. Any
+/// OTHER tag length -- nonzero but not exactly `blockCount * 12` -- is
+/// rejected as a malformed container (``Error/tagLengthMismatch(expected:found:)``),
+/// not silently coerced.
 public struct DC42Image {
     public enum Error: Swift.Error, Equatable {
         /// Container header is too short.
         case headerTooShort
         /// Container size does not match expected header dimensions (too small or has trailing garbage).
         case sizeMismatch(expected: Int, found: Int)
+        /// Header's data length is not a whole multiple of 512 bytes, so it
+        /// cannot be divided into an integral number of blocks.
+        case dataLengthNotBlockAligned(Int)
+        /// Header's tag length is neither 0 (tagless -- see the type doc
+        /// comment "Tagless containers") nor exactly `blockCount * 12`.
+        case tagLengthMismatch(expected: Int, found: Int)
     }
 
     private let dataPlane: [UInt8]
@@ -31,6 +53,10 @@ public struct DC42Image {
     ///
     /// Validates the container format strictly by checking:
     /// - Header is at least 84 bytes
+    /// - Data length is a whole multiple of 512 bytes
+    /// - Tag length is either 0 (tagless -- see the type doc comment
+    ///   "Tagless containers"; a zero tag plane is synthesized) or exactly
+    ///   `blockCount * 12`
     /// - Container size matches exactly: header (84) + data + tag planes
     ///   (rejects truncated or corrupted images with trailing garbage)
     ///
@@ -50,6 +76,23 @@ public struct DC42Image {
         let tagLenBytes = data.subdata(in: 68..<72)
         let expectedTagLen = Int(UInt32(bigEndian: tagLenBytes.withUnsafeBytes { $0.load(as: UInt32.self) }))
 
+        // Data length must divide evenly into 512-byte blocks -- blockCount
+        // (and therefore the tag-length check just below) is meaningless
+        // otherwise.
+        guard expectedDataLen % 512 == 0 else {
+            throw Error.dataLengthNotBlockAligned(expectedDataLen)
+        }
+        let blockCount = expectedDataLen / 512
+
+        // Tag length must be either 0 (tagless container -- a zero tag plane
+        // is synthesized below, see the type doc comment "Tagless
+        // containers") or exactly one 12-byte tag per block. Anything else
+        // is a malformed/corrupt container, rejected outright rather than
+        // silently truncated or padded.
+        guard expectedTagLen == 0 || expectedTagLen == blockCount * 12 else {
+            throw Error.tagLengthMismatch(expected: blockCount * 12, found: expectedTagLen)
+        }
+
         // Container must be exactly: header + data plane + tag plane
         // Rejects both truncation and trailing garbage.
         let expectedTotalSize = 84 + expectedDataLen + expectedTagLen
@@ -62,10 +105,17 @@ public struct DC42Image {
         let dataEnd = dataStart + expectedDataLen
         let actualDataPlane = [UInt8](data.subdata(in: dataStart..<dataEnd))
 
-        // Extract tag plane
-        let tagStart = dataEnd
-        let tagEnd = tagStart + expectedTagLen
-        let actualTagPlane = [UInt8](data.subdata(in: tagStart..<tagEnd))
+        // Extract tag plane -- or synthesize an all-zero one for a tagless
+        // container (expectedTagLen == 0), so `tag(block:)` never traps on
+        // an empty plane. See the type doc comment "Tagless containers".
+        let actualTagPlane: [UInt8]
+        if expectedTagLen == 0 {
+            actualTagPlane = [UInt8](repeating: 0, count: blockCount * 12)
+        } else {
+            let tagStart = dataEnd
+            let tagEnd = tagStart + expectedTagLen
+            actualTagPlane = [UInt8](data.subdata(in: tagStart..<tagEnd))
+        }
 
         self.dataPlane = actualDataPlane
         self.tagPlane = actualTagPlane

@@ -131,7 +131,11 @@ open -a LisaApp/LisaApp.xcodeproj  # or run the built .app directly
    load failure (bad path, malformed image) surfaces as a dismissible
    "Could Not Insert Disk" alert, never a crash. The status strip's new disk
    indicator (a small dot + "DISK" label, bottom-right) lights up once
-   attached.
+   attached. A tagless DC42 container (`tagLen == 0` — common for wild
+   Mac-disk DC42s, exactly what drag-and-drop invites) is accepted, not
+   rejected: `DC42Image` synthesizes zero tags, so it inserts and reads
+   cleanly and the Lisa-side boot rejects it gracefully instead of crashing
+   the emulator.
 2. **Click STARTUP FROM…**, then a device item in the list that opens — the
    same two clicks `ROMFloppyBootTests`/`EmulationControllerFloppyIntegrationTests`
    script automatically. Mouse/keyboard reach the Lisa through the existing
@@ -147,11 +151,26 @@ open -a LisaApp/LisaApp.xcodeproj  # or run the built .app directly
    the disk-activity flash, not new pixels.
 4. **Where it stops, and why**: the loader reaches its Lisa Pascal `trap #6`
    inter-segment call gate (`$A84000`, an unrelocated segment-base
-   placeholder) and halts forward progress there — a Lisa Pascal
-   segment-loader/relocation runtime dependency, not a device this emulator
-   is missing. That boundary is **M3**: resolving it needs the Pascal
-   segment-loader runtime, which is the next milestone's work, not more
+   placeholder) and halts forward progress there — no new peripheral would
+   get it further; whatever unblocks it is M3-scoped work, not more
    floppy/device modeling.
+
+   That said, the recorded facts (vector `$98` overwritten with the
+   unrelocated `$A84000` placeholder, domain-0 segment 84 mapped with
+   `SORG=$FE4` → phys `$1FC800`, `$A84000` translating to phys `$200800` —
+   just past this environment's 2 MB RAM end, and the placeholder bytes
+   baked into DC42 block 1 offset 478) support two different explanations,
+   not one settled conclusion: **(a)** the Pascal segment-loader/relocation
+   runtime genuinely hasn't executed yet at this point — real hardware stops
+   here too, and M3 implements that runtime; or **(b)** this is an
+   emulation divergence (MMU SORG/limit decode, OQ1's still-open
+   inactive-domain semantics, or a RAM-size-dependent path in the loader's
+   own relocation math) — real hardware runs this loader PAST this gate
+   using only 68000 + MMU + disk. **M3's first task is to discriminate the
+   two** — cheapest probe: re-run the same trace with a 1 MB RAM
+   configuration and see whether the stop point changes. See
+   `docs/rom-trace-notes.md` "OS loader (Task 6)" → "Two open hypotheses for
+   the stop" for the full citations.
 5. **Reset survives the inserted disk**: Machine > Reset (⌘R) warm-resets the
    CPU/ROM but the floppy stays inserted (Task 2's by-construction guarantee,
    proven end-to-end at the controller level by

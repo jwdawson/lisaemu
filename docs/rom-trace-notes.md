@@ -1200,13 +1200,56 @@ carry through:
   `unclamp`/`clristat`/`clrmask $88`, source-ldmicro:184-203) and re-enters
   `prom_monitor` (source-ldmicro:141-150) — i.e. it bombs back to the boot menu.
 
-**This TRAP-based segment loader is the documented M3 boundary — a Lisa Pascal
-*runtime* dependency (68000 trap-vector / segment-relocation semantics), not a
-device.** No new peripheral is required to get here, and none would get the
-loader past `trap #6`; resolving it needs the Pascal segment-loader/relocation
-runtime, which is M3's requirements work. Per the task brief's "stop at the
-documented boundary" rule, Task 6 stops here with the evidence above rather than
-scope-creeping into that runtime.
+**This TRAP-based segment loader is where forward progress stops in this
+environment — no new peripheral is required to get here, and none would get
+the loader past `trap #6` as this environment currently behaves.** Resolving
+it needs Pascal segment-loader/relocation runtime work in some form. Per the
+task brief's "stop at the documented boundary" rule, Task 6 stops here with
+the evidence above rather than scope-creeping into that runtime — but see
+the discrimination note directly below before treating that runtime work as
+the ONLY thing standing between here and further progress.
+
+### Two open hypotheses for the stop — not yet a settled conclusion
+
+Everything recorded above (the block-0/loader-progression anchors, the
+`trap #6` dispatch at `$100418`, vector `$98` holding the PROM's real handler
+at `$020000` entry and the unrelocated `$A84000` placeholder by the time the
+gate is reached, domain-0 segment-84 mapped with `SORG=$FE4`/`SLIM=$7DB`
+(origin phys `$1FC800`), logical `$A84000` translating to phys `$200800`, and
+the `22 7C 00 A8 40 00` placeholder bytes baked into DC42 block 1 offset 478)
+is a solid, reproducible FACT pattern. What is NOT yet settled is the causal
+conclusion drawn from it — WHY forward progress stops here, in THIS
+environment. Two hypotheses both fit every anchor above:
+
+- **(a) Genuine runtime boundary.** The Pascal segment-loader/relocation code
+  that resolves `trap #6` and fixes up the `$A84000` placeholder to the
+  loader's real `$100000` load base simply has not run yet at this point in
+  the sequence — on real Lisa hardware as much as here — and implementing
+  that machinery is exactly M3's scoped requirements work, independent of
+  anything this emulator gets wrong.
+- **(b) An emulation divergence masquerading as a runtime boundary.** Real
+  Lisa hardware might run this identical on-disk loader PAST this identical
+  gate using nothing more than a 68000 + MMU + disk. If so, something in this
+  environment's 68000/MMU modeling diverges from real silicon at or before
+  the gate. The anchors above point at three candidates: a subtly wrong MMU
+  SORG/limit decode for the seg-84 mapping (exactly the kind of error that
+  would make `$A84000` land at phys `$200800`, just past this environment's
+  2 MB RAM end, instead of somewhere the loader actually populated); OQ1's
+  still-undischarged inactive-domain semantics (this IS the first live,
+  post-POST SLIM/SORG programming of a fresh segment by running OS code, per
+  the sanity sweep below — the first place OQ1 could actually bite); or some
+  other RAM-size-dependent path in the loader's own relocation math
+  (`ldbase = prom_realsize/2`, i.e. `$100000` only because this environment
+  always runs the hardware-max 2 MB configuration).
+
+**M3's first task is to discriminate (a) from (b), not to assume (a).** The
+cheapest available probe: re-run this exact loader trace with a 1 MB RAM
+configuration instead of 2 MB (`ldbase` becomes `$80000`, not `$100000`). A
+genuine runtime boundary (a) predicts the SAME `trap #6`-at-`$A84000` stop
+regardless of RAM size; the RAM-size-dependent strand of (b) predicts a
+DIFFERENT stop point or failure mode. Only after that probe should M3 commit
+its scope to segment-loader-runtime implementation as the confirmed correct
+next investment, rather than as the untested default assumption it is today.
 
 ### Sanity-negative sweep (device / interrupt / MMU / screen)
 

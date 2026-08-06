@@ -125,5 +125,104 @@ extension MusashiSuites {
             #expect(m.bus.read16(0x0002_0004) == 0xAAAA,
                     "boot block should carry the $AAAA signature the loader verifies")
         }
+
+        /// Drives the same menu selection as the checkpoint-C springboard, then
+        /// runs the boot block ("ldsony"/ldmicro loader-loader, source-ldmicro)
+        /// into the OS loader and stops the instant the loader installs its own
+        /// TRAP #6 vector -- the point of maximal, stable progress. Returns the
+        /// booted machine parked there; the loader-execution markers are then
+        /// asserted by the caller. See docs/rom-trace-notes.md "OS loader
+        /// (Task 6)" for the full journey narrative + citations.
+        private func bootIntoLoader() throws -> Machine {
+            let m = try bootedWithDisk()
+            m.run(until: 18_000_000)
+            moveCursor(m, to: 420, 182); click(m)         // "STARTUP FROM..."
+            m.run(until: m.cycles + 3_000_000)
+            moveCursor(m, to: 88, 33); click(m)           // top device item
+            // Step into the loaded boot block at $020000.
+            let lim0 = m.cycles + 40_000_000
+            while m.cycles < lim0 && !m.halted && m.cpu[.pc] != 0x0002_0000 { _ = m.step() }
+            // Follow the loader until it dispatches through its own
+            // (unrelocated) TRAP #6 segment-call gate, i.e. PC reaches the
+            // placeholder segment base $A84000. By this instant ldmicro has
+            // relocated itself to $100000, read its remaining code blocks + the
+            // LFS MDDF, written the loader hand-off cells, mapped its Pascal
+            // code segment 84, and the compiled Pascal loader has overwritten
+            // the PROM's TRAP #6 vector ($FE1D14) with $A84000 -- the point of
+            // maximal, stable progress (docs/rom-trace-notes.md "OS loader
+            // (Task 6)"). ~0.4M cycles past $020000.
+            let lim1 = m.cycles + 5_000_000
+            while m.cycles < lim1 && !m.halted && m.cpu[.pc] != 0x00A8_4000 { _ = m.step() }
+            return m
+        }
+
+        /// **M2 EXIT CRITERION -- the OS loader executes from RAM and makes
+        /// documented progress.** After the menu selection boots the floppy,
+        /// the Rev H PROM's twig_entry RWTS reads block 0 (the "ldsony"
+        /// loader-loader, source-ldmicro) to `$020000` and JMPs into it; the
+        /// loader-loader then:
+        ///   1. relocates itself to `prom_realsize/2` = `$100000`
+        ///      (`ldbaseptr` cell `$21C`; source-ldmicro:77-79 / LDEQU:35,66),
+        ///   2. reads its remaining code blocks **and the LFS MDDF** off the
+        ///      floppy via twig_entry (`blocksRead` climbs to 24 -- 23 code
+        ///      blocks + block 28, the MDDF the loader's own `fs_block0` field
+        ///      names), every read `lastError == 0`,
+        ///   3. writes the loader hand-off cells: `dev_type` (`$22E`) = 2
+        ///      (`dev_sony`; source-ldmicro:124 / LDEQU:32,40), `ld_fs_block0`
+        ///      (`$210`) = `$1C` (MDDF block; LDEQU:29), `log_volume` (`$212`)
+        ///      = 1 (LDEQU:30),
+        ///   4. maps its Pascal code segment 84 (logical `$A80000`) live via
+        ///      the MMU and enters the compiled Pascal loader (source-ldlfs),
+        ///      then reaches its Pascal inter-segment call gate `trap #6`,
+        ///      installing an (unrelocated) `$A84000` handler at vector `$98`.
+        /// Step 4's TRAP-based segment loader is the documented M3 boundary --
+        /// a Lisa Pascal runtime dependency, not a device (see the report /
+        /// rom-trace-notes.md). This test asserts the loader-execution markers
+        /// at the point it is reached; robust invariants alongside the exact
+        /// deterministic anchors.
+        @Test func osLoaderExecutesFromRAMAndReachesPascalSegmentGate() throws {
+            let m = try bootIntoLoader()
+
+            // The loader relocated itself to the RAM midpoint and ran there.
+            #expect(m.bus.read32(0x21C) == 0x0010_0000,
+                    "ldbaseptr ($21C) should be prom_realsize/2 = $100000")
+            #expect(m.bus.read32(0x2A8) == 0x0020_0000,
+                    "the PROM should have reported prom_realsize ($2A8) = 2 MB")
+
+            // It read its own code blocks + the LFS MDDF off the floppy.
+            #expect(m.bus.floppy.blocksRead >= 20,
+                    "the loader should read many blocks off the floppy (loading itself + the MDDF); got \(m.bus.floppy.blocksRead)")
+            #expect(m.bus.floppy.blocksRead == 24,
+                    "exact anchor: 23 loader code blocks + block 28 (MDDF) = 24")
+            #expect(m.bus.floppy.lastError == 0,
+                    "every loader block read should succeed (DISKERR 0)")
+
+            // It wrote the loader hand-off cells (source-ldmicro:121-125).
+            #expect(m.bus.read16(0x22E) == 2,
+                    "dev_type ($22E) should be dev_sony (2)")
+            #expect(m.bus.read16(0x210) == 0x001C,
+                    "ld_fs_block0 ($210) should be the MDDF block $1C")
+            #expect(m.bus.read16(0x212) == 1,
+                    "log_volume ($212) should be drive 1")
+
+            // It entered the Pascal loader and reached its trap-based segment
+            // gate: the PROM's ROM TRAP #6 vector was overwritten with the
+            // loader's own (unrelocated) $A84000 segment-loader placeholder.
+            #expect(m.bus.read32(0x98) == 0x00A8_4000,
+                    "the loader should install its own TRAP #6 handler ($A84000) over the PROM's ($FE1D14)")
+
+            // It programmed a new MMU segment (84, its Pascal code segment)
+            // live -- more SLIM/SORG writes than the 4384 POST leaves behind.
+            #expect(m.bus.mmuPortWrites > 4384,
+                    "the loader should program its Pascal code segment via the MMU; got \(m.bus.mmuPortWrites)")
+
+            // The loader draws nothing before the segment gate: the boot-menu
+            // framebuffer content is still present (not blanked/redrawn).
+            let px = m.bus.framebufferSnapshot().reduce(0) { $0 + $1.nonzeroBitCount }
+            #expect(px > 70_000,
+                    "the menu framebuffer should still be present (loader draws nothing pre-gate); got \(px)")
+
+            #expect(!m.halted, "the loader run is a live progression, not a halt")
+        }
     }
 }

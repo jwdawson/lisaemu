@@ -20,12 +20,8 @@ public struct DC42Image {
     public enum Error: Swift.Error, Equatable {
         /// Container header is too short.
         case headerTooShort
-        /// Data plane size in header does not match actual data plane size.
-        case dataSizeMismatch(expected: Int, found: Int)
-        /// Tag plane size in header does not match actual tag plane size.
-        case tagSizeMismatch(expected: Int, found: Int)
-        /// Container is truncated or incomplete.
-        case truncatedContainer
+        /// Container size does not match expected header dimensions (too small or has trailing garbage).
+        case sizeMismatch(expected: Int, found: Int)
     }
 
     private let dataPlane: [UInt8]
@@ -33,13 +29,12 @@ public struct DC42Image {
 
     /// Initializes a DC42Image from raw container data.
     ///
-    /// Validates the container format by checking:
+    /// Validates the container format strictly by checking:
     /// - Header is at least 84 bytes
-    /// - Data plane size from header matches actual data
-    /// - Tag plane size from header matches actual tags
-    /// - Container has sufficient data for both planes
+    /// - Container size matches exactly: header (84) + data + tag planes
+    ///   (rejects truncated or corrupted images with trailing garbage)
     ///
-    /// - Parameter data: Raw container bytes (header + data plane + tag plane)
+    /// - Parameter data: Raw container bytes (header + data plane + tag plane, exact size)
     /// - Throws: ``Error`` if validation fails
     public init(data: Data) throws {
         // Minimum header size is 84 bytes
@@ -55,10 +50,11 @@ public struct DC42Image {
         let tagLenBytes = data.subdata(in: 68..<72)
         let expectedTagLen = Int(UInt32(bigEndian: tagLenBytes.withUnsafeBytes { $0.load(as: UInt32.self) }))
 
-        // Check that container has enough data for both planes
+        // Container must be exactly: header + data plane + tag plane
+        // Rejects both truncation and trailing garbage.
         let expectedTotalSize = 84 + expectedDataLen + expectedTagLen
-        guard data.count >= expectedTotalSize else {
-            throw Error.truncatedContainer
+        guard data.count == expectedTotalSize else {
+            throw Error.sizeMismatch(expected: expectedTotalSize, found: data.count)
         }
 
         // Extract data plane
@@ -66,20 +62,10 @@ public struct DC42Image {
         let dataEnd = dataStart + expectedDataLen
         let actualDataPlane = [UInt8](data.subdata(in: dataStart..<dataEnd))
 
-        // Verify data plane size
-        guard actualDataPlane.count == expectedDataLen else {
-            throw Error.dataSizeMismatch(expected: expectedDataLen, found: actualDataPlane.count)
-        }
-
         // Extract tag plane
         let tagStart = dataEnd
         let tagEnd = tagStart + expectedTagLen
         let actualTagPlane = [UInt8](data.subdata(in: tagStart..<tagEnd))
-
-        // Verify tag plane size
-        guard actualTagPlane.count == expectedTagLen else {
-            throw Error.tagSizeMismatch(expected: expectedTagLen, found: actualTagPlane.count)
-        }
 
         self.dataPlane = actualDataPlane
         self.tagPlane = actualTagPlane
@@ -92,24 +78,30 @@ public struct DC42Image {
 
     /// Retrieves the 512-byte data for a given block.
     ///
+    /// Returns a zero-based array that can be safely indexed with subscripts 0..<512.
+    ///
     /// - Parameter block: Block index (0-based)
-    /// - Returns: 512-byte slice of the data plane
+    /// - Returns: 512-byte array copy of the block data
     /// - Precondition: `block` must be in range `0..<blockCount`
-    public func data(block: Int) -> ArraySlice<UInt8> {
+    public func data(block: Int) -> [UInt8] {
+        precondition(block >= 0 && block < blockCount, "block \(block) out of range [0..<\(blockCount)]")
         let start = block * 512
         let end = start + 512
-        return ArraySlice(dataPlane[start..<end])
+        return Array(dataPlane[start..<end])
     }
 
     /// Retrieves the 12-byte tag for a given block.
     ///
+    /// Returns a zero-based array that can be safely indexed with subscripts 0..<12.
+    ///
     /// - Parameter block: Block index (0-based)
-    /// - Returns: 12-byte slice of the tag plane
+    /// - Returns: 12-byte array copy of the block tag
     /// - Precondition: `block` must be in range `0..<blockCount`
-    public func tag(block: Int) -> ArraySlice<UInt8> {
+    public func tag(block: Int) -> [UInt8] {
+        precondition(block >= 0 && block < blockCount, "block \(block) out of range [0..<\(blockCount)]")
         let start = block * 12
         let end = start + 12
-        return ArraySlice(tagPlane[start..<end])
+        return Array(tagPlane[start..<end])
     }
 
     /// Loads a DC42 image from a file URL.

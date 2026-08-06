@@ -270,47 +270,93 @@ extension MusashiSuites {
                     "do_an_mmu programmed at least one segment past the gate; got \(m.bus.mmuPortWrites)")
         }
 
-        /// **M3 Task 2 -- Checkpoint D frontier: the loader's full domain-0 MMU
-        /// build, then the domain-1 crossover (OQ1 forcing point).** Past the
-        /// gate the loader drives `do_an_mmu` (via `prog_mmu`, LDASM:257-275)
-        /// once per segment to program **all of domain 0** -- ~127 trap-#6 calls
-        /// walking segment indices up through `$7F` -- then issues a call
-        /// targeting **domain 1, segment 0** (`d2=1, d3=0`). `do_an_mmu`
-        /// switches the live context to domain 1 (`ctbit1on`, `$A8402E`) and
-        /// keeps executing its own seg-84 code there; but domain 1 is still
-        /// empty (the loader has only just begun building it), so the in-handler
-        /// fetch/exception-vector access finds nothing mapped and the CPU
-        /// double-faults to a halt. THIS is the documented Checkpoint-D
-        /// frontier: a genuine multi-domain-bootstrap boundary and OQ1's
-        /// long-predicted forcing point (per-domain vs. global segment
-        /// semantics -- see rom-trace-notes.md "Checkpoint D" / OQ1). Anchored
-        /// on robust invariants of that furthest reproducible state; no floppy
-        /// writes occur anywhere on this path (Deliverable #3: none observed).
-        @Test func loaderBuildsDomain0MMUThenHaltsAtTheDomain1Crossover() throws {
+        /// **M3 Task 4 -- the domain-1 crossover SURVIVES (OQ1′ resolved) and
+        /// the boot loads the OS image, reaching the OS's own COPS driver.**
+        ///
+        /// Past the gate the loader drives `do_an_mmu` once per segment to
+        /// program all of domain 0, then issues the pivot call targeting
+        /// **domain 1** (`d2=1`). `do_an_mmu` switches the live context to
+        /// domain 1 (`ctbit1on`, `$A8402E`) with SETUP OFF and keeps executing
+        /// its own seg-84 code there. Under M3 Task 2 this **double-faulted to
+        /// a halt** because our per-domain-independent model left domain 1
+        /// empty. OQ1′ (M3 Task 4) resolved it: **supervisor-mode translation
+        /// uses the OS domain (0) regardless of the context latch** -- domains
+        /// 1-3 are user-process domains, and `do_an_mmu`/`SET_DOMAIN` flip the
+        /// latch while in supervisor and keep running domain-0 code (see
+        /// `Bus.translationDomain`, rom-trace-notes.md "Kernel push (M3 Task
+        /// 4)"). With the pivot surviving, the loader BUILDS domain 1's
+        /// register file (SLIM/SORG writes climb well past the 4638 gate), the
+        /// loader completes and **reads the OS image off the floppy**
+        /// (`blocksRead` 24 -> 75, all via the PROM read routine `$FE1E4C`),
+        /// and control enters loaded OS code at `$520000` -- specifically the
+        /// OS's own **COPS command-send driver** (`$520824`, the same
+        /// stage-to-IORA2 / drive-via-DDRA2 / poll-CRDY protocol the ROM uses,
+        /// COPS.swift type doc "command-send protocol"). That driver is the M3
+        /// Task 4 STOP: it spins on CRDY because our simplified COPS model
+        /// drops CRDY on the register-15 *no-handshake* staging write it issues
+        /// every poll iteration -- a genuinely-new subsystem boundary (the
+        /// OS-driven COPS, vs the ROM's) documented as an M4 requirement
+        /// (rom-trace-notes.md "Kernel push" / hardware-notes.md §4).
+        ///
+        /// Anchored on robust invariants + exact deterministic markers of that
+        /// furthest reproducible state; NO bus error, NO halt, NO floppy write
+        /// anywhere on the path.
+        @Test func domain1CrossoverSurvivesLoaderLoadsOSImageAndReachesTheCOPSDriver() throws {
             let m = try bootIntoLoader()
             let mmuAtGate = m.bus.mmuPortWrites
 
             var trap6Calls = 0
             var sawDomain1 = false
+            var returnedToDomain0AfterD1 = false
+            var reachedCopsDriver = false
             var prevPC: UInt32 = 0
             for _ in 0..<400_000 {
                 let pc = m.cpu[.pc]
                 if pc == 0x00A8_4000 && prevPC != 0x00A8_4000 { trap6Calls += 1 }
                 if m.bus.domain == 1 { sawDomain1 = true }
+                if sawDomain1 && m.bus.domain == 0 { returnedToDomain0AfterD1 = true }
+                // The OS COPS command-send driver lives at $520800-$5208FF.
+                if pc >= 0x0052_0800 && pc <= 0x0052_08FF { reachedCopsDriver = true; break }
                 prevPC = pc
                 _ = m.step()
                 if m.halted { break }
             }
 
-            #expect(m.halted, "the boot halts at the multi-domain bootstrap boundary (Checkpoint D frontier)")
+            // OQ1′: the pivot survives -- no double fault, no halt.
+            #expect(!m.halted,
+                    "the domain-1 crossover no longer double-faults to a halt (OQ1′ resolved)")
+            #expect(m.bus.busErrorPulseCount == 0,
+                    "no bus error anywhere across the domain-1 crossover; got \(m.bus.busErrorPulseCount)")
+            #expect(sawDomain1,
+                    "the loader crosses the live context into domain 1 (the OQ1′ pivot)")
+            #expect(returnedToDomain0AfterD1,
+                    "do_an_mmu establishes domain 1, programs it, and restores domain 0 -- it RETURNS, it does not derail")
+
+            // The loader built domain 0 (many trap-#6 calls) and then domain 1
+            // (SLIM/SORG writes climb well past the 4638 gate value).
             #expect(trap6Calls >= 120,
                     "the loader programs ~all of domain 0 via many do_an_mmu calls; got \(trap6Calls)")
             #expect(m.bus.mmuPortWrites > mmuAtGate,
-                    "each do_an_mmu programmed segments -- SLIM/SORG writes climbed past the gate (\(mmuAtGate) -> \(m.bus.mmuPortWrites))")
-            #expect(sawDomain1,
-                    "the loader crosses into domain 1 -- the OQ1 forcing point -- before halting")
+                    "domain-1 build: SLIM/SORG writes climbed past the gate (\(mmuAtGate) -> \(m.bus.mmuPortWrites))")
+
+            // The loader completed and read the OS image off the floppy.
+            #expect(m.bus.floppy.blocksRead >= 70,
+                    "the loader reads the OS image off the floppy; got \(m.bus.floppy.blocksRead)")
+            #expect(m.bus.floppy.blocksRead == 75,
+                    "exact anchor: 24 (loader + MDDF) + 51 OS-image blocks = 75")
+            #expect(m.bus.floppy.lastError == 0,
+                    "every OS-image block read succeeds (DISKERR 0)")
+
+            // Control reached loaded OS code -- the OS's own COPS command-send
+            // driver (the M3 Task 4 documented STOP / M4 boundary).
+            #expect(reachedCopsDriver,
+                    "the boot reaches loaded OS code -- the COPS command-send driver at $520800-$5208FF")
+            #expect((0x0052_0800...0x0052_08FF).contains(m.cpu[.pc]),
+                    "furthest state: parked in the OS COPS driver; got \(String(format: "$%06X", m.cpu[.pc]))")
+
+            // No floppy WRITE is ever issued on the whole path.
             #expect(m.bus.floppy.writeAttempts == 0,
-                    "no floppy WRITE is issued anywhere on the Checkpoint-D path (no-writes-observed)")
+                    "no floppy WRITE anywhere on the kernel-push path (no-writes-observed)")
         }
     }
 }

@@ -983,6 +983,25 @@ zone/track/sector/side:
   in M1b), `$C015` currently unknown-I/O `0xFF` → Task 4 sets `$C015`=1
   (single-sided, matches 400K install disks), Task 5 validates against the
   boot path with trace evidence.
+- **Task 4 update:** `$C015` now returns `1` (was `0xFF` unknown-I/O), per
+  the line above. The `$C000-$C7FF` window (`FloppyController`, this
+  section's shared-RAM cells) is now live RAM served by that device;
+  `$C031` is UNCHANGED (still the Task-3-era `0` stub, checked before the
+  window range in `IODispatcher.currentValue` so it isn't shadowed by it).
+  Re-ran the full ROM-gated boot suite (`ROMBootTests`,
+  `LISAEMU_ROM_DIR=... swift test`) after this change: the exact boot-menu
+  anchor (`romCompletesPOSTAndReachesBootMenu`'s FNV hash
+  `0xd09234d25516d0b8` / 78,100 set pixels) is UNCHANGED, because the
+  traced boot path never reaches the floppy driver at all (it parks at the
+  `$FE2DBE` COPS input-idle loop before ever touching `$FCC0xx`) — so
+  neither the `$C015` value change nor the new window is observed on this
+  path yet. See `FloppyController.swift`'s type doc comment for the HLE
+  model (go-byte state machine, zone mapping, completion-line wiring) and
+  its two flagged, Task-5-revisable assumptions: the completion line's
+  IDLE/ASSERTED polarity (chosen idle=0/asserted=1, since the alternative
+  risked a spurious permanently-asserted level-1 bit on the current boot
+  path) and the DISKERR raw-byte values (inferred as the documented
+  OS-level error codes minus the `1800` offset, not independently cited).
 
 ### Could Not Find
 

@@ -26,16 +26,38 @@ struct LisaEmuApp: App {
                 .environment(model)
                 .onAppear {
                     appDelegate.model = model // see AppDelegate's doc comment
+                    model.insertDiskIfRequested()
                     model.runAutoScreenshotIfRequested()
                 }
         }
         .windowResizability(.contentSize)
         .commands {
+            CommandGroup(after: .newItem) {
+                Button("Insert Disk…") {
+                    presentInsertDiskPanel()
+                }
+                .keyboardShortcut("i", modifiers: [.command])
+
+                Button("Eject") {
+                    model.ejectFloppy()
+                }
+            }
             CommandGroup(after: .saveItem) {
                 Button("Save Screenshot…") {
                     presentSaveScreenshotPanel()
                 }
             }
+            // CONSCIOUS DEFERRAL (M2 Task 7, re-recorded from M1c's own
+            // deferral of the same item): no "Power" menu item here.
+            // `LisaCore.COPS.powerCommandLog` already exists (captures the
+            // OS-driven soft-power-off command byte sequence) and the M2
+            // Task 7 brief explicitly named this a task-7 candidate, but a
+            // Power menu belongs together with M3's soft-power/Widget work
+            // (a real power-off needs somewhere to GO -- suspend the
+            // emulation thread, show a "powered off" UI state, etc. -- none
+            // of which exists yet). This task instead lands the disk-
+            // activity status-strip indicator, M1c's OTHER still-open
+            // deferred item. Deliberate, not lost -- see task-7-report.md.
             CommandMenu("Machine") {
                 Button(model.running ? "Pause" : "Start") {
                     model.toggleRunning()
@@ -83,6 +105,28 @@ struct LisaEmuApp: App {
                 guard let data else { return }
                 try? data.write(to: url)
             }
+        }
+    }
+
+    /// File > Insert Disk… (M2 Task 7, ⌘I). `NSOpenPanel` filtered to
+    /// `.dc42` files -- DC42 has no registered system UTType, so this
+    /// constructs one BY EXTENSION (`UTType(filenameExtension:)`), matching
+    /// the drag-and-drop filter's identical extension check
+    /// (`AppModel.isDC42File`, `ScreenView.swift`'s `.onDrop`). Falls back
+    /// to `.data` (accept anything) if `UTType(filenameExtension:)` somehow
+    /// returns `nil` -- it shouldn't for a well-formed extension string,
+    /// but degrading to "no filter" is strictly safer than crashing on a
+    /// force-unwrap for a cosmetic panel filter.
+    @MainActor
+    private func presentInsertDiskPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "dc42") ?? .data]
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            model.insertFloppy(url: url)
         }
     }
 }

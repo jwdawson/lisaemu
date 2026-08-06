@@ -1,6 +1,7 @@
 import AppKit
 import LisaShell
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// The live Lisa screen (blit of `AppModel.image`) plus a one-line status
 /// bar, per the plan's Task 3 interfaces ("a status bar (cycles, emulated
@@ -76,6 +77,32 @@ struct ScreenView: View {
         } message: {
             Text(model.startupError ?? "")
         }
+        // M2 Task 7: dismissible (unlike the fatal ROM alert above) --
+        // see `AppModel.diskError`'s doc comment.
+        .alert("Could Not Insert Disk",
+               isPresented: Binding(get: { model.diskError != nil },
+                                     set: { if !$0 { model.dismissDiskError() } })) {
+            Button("OK", role: .cancel) { model.dismissDiskError() }
+        } message: {
+            Text(model.diskError ?? "")
+        }
+        // M2 Task 7: drag-and-drop of a .dc42 file anywhere onto the window
+        // inserts it -- the same `insertFloppy(url:)` entry point as File >
+        // Insert Disk…/`--insert-disk`. `NSItemProvider.loadItem` runs its
+        // completion off the main thread (undocumented but empirically
+        // true, and not contractually main-thread per its own API), so the
+        // `AppModel` call is hopped back to main explicitly rather than
+        // assumed synchronous.
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, AppModel.isDC42File(url) else { return }
+                DispatchQueue.main.async {
+                    model.insertFloppy(url: url)
+                }
+            }
+            return true
+        }
         .onAppear {
             if inputCapture == nil {
                 let capture = InputCapture(model: model)
@@ -101,6 +128,10 @@ struct ScreenView: View {
                     Divider().frame(height: 12)
                     Text("HALTED").foregroundStyle(.red)
                 }
+                if status.diskInserted {
+                    Divider().frame(height: 12)
+                    diskIndicator(active: status.diskActivity)
+                }
             } else {
                 Text("starting…")
             }
@@ -115,6 +146,27 @@ struct ScreenView: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .background(.bar)
+    }
+
+    /// M2 Task 7's status-strip disk indicator: a small colored dot (an
+    /// SF Symbol was deliberately avoided here -- there is no well-known
+    /// "floppy disk" glyph in the system symbol set to reach for with
+    /// confidence, and a missing/wrong symbol name fails silently at
+    /// runtime rather than at build time) plus a "DISK" label, shown only
+    /// while `EmuStatus.diskInserted` is true (see `statusBar`, above).
+    /// `active` (`EmuStatus.diskActivity`) recolors the dot green -- the
+    /// "activity flash": since it only ever reflects the MOST RECENT
+    /// ~0.25s status publish (`EmulationController`'s own publish cadence),
+    /// a real floppy access shows as a brief green flash rather than a
+    /// literal instantaneous blink, which is the right granularity for a
+    /// human glancing at the status strip.
+    private func diskIndicator(active: Bool) -> some View {
+        HStack(spacing: 4) {
+            Circle()
+                .fill(active ? Color.green : Color.secondary)
+                .frame(width: 6, height: 6)
+            Text("DISK")
+        }
     }
 }
 

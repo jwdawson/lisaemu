@@ -33,6 +33,16 @@ final class AppModel {
     /// than crashing or silently doing nothing.
     private(set) var startupError: String?
 
+    /// M2 Task 7: set from `EmulationController.onDiskError` when
+    /// `insertFloppy(url:)` fails to load the image (bad path, malformed
+    /// DC42 container). Unlike `startupError`, this is DISMISSIBLE --
+    /// `ScreenView`'s alert clears it via `dismissDiskError()` -- because a
+    /// bad disk pick is recoverable (unlike a missing ROM, which leaves the
+    /// app with nothing to run). See `EmulationController.onDiskError`'s
+    /// doc comment for why this is a callback rather than an `EmuStatus`
+    /// field.
+    private(set) var diskError: String?
+
     /// Optimistic local mirror of "should the emulation thread be
     /// running" -- `EmulationController` has no synchronous getter for
     /// this (mailbox-only), so `start()`/`pause()` set it immediately for
@@ -163,10 +173,62 @@ final class AppModel {
                 self?.status = status
             }
         }
+        controller.onDiskError = { [weak self] message in
+            DispatchQueue.main.async {
+                self?.diskError = message
+            }
+        }
     }
 
     private func apply(_ frame: Frame) {
         image = AppModel.makeCGImage(frame: frame, scratch: &pixelScratch)
+    }
+
+    // MARK: - Floppy (M2 Task 7): File > Insert Disk…/Eject, drag-and-drop
+
+    /// File > Insert Disk… (`LisaApp.swift`'s `NSOpenPanel`) and the
+    /// drag-and-drop handler (`ScreenView.swift`'s `.onDrop`) both funnel
+    /// through here -- a thin passthrough to `EmulationController
+    /// .insertFloppy(url:)`, matching `post(_:)`'s existing "controller is
+    /// private, everything else reaches it through `AppModel`" boundary.
+    func insertFloppy(url: URL) {
+        controller?.insertFloppy(url: url)
+    }
+
+    /// File > Eject.
+    func ejectFloppy() {
+        controller?.ejectFloppy()
+    }
+
+    /// Dismisses `diskError`'s alert (`ScreenView.swift`) -- see that
+    /// property's doc comment for why it's dismissible, unlike
+    /// `startupError`.
+    func dismissDiskError() {
+        diskError = nil
+    }
+
+    /// Pure predicate behind the drag-and-drop filter (`ScreenView.swift`'s
+    /// `.onDrop`): only a `.dc42` file is accepted as an insertable floppy
+    /// image, matching File > Insert Disk…'s `NSOpenPanel` filter
+    /// (`LisaApp.swift`'s `presentInsertDiskPanel`). Extracted as a
+    /// `nonisolated static` pure function (no `AppModel` instance state) so
+    /// `LisaAppTests` can exercise it directly without a real drag session
+    /// -- same shape as `InputCapture.isReservedMenuShortcut`.
+    nonisolated static func isDC42File(_ url: URL) -> Bool {
+        url.pathExtension.lowercased() == "dc42"
+    }
+
+    /// Supports `--insert-disk <path>`: a debug-only launch argument,
+    /// alongside `--auto-screenshot`, that inserts a floppy image at launch
+    /// without needing a human to drive `NSOpenPanel` or drag-and-drop --
+    /// the manual verification checkpoint's "boot with a disk already in
+    /// the drive" scenario. Called from `LisaEmuApp.swift`'s `.onAppear`,
+    /// same as `runAutoScreenshotIfRequested()`. Inert (no-op) unless the
+    /// argument is present.
+    func insertDiskIfRequested() {
+        let args = CommandLine.arguments
+        guard let flagIndex = args.firstIndex(of: "--insert-disk"), args.count > flagIndex + 1 else { return }
+        insertFloppy(url: URL(fileURLWithPath: args[flagIndex + 1]))
     }
 
     // MARK: - Machine menu actions

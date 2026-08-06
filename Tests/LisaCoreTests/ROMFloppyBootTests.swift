@@ -231,5 +231,86 @@ extension MusashiSuites {
 
             #expect(!m.halted, "the loader run is a live progression, not a halt")
         }
+
+        /// **M3 Task 2 -- the fallen gate has a boot-level guard.** The prior
+        /// test parks AT `$A84000`; this one steps THROUGH it to prove the M3
+        /// Task 1 MMU-wrap fix (plus the setup-latch translation fix, M3 Task 2)
+        /// let `do_an_mmu` actually EXECUTE at its wrapped home and RETURN.
+        /// `do_an_mmu` (LDASM:305-446) runs entirely in seg-84 (logical
+        /// `$A84xxx` -> phys `$800`), toggling SETUP on inside its own loop
+        /// while it keeps fetching its code and reading the SMT from that same
+        /// window -- which only works because SETUP does not disturb live
+        /// translation (Bus.swift setup-mode translate-else-flat; docs/
+        /// hardware-notes.md §1 "Setup Latch", rom-trace-notes.md "Checkpoint
+        /// D"). It then `rte`s to the loader's `prog_mmu` return site,
+        /// `$10041A` (the trap frame's stacked PC), with NO bus error -- the
+        /// gate is gone. Without either fix the CPU derailed off seg-84 into
+        /// garbage and bombed to the ROM error entry `$FE0030`.
+        @Test func doAnMmuExecutesAtItsWrappedHomeAndReturnsToLoader() throws {
+            let m = try bootIntoLoader()
+            #expect(m.cpu[.pc] == 0x00A8_4000, "bench parks at the trap #6 gate")
+            #expect(m.bus.busErrorPulseCount == 0, "no fault reaching the gate")
+
+            // Step through do_an_mmu until control re-enters the relocated
+            // loader ($100000-$10FFFF); it must be the trap-#6 return site.
+            var backInLoader: UInt32? = nil
+            for _ in 0..<4000 {
+                _ = m.step()
+                let pc = m.cpu[.pc]
+                if pc >= 0x0010_0000 && pc < 0x0011_0000 { backInLoader = pc; break }
+            }
+            #expect(backInLoader == 0x0010_041A,
+                    "do_an_mmu should rte to prog_mmu's return site $10041A; got \(backInLoader.map { String(format: "$%06X", $0) } ?? "none")")
+            #expect(m.bus.busErrorPulseCount == 0,
+                    "do_an_mmu executes cleanly at its wrapped home -- no bus error, no $FE0030 bounce")
+            #expect(!m.halted, "the boot advances past the gate, it does not halt at it")
+            // The wrapped-home execution really programmed a segment: SLIM/SORG
+            // writes climbed past the count captured at the gate.
+            #expect(m.bus.mmuPortWrites > 4386,
+                    "do_an_mmu programmed at least one segment past the gate; got \(m.bus.mmuPortWrites)")
+        }
+
+        /// **M3 Task 2 -- Checkpoint D frontier: the loader's full domain-0 MMU
+        /// build, then the domain-1 crossover (OQ1 forcing point).** Past the
+        /// gate the loader drives `do_an_mmu` (via `prog_mmu`, LDASM:257-275)
+        /// once per segment to program **all of domain 0** -- ~127 trap-#6 calls
+        /// walking segment indices up through `$7F` -- then issues a call
+        /// targeting **domain 1, segment 0** (`d2=1, d3=0`). `do_an_mmu`
+        /// switches the live context to domain 1 (`ctbit1on`, `$A8402E`) and
+        /// keeps executing its own seg-84 code there; but domain 1 is still
+        /// empty (the loader has only just begun building it), so the in-handler
+        /// fetch/exception-vector access finds nothing mapped and the CPU
+        /// double-faults to a halt. THIS is the documented Checkpoint-D
+        /// frontier: a genuine multi-domain-bootstrap boundary and OQ1's
+        /// long-predicted forcing point (per-domain vs. global segment
+        /// semantics -- see rom-trace-notes.md "Checkpoint D" / OQ1). Anchored
+        /// on robust invariants of that furthest reproducible state; no floppy
+        /// writes occur anywhere on this path (Deliverable #3: none observed).
+        @Test func loaderBuildsDomain0MMUThenHaltsAtTheDomain1Crossover() throws {
+            let m = try bootIntoLoader()
+            let mmuAtGate = m.bus.mmuPortWrites
+
+            var trap6Calls = 0
+            var sawDomain1 = false
+            var prevPC: UInt32 = 0
+            for _ in 0..<400_000 {
+                let pc = m.cpu[.pc]
+                if pc == 0x00A8_4000 && prevPC != 0x00A8_4000 { trap6Calls += 1 }
+                if m.bus.domain == 1 { sawDomain1 = true }
+                prevPC = pc
+                _ = m.step()
+                if m.halted { break }
+            }
+
+            #expect(m.halted, "the boot halts at the multi-domain bootstrap boundary (Checkpoint D frontier)")
+            #expect(trap6Calls >= 120,
+                    "the loader programs ~all of domain 0 via many do_an_mmu calls; got \(trap6Calls)")
+            #expect(m.bus.mmuPortWrites > mmuAtGate,
+                    "each do_an_mmu programmed segments -- SLIM/SORG writes climbed past the gate (\(mmuAtGate) -> \(m.bus.mmuPortWrites))")
+            #expect(sawDomain1,
+                    "the loader crosses into domain 1 -- the OQ1 forcing point -- before halting")
+            #expect(m.bus.floppy.writeAttempts == 0,
+                    "no floppy WRITE is issued anywhere on the Checkpoint-D path (no-writes-observed)")
+        }
     }
 }

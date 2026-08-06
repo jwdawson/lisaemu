@@ -1008,3 +1008,104 @@ evidence:
 **No stall on the path to the menu requires a new subsystem.** The
 remaining open items (`$F801` bit 1 semantics, the `$D241` SCC, the M2
 bus-error frame) are all off the boot-to-menu path and correctly deferred.
+
+## Floppy boot (checkpoint C) — the ROM reads block 0 and runs it (M2 Task 5)
+
+With `FloppyController` live (`$C000-$C7FF` shared-RAM window, `$C015=1`,
+DISKIN reflecting insertion, DC42-served reads, VIA2 PB4 + own level-1
+completion) and a disk inserted (`swift run -c release lisadbg --rom
+$HOME/Development/LisaROMs --disk $HOME/Development/LisaImages/OS31_Install_1.dc42`),
+this section records how the Rev H boot ROM actually reaches, drives, and
+returns from its floppy read routine, and settles hardware-notes.md §9's two
+ambiguities from the disassembly. All findings are reproducible from
+`lisadbg` (`g`, `d`, `m`) and are pinned by `ROMFloppyBootTests` (env-gated on
+`LISAEMU_ROM_DIR` + `LISAEMU_DISK_DIR`).
+
+### The ROM does NOT auto-boot — and an inserted disk does NOT change the menu
+
+An unbounded single-step reachability trace (reset → 30 M cycles) with the disk
+inserted hits **none** of the boot-dispatch PCs (`$FE16E2` FIND_BOOT,
+`$FE1706`/`$FE1714` device probes, `$FE1BCC` Sony loader, `$FE1D76` read
+routine). The only boot-flow PC reached is `$FE2624` (the menu setup, at
+~16.2 M), and the ROM parks in the same `$FE2DBE-$FE2DD6` "await next COPS input
+byte" idle loop Task 7 documented. The power-on framebuffer with a disk inserted
+is **byte-identical** to the no-disk boot-menu anchor — same FNV-1a
+`0xd09234d25516d0b8`, same 78,100 set pixels, same crossed-out ProFile "42"
+icon. So `$1B3`/bootdev auto-boot does **not** fire on this ROM/board with no
+persistent parameter memory: the menu anchor is UNMOVED by an inserted disk
+(`ROMFloppyBootTests.diskInsertedAtPowerOnReachesTheIdenticalMenuAnchor`; the
+no-disk `ROMBootTests` anchors are untouched by this task).
+
+### Triggering the boot: a two-level menu selection
+
+A floppy boot is reached only through the menu. The `$53a` hit-test table at
+the idle loop holds the three menu buttons (`$F4` RESTART, `$F1` CONTINUE, `$F2`
+STARTUP FROM, rects at x∈[416,496]). Injecting mouse motion + a click (via
+`COPS.postMouse`/`postKey $06`, the M1c input channel) onto **STARTUP FROM**
+(`$F2`) opens a device-list window (the hit-test table becomes two items,
+`$F4 [16,16,160,50]` / `$F1 [16,50,160,84]`). Clicking a device item runs the
+Sony loader `$FE1BCC` → twig_entry (`$FE0094` → `$FE1D76`).
+
+### The read routine (`$FE1D76`) — go-bytes, cells, handshake
+
+```
+FE1D76: ori #$700,SR              ; mask interrupts for the transfer
+FE1D80: bsr $FE1E96               ; drain any stale completion (clristat if PB4 set)
+FE1D84: movep.l D1,($4,A0)        ; stage DRIV/HEAD/SEC/TRAK cells ($05/$07/$09/$0B), stride-2
+FE1D88: move.b D0,($C,A0)         ; drive-speed cell ($0D)
+FE1D8C: clr.b  ($2,A0)            ; DISKPARM ($03) = 0 = readdisk sub-command
+FE1D90: move.b #$81,(A0)          ; DISKCMD ($01) = excmd  -> FloppyController.performExCmd
+FE1D94: bsr $FE1E3E               ; WAIT COMPLETION: btst #$4,$FCDD81 / bne (VIA2 PB4 SET)
+FE1D9A: move.b ($10,A0),D0        ; read DISKERR ($11)
+FE1D9E: move.b #$CC,($2,A0)       ; DISKPARM = $CC
+FE1DA4: move.b #$85,(A0)          ; DISKCMD = clristat
+FE1DA8: bsr $FE1E04               ; WAIT READY: DISKCMD==0, gated on VIA1 $FCD901 PB6
+FE1DAC: tst.b D0 / bne error      ; DISKERR must be 0
+FE1DB0: lea ($3E8,A0),A4 ; movep  ; copy 12 tag bytes (odd lane $3E9,$3EB,…,$3FF)
+FE1DC6: lea ($400,A0),A4 ; movep  ; copy 512 data bytes (odd lane $401,$403,…,$7FF)
+```
+
+with `A0 = $FCC001` throughout. The command cells (`$01/$03/$05/…`) are the odd
+byte of each 68000 word — the 6504's 8-bit shared RAM — and `FloppyController`'s
+`Cell` offsets already matched them. Simple/probe commands elsewhere on the boot
+path use go-bytes `$86` enabstat, `$87` clrmask, `$88`→DISKPARM, `$85` clristat,
+and `$81` excmd with non-read sub-commands.
+
+### AMBIGUITY (a) SETTLED — buffer base `$400`, odd-lane stride-2
+
+`$FE1DC6: lea ($400,A0),A4` (A0=`$FCC001`) + `$FE1DCE: movep.l ($0,A4),D3`
+prove the data buffer BASE is **`$400`** (not the `$600` the SONYASM
+"DISKDATA+1024" reading implied), read with `movep.l` (stride 2) from the odd
+lane — so the 512 bytes live at window offsets `$401,$403,…,$7FF`, and the tag
+at `$3E9,…,$3FF` (`$FE1DB0`). `FloppyController` had been storing both buffers
+**contiguously** (`$400+i`), which this task's live trace exposed: the ROM read
+misaligned data, the loader's signature check failed, and it fell back to the
+menu (`blocksRead=3, lastError=9`, no RAM execution). **Fix (one constant's
+worth, per the §9 design):** `performRead` now writes `window[diskData+1+2*i]` /
+`window[diskHdr+1+2*i]`. After the fix the ROM reads block 0 in a single pass
+(`blocksRead=1, lastError=0`) and boots.
+
+### AMBIGUITY (b) SETTLED — `$FCD901` (VIA1) bit 6, no wiring needed
+
+The ready/handshake wait `$FE1E04` polls **VIA1 PORT B bit 6 at `$FCD901`**
+(`movea.l #$fcd901,A3` / `andi.b #$bf,($10,A3)` making PB6 an input /
+`btst #$6,(A3)`), NOT `$FCD801`. `$FCD901` is our ROM-established VIA1 base
+(§3), so the disk_control idle bit is literally a VIA1 port-B input line —
+resolving the OS-source `$D901`/`$D801` contradiction in favor of `$D901`. **No
+new wiring was required:** VIA1's `portBInput` defaults to `0xFF` (unconnected
+input floating high), so PB6 already reads 1 = idle/ready, exactly what the
+handshake needs. The completion wait (`$FE1E3E`) likewise confirms the
+completion-line polarity: it spins until VIA2 PORTB2 bit 4 is SET, matching
+`FloppyController`'s idle=0/asserted=1 choice.
+
+### The boot block: load address `$020000`, first instruction `4E FA` (JMP)
+
+After a clean block-0 read the loader verifies the boot-block signature
+(`$FE1EF2: cmpi.w #-$5556,D0` i.e. `$AAAA`, read from block offset 4), runs a
+contrast-DAC delay, and **JMPs into the loaded block at `$020000`** (cycle
+~33.1 M in the traced run). The block's first bytes are
+`4E FA 00 0E …` = `JMP (d16,PC)`, with the `$AAAA` signature at `$020004`.
+`ROMFloppyBootTests.menuSelectionReadsBlockZeroAndExecutesTheBootBlock` pins
+`blocksRead≥1`, `lastError==0`, `PC==$020000`, the `4E FA` opcode, and the
+`$AAAA` signature. **This is checkpoint C's stop line — the loader's journey
+beyond boot-block entry is Task 6.**

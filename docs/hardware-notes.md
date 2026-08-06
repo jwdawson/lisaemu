@@ -882,9 +882,17 @@ Key files: `OS/SOURCE-SONY.TEXT.unix.txt` (Pascal driver, Rich Castro),
   - `$3E8` DISKHDR (12-byte packed tag)
   - `$400` DISKDATA (512-byte sector buffer)
 
-**AMBIGUITY (a):** FINISH_READ/START_WRITE treat DISKDATA+1024 as the END of
-a 512-byte transfer (SONYASM:221-231,323-326) → live data may sit at
-`$600`-`$7FF`, not `$400`-`$5FF`. Settle from ROM disassembly (Task 5).
+**AMBIGUITY (a) — SETTLED (Task 5, boot-ROM disassembly + live trace).** The
+buffer base is **`$400`**, ~~not `$600`~~ (the SONYASM:221-231 "DISKDATA+1024"
+reading was a red herring). The Rev H boot ROM's own read routine (twig_entry
+`$FE1D76`) reads the data buffer at `$FE1DC6: lea ($400,A0),A4` with
+`A0 = $FCC001`, then copies it with `movep.l` (stride 2). So the 512 data bytes
+occupy the **ODD bytes** of the window — offsets `$401,$403,…,$7FF` — and the
+12-byte tag likewise at `$3E9,$3EB,…,$3FF` (`$FE1DB0: lea ($3E8,A0),A4`). This
+is the same odd-lane arrangement the single-byte command cells already use
+(`$01/$03/$05/…`): the 6504's 8-bit shared RAM sits on the odd byte of each
+68000 word. `FloppyController.performRead` writes the buffers on that odd lane
+accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
 
 ### Command Protocol
 
@@ -941,12 +949,19 @@ zone/track/sector/side:
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
 - **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
-- **disk_control idle bit — AMBIGUITY (b):** bit 6 of a byte at `$FCD901`
-  (LDEQU:47, boot ROM wait_drv LDTWIG:174-186) vs `$FCD801` (twiggy:258
-  computes `iospacemmu*$20000+$0D801`). In-source contradiction; settle from
-  ROM disassembly (Task 5). NOTE: `$FCD901` is ALSO our ROM-established
-  VIA1 base (§3) — plausibly the same address serving double duty (VIA1
-  port bit), which would resolve the contradiction in favor of `$D901`.
+- **disk_control idle bit — AMBIGUITY (b) — SETTLED (Task 5, boot-ROM
+  disassembly).** The Rev H boot ROM polls **bit 6 of `$FCD901`**, ~~not
+  `$FCD801`~~. Its handshake/ready wait (`$FE1E04`, called after every go-byte)
+  does `$FE1E14: movea.l #$fcd901,A3` / `$FE1E1A: andi.b #$bf,($10,A3)` (clear
+  DDRB1 bit 6 → make PB6 an input) / `$FE1E24: btst #$6,(A3)` — i.e. it reads
+  **VIA1 PORT B bit 6**. `$FCD901` is exactly our ROM-established VIA1 base
+  (§3), so the address serves double duty (a VIA1 port-B input line IS the
+  disk_control idle bit), resolving the in-source `$D901`/`$D801` contradiction
+  in favor of `$D901`. **No new wiring needed:** VIA1's `portBInput` defaults
+  to `0xFF` (an unconnected input floating high), so PB6 reads 1 = idle/ready,
+  which is exactly what the handshake requires — the ROM reads block 0 to
+  completion with the existing default. The `$FCD801` window remains unused by
+  the boot path. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
 
 ### Boot Path
 
@@ -970,6 +985,20 @@ zone/track/sector/side:
   (ldlfs).
 - **ProFile interleave table** for contrast (LDPROF:311-314): 0,5,10,15,4,
   9,14,3,8,13,2,7,12,1,6,11.
+- **Boot-ROM read sequence — Task 5 live trace.** The Rev H boot ROM does NOT
+  auto-boot from an inserted floppy: it completes POST and parks in its
+  boot-menu idle loop (`$FE2DBE`), byte-identical whether or not a disk is
+  present. A floppy boot is triggered only by a menu selection — click
+  "STARTUP FROM…" (button id `$F2`), then a device item — which runs the Sony
+  loader (`$FE1BCC`) → twig_entry read routine (`$FE1D76`). That routine's
+  go-byte choreography for one block read: `clr.b ($2,A0)` (DISKPARM = 0 =
+  readdisk) → `move.b #$81,(A0)` (DISKCMD = excmd) → wait completion
+  (`$FE1E3E`: VIA2 PORTB2 bit 4 SET) → read DISKERR (`$11`) → `move.b #$85,(A0)`
+  (clristat) → wait ready (`$FE1E04`: DISKCMD==0, gated on VIA1 `$FCD901` PB6) →
+  check DISKERR==0 → copy 12 tag + 512 data bytes off the odd lane. The loader
+  verifies the boot block's `$AAAA` signature (`$FE1EF2: cmpi.w #-$5556`) at
+  block offset 4, then **JMPs to the loaded block at `$020000`** (first bytes
+  `4E FA …` = JMP). Task 6 owns the loader journey beyond boot-block entry.
 
 ### Board IDs
 
@@ -1002,10 +1031,13 @@ zone/track/sector/side:
   path yet. See `FloppyController.swift`'s type doc comment for the HLE
   model (go-byte state machine, zone mapping, completion-line wiring) and
   its two flagged, Task-5-revisable assumptions: the completion line's
-  IDLE/ASSERTED polarity (chosen idle=0/asserted=1, since the alternative
-  risked a spurious permanently-asserted level-1 bit on the current boot
-  path) and the DISKERR raw-byte values (inferred as the documented
-  OS-level error codes minus the `1800` offset, not independently cited).
+  IDLE/ASSERTED polarity (chosen idle=0/asserted=1) and the DISKERR raw-byte
+  values (inferred as the documented OS-level error codes minus the `1800`
+  offset, not independently cited). **Task 5 update:** the completion-line
+  polarity is now CONFIRMED (the ROM waits at `$FE1E3E` for VIA2 PORTB2 bit 4
+  to be SET — asserted=1 is correct); block 0 reads to completion and the boot
+  block executes. The DISKERR raw-byte values remain uncited (the successful
+  read path sets DISKERR=0, so no error code was exercised).
 
 ### Could Not Find
 
@@ -1015,8 +1047,11 @@ zone/track/sector/side:
 2. One-constant statement of the shared-RAM window size (offsets observed
    to `$B9` + `$3E8`-`$7FF` region).
 3. Sony interleave remap table (firmware-internal).
-4. Resolution of ambiguities (a) buffer offset and (b) disk_control
-   address — both assigned to Task 5 ROM-disassembly.
+4. ~~Resolution of ambiguities (a) buffer offset and (b) disk_control
+   address — both assigned to Task 5 ROM-disassembly.~~ **RESOLVED (Task 5):**
+   (a) buffer base `$400`, odd-lane stride-2; (b) `$FCD901` (VIA1) bit 6. See
+   the AMBIGUITY (a)/(b) notes above and docs/rom-trace-notes.md "Floppy boot
+   (checkpoint C)".
 
 ## Known Gaps (Flagged for M1b, Not M1a)
 

@@ -992,8 +992,12 @@ zone/track/sector/side:
   `LISAEMU_ROM_DIR=... swift test`) after this change: the exact boot-menu
   anchor (`romCompletesPOSTAndReachesBootMenu`'s FNV hash
   `0xd09234d25516d0b8` / 78,100 set pixels) is UNCHANGED, because the
-  traced boot path never reaches the floppy driver at all (it parks at the
-  `$FE2DBE` COPS input-idle loop before ever touching `$FCC0xx`) — so
+  traced boot path never reaches the floppy driver at all -- it parks at
+  the `$FE2DBE` COPS input-idle loop before ever touching `$FCC015` or the
+  `$C000-$C7FF` shared-RAM window (the already-validated `$C031` board-ID
+  reads at `$FE0B24`/`$FE0B2C`/`$FE119A` are the only `$FCC0xx` traffic
+  pre-menu -- see docs/rom-trace-notes.md "`$C031` board ID -- read, and
+  `0x00` does NOT divert POST") — so
   neither the `$C015` value change nor the new window is observed on this
   path yet. See `FloppyController.swift`'s type doc comment for the HLE
   model (go-byte state machine, zone mapping, completion-line wiring) and

@@ -147,6 +147,12 @@ public final class FloppyController {
         /// controller could not execute what was asked."
         static let notIssued: UInt8 = 9
         static let verify: UInt8 = 21
+        /// Used for BOTH "no disk present" and "out-of-range track/sector"
+        /// on a `readdisk` sub-command -- intentional, not an oversight:
+        /// §9's error table has no distinct no-disk code at this layer (only
+        /// `not_issued`/`vererr`/`read_err`/`write_err` are documented), and
+        /// a real driver reading DISKERR after a failed read sees a generic
+        /// "the read didn't happen" signal either way.
         static let read: UInt8 = 23
         static let write: UInt8 = 24
     }
@@ -253,8 +259,7 @@ public final class FloppyController {
         blocksRead = 0
         writeAttempts = 0
         lastError = 0
-        completionLineAsserted = false
-        setLevel1Pending(false)
+        dropCompletionLine()
         if let image {
             window[Cell.diskIn] = 1
             window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0

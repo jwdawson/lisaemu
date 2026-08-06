@@ -142,25 +142,36 @@ Source: OS/source-starasm1.text.unix.txt:232-258 (SET_DOMAIN), LDASM:145-151
   (`SYSGLOBAL:60/137` `domainRange`/`domvalue` "user's domain on sys call
   entry"; SCHED `Set_Address_Space`/`SelectDomain` 212-453; EXCEPASM
   "system code" vs "user domain", 108-178).
-- **The context latch selects the translation map ONLY for user-mode
-  accesses; supervisor-mode accesses always translate through domain 0**
-  (M3 Task 4, OQ1′). This is the only reading consistent with the OS's own
-  code: `SET_DOMAIN` (starasm1:232-258, "*can only be called from the
-  supervisor stack*") flips the latch then `jmp (a0)` back to the caller, and
-  `do_an_mmu` (LDASM:364-425) flips the latch **with setup OFF** then keeps
-  fetching its own seg-84 code and reading the SMT — both would fault on the
-  first post-switch fetch if the latch gated supervisor translation, and no
-  Lisa would boot. Even the domain-construction routines
-  (`MAP_SPACE`/`MAP_DOMAIN`, MMPRIM:491-624) switch to the target domain
-  *before* programming it. Deterministic single-step confirms the pivot fetch
-  `$A84034` occurs in the freshly-latched, empty domain 1 with `setup=OFF` and
-  nothing written to domain 1 (rom-trace-notes.md "Kernel push (M3 Task 4)").
-  Implemented as `LisaCore/Bus.swift`'s `translationDomain`
+- **Supervisor-mode code EXECUTION translates through domain 0 regardless of
+  the context latch (proven); the latch selects the map for user-mode
+  accesses** (M3 Task 4, OQ1′). NOTE: this is **inferred from OS behavior +
+  source, not a datasheet**, and what is *proven* is specifically **supervisor
+  code execution across a latch switch** — the only thing the boot path
+  exercises (min SR `$2700`, no user processes yet, so no supervisor DATA
+  access to a user domain occurs). The proof: `SET_DOMAIN` (starasm1:232-258,
+  "*can only be called from the supervisor stack*") flips the latch then
+  `jmp (a0)` back to the caller, and `do_an_mmu` (LDASM:364-425) flips the
+  latch **with setup OFF** then keeps fetching its own seg-84 code and reading
+  the SMT — both would fault on the first post-switch fetch if the latch gated
+  supervisor translation, and no Lisa would boot. Even the domain-construction
+  routines (`MAP_SPACE`/`MAP_DOMAIN`, MMPRIM:491-624) switch to the target
+  domain *before* programming it. Deterministic single-step confirms the pivot
+  fetch `$A84034` occurs in the freshly-latched, empty domain 1 with
+  `setup=OFF` and nothing written to domain 1 (rom-trace-notes.md "Kernel push
+  (M3 Task 4)"). Implemented as `LisaCore/Bus.swift`'s `translationDomain`
   (`supervisor ? 0 : latched domain`); SLIM/SORG *register* programming
   (`slimSorgPortAccess`) still targets the raw latched domain, so the loader
   builds domains 1-3 for later user-mode execution. (This SUPERSEDES the M3
   Task 2 "per-domain vs global segment presence" framing of OQ1′: it is
   neither — it is supervisor-vs-user.)
+- **OPEN (OQ1″) — supervisor DATA access to a user domain.** The rule above is
+  modeled as unconditional (`supervisor ⇒ domain 0`), but only supervisor
+  *execution* is proven. EXCEPASM saves `domvalue` ("*user's domain on sys
+  call entry*", SYSGLOBAL:137) precisely so the OS can act on the user's domain
+  once processes run — hinting the kernel may read/write user buffers in
+  domain N while supervisor (LDSN mechanism, or a mode where data references
+  DO follow the latch). No traced path exercises this yet. **Flagged for the
+  first user-process milestone (M4/M5)**; revisit `translationDomain` then.
 
 ### Reset Line (Warm Reset)
 

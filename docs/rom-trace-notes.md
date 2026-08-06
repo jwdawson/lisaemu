@@ -1591,15 +1591,29 @@ mechanism:**
   LRU-assigned from the DCT (`SYSGLOBAL:60/137` `domainRange`/`domvalue`
   "*user's domain on sys call entry*"; SCHED `Set_Address_Space`/`SelectDomain`
   212-453; EXCEPASM's "system code" vs "user domain", 108-178). The context
-  (`ctbit`) latch selects the translation map **only for user-mode accesses**;
-  **supervisor-mode accesses always translate through domain 0.** That is the
-  ONLY reading under which every domain-switching OS routine keeps running.
+  (`ctbit`) latch selects the translation map for user-mode accesses;
+  **supervisor-mode code EXECUTION translates through domain 0** — the only
+  reading under which every domain-switching OS routine keeps running.
   Implemented as `Bus.translationDomain` (`supervisor ? 0 : latched domain`);
   SLIM/SORG *register* programming is a separate mechanism and still targets
   the raw latched domain, so the loader still builds domains 1-3 for later
   user-mode execution. Refutes the M3 Task 2 "per-domain vs global" framing:
   it is neither — it is **supervisor-vs-user**. (hardware-notes.md §1 "Domain
   Context Latches" updated in lockstep.)
+
+- **Scope of the proof / the successor question (OQ1″).** This rule is
+  **inferred from OS behavior + source, not a datasheet**, and what the boot
+  path actually *proves* is **supervisor code EXECUTION across a latch switch**
+  (min SR `$2700`, no user processes yet — no supervisor DATA access to a user
+  domain is ever exercised). `Bus.translationDomain` models the rule as
+  unconditional (`supervisor ⇒ domain 0`), which may **refine** once processes
+  run: EXCEPASM saves `domvalue` ("*user's domain on sys call entry*") so the
+  OS can act on the user's domain on syscall entry, hinting the kernel may
+  read/write user buffers in domain N while supervisor (LDSN mechanism, or a
+  data-reference mode that DOES follow the latch). **OQ1″ (open, flagged for
+  the first user-process milestone, M4/M5):** *does supervisor DATA access to a
+  user domain follow the context latch?* No traced path exercises it; revisit
+  `translationDomain` then. (See the open-questions table below.)
 
 ### What the fix reveals — the loader loads the OS image; the OS's COPS driver
 
@@ -1654,6 +1668,12 @@ ever occurs (`writeAttempts==0`). Framebuffer unchanged (menu still present,
   calls, `mmuPortWrites` climbs past 4638, `blocksRead==75`, `lastError==0`,
   the PC reaches the OS COPS driver `$520800-$5208FF`, `writeAttempts==0`.
 
+**Reproduction.** This frontier is reachable **only through the integration
+test** — `lisadbg` cannot get here on its own: it has no menu-harness (the
+cursor-walk + click that selects a boot device), so it cannot drive the ROM
+past the boot menu into the loader. `bootIntoLoader` (the `ROMFloppyBootTests`
+harness) is the sole reproduction vehicle for the `$520000` state.
+
 ## M3 Task 3 — deferrals re-recorded to M4 (parked-debt bundle)
 
 Two subsystems the M3 plan document's Global Constraints named as
@@ -1669,6 +1689,8 @@ has forced either into scope.
 | **Widget hard-disk HLE** | `dev_type` (`$22E`) only ever observed `= 2` (`dev_sony`) on every traced boot (checkpoint C, Task 6's loader progression, Checkpoint D) — `dev_widget = 3` (docs/hardware-notes.md §9 "Boot Path") is never selected because no traced path chooses a Widget boot device. | None yet — no peripheral beyond the internal Sony/Twiggy floppy (`FloppyController`) exists in this emulator. |
 | **ProFile HLE** | Same low-core cell: `dev_type` never observed `= 1` (`dev_prof`) on any traced path. `docs/hardware-notes.md` §9's "ProFile interleave table" is transcribed as research only, never exercised. | None yet. |
 | **Soft power / Power menu** | No traced boot path (menu idle-wait, floppy boot, the OS loader through Checkpoint D) has been observed to issue a Power Command byte (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`, docs/hardware-notes.md §7). | `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`) already recognizes and logs every Power Command byte, regression-pinned by `COPSTests.powerCommandsAreLogged` — no shutdown/reboot/alarm semantics are modeled behind the log, by design, until M4 evidence demands them. |
+| **OS COPS command-send driver** (M3 Task 4 STOP) | The boot now reaches the OS's own COPS driver at `$520824` (sends `$7C`) and spins: our simplified COPS model drops CRDY on *every* register-15 write, but this driver re-writes register 15 each poll iteration (real hw: register 15 is *no-handshake* — stages without strobing the COPS; the `DDRA2 $00→$FF` transition is the real send). See "Kernel push (M3 Task 4)". | `Sources/LisaCore/COPS.swift` (`handleCommandWrite`) — needs a **DDRA2-gated CRDY handshake** + re-validation of the pinned ROM COPS path (menu FNV, POST presence probe, `COPSTests`, M1c input) before it can advance. |
+| **OQ1″ — supervisor DATA access to a user domain** (open) | `Bus.translationDomain` models `supervisor ⇒ domain 0` as unconditional, but only supervisor *execution* is proven (§1). EXCEPASM saves `domvalue` so the OS can act on the user's domain on syscall entry — the kernel may read/write user buffers in domain N while supervisor once processes run. No traced path exercises it. | `Sources/LisaCore/Bus.swift` `translationDomain` — revisit at the first user-process milestone (M4/M5). |
 
 Wired the same way the plan's own precedent already established
 (`docs/hardware-notes.md` §7 "Soft Power Control" carries the mirrored

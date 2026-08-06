@@ -117,9 +117,23 @@ public struct MMU {
     ///     page count, LDASM:414). Valid while `pageOffset < limitPages`.
     ///   - stack: `limitPages = (slim & 0xFF) + 1` (1...256) -- a DIRECT
     ///     count, not two's-complement. See the derivation below.
-    ///   - Physical address is `(sorg & 0xFFF) << 9 + offsetWithinSegment`
-    ///     for every mapped type (memory and stack alike); `io` returns the
-    ///     bare offset instead (`.io(offset:)`) for the IODispatcher.
+    ///   - Physical address is `((sorg & 0xFFF) << 9 + offsetWithinSegment)
+    ///     & 0x1F_FFFF` for every mapped type (memory and stack alike); `io`
+    ///     returns the bare offset instead (`.io(offset:)`) for the
+    ///     IODispatcher. The `& 0x1F_FFFF` is load-bearing, not cosmetic:
+    ///     the physical page number the hardware forms is
+    ///     `(SORG + pageWithinSegment)` truncated to SORG's 12-bit register
+    ///     width, so it WRAPS modulo 4096 pages -- a 21-bit / 2 MB physical
+    ///     space. The OS loader relies on this: `initmmutil` (LDASM:174-252)
+    ///     programs `mmucodemmu` (seg 84) with a *negative* origin page
+    ///     `SORG = (utiladr>>9) - 32` (for `utiladr=$800`, page `-28` = the
+    ///     12-bit value `$FE4`), points TRAP #6's vector at
+    ///     `mmusegorg+bit_14 = $A84000`, and expects that virtual address to
+    ///     decode back to physical `$800` where it copied `do_an_mmu`:
+    ///     `(-28 + 32) mod 4096 = 4` -> `$800`. WITHOUT the wrap the same
+    ///     access lands at `$FE4<<9 + $4000 = $200800`, past 2 MB, and the
+    ///     first inter-segment call gate fetches garbage -- the M3 Task 1
+    ///     gate. See docs/rom-trace-notes.md "Gate diagnosis (M3 Task 1)".
     ///
     /// ### Stack window derivation
     ///
@@ -178,13 +192,13 @@ public struct MMU {
             if nibble == 0x8 {
                 return .io(offsetInSegment)
             }
-            return .memory((UInt32(r.sorg & 0xFFF) << 9) &+ offsetInSegment)
+            return .memory(((UInt32(r.sorg & 0xFFF) << 9) &+ offsetInSegment) & 0x1F_FFFF)
         case 0x6:   // stack
             let limitPages = limitByte + 1
             guard pageOffset >= (0x100 - limitPages) else {
                 return .fault(MMUFault(logical: addr, reason: .limitViolation))
             }
-            return .memory((UInt32(r.sorg & 0xFFF) << 9) &+ offsetInSegment)
+            return .memory(((UInt32(r.sorg & 0xFFF) << 9) &+ offsetInSegment) & 0x1F_FFFF)
         case 0x9, 0xF:
             // iospace ($9) / prom-special ($F): ROM-discovered hardwired
             // decodes, not limit-checked memory windows (see the doc

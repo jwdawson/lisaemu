@@ -140,6 +140,39 @@ private func mmuWith(_ seg: Int, _ reg: SegmentRegister, domain: Int = 0) -> MMU
     } else { Issue.record("expected limit fault") }
 }
 
+// MARK: - 12-bit page-relocation wrap (M3 Task 1 gate diagnosis)
+
+/// The physical page number the MMU forms is `(SORG + pageWithinSegment)`
+/// truncated to SORG's 12-bit register width -- i.e. it WRAPS modulo 4096
+/// pages (a 21-bit / 2 MB physical space). This is not cosmetic: the OS
+/// loader's `initmmutil` (LDASM:174-252) programs `mmucodemmu` (segment 84)
+/// with a deliberately *negative* origin page -- `SORG = (utiladr>>9) - 32`,
+/// which for `utiladr = $800` is page `4 - 32 = -28`, stored as the 12-bit
+/// value `$FE4`. It then points the TRAP #6 vector at `mmusegorg+bit_14`
+/// (`$A80000 + $4000 = $A84000`) and expects that virtual address to decode
+/// back to physical `$800`, where it copied `do_an_mmu`. That only works if
+/// the page add wraps: `(-28 + 32) mod 4096 = 4` -> phys `$800`. Without the
+/// wrap the same access lands at `$FE4<<9 + $4000 = $200800`, past 2 MB RAM,
+/// and the segment-call gate fetches garbage. See docs/rom-trace-notes.md
+/// "Gate diagnosis (M3 Task 1)" and docs/hardware-notes.md §1.
+@Test func physicalPageAddWrapsAt12Bits() {
+    // The exact gate case: seg 84, SORG=$FE4 (page -28), readWrite, offset
+    // $4000 (page 32). (-28 + 32) mod 4096 = 4 -> phys $800.
+    var mmu = MMU()
+    mmu.domains[0][84] = SegmentRegister(sorg: 0xFE4, slim: 0x7DB)
+    #expect(mmu.translate(0x00A8_4000, domain: 0, isSupervisor: true, isWrite: false) == .memory(0x0000_0800),
+            "seg-84 offset $4000 with SORG=$FE4 must wrap to phys $800, not $200800")
+    // A within-2MB access is unaffected by the mask.
+    #expect(mmu.translate(0x00A8_2000, domain: 0, isSupervisor: true, isWrite: false) == .memory(0x0000_0000 &+ (UInt32(0xFE4) << 9 &+ 0x2000) & 0x1F_FFFF))
+    // General wrap invariant: SORG at the top of its range plus a high page
+    // offset wraps past the 2 MB boundary rather than exceeding it.
+    mmu.domains[0][10] = SegmentRegister(sorg: 0xFFF, slim: 0x700)  // page 4095, full segment
+    if case .memory(let p) = mmu.translate((10 << 17) + 0x1_0000, domain: 0, isSupervisor: true, isWrite: false) {
+        #expect(p < 0x20_0000, "wrapped physical must stay within the 21-bit space; got \(String(format: "$%X", p))")
+        #expect(p == ((UInt32(0xFFF) << 9) &+ 0x1_0000) & 0x1F_FFFF)
+    } else { Issue.record("expected memory translation") }
+}
+
 // MARK: - Ported M0-era tests (raw model via the factory)
 
 @Test func translatesReadWriteSegment() {

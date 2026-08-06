@@ -110,7 +110,8 @@ Source: LIBHW/libhw-DRIVERS.TEXT.unix.txt:139-140, LDASM:154-155
 - SetUpSet: IOSpace + $E010
 - SetUpReset: IOSpace + $E012
 - Behavior: ANY access (read or write, e.g., TST.B) toggles the flip-flop; data is irrelevant (libhw-MACHINE:641-645, 681-685)
-- While SETUP is on, SORG/SLIM writes program the inactive domain's registers without disturbing live translation
+- While SETUP is on, SORG/SLIM writes program ~~the inactive domain's registers~~ **the CURRENT (active) domain's registers** without disturbing live translation
+  - **~~inactive domain~~ REFUTED (M3 Task 2, strike-through-not-erase):** the "inactive domain" half is contradicted by the very source that sets this behavior up. `initmmutil` (LDASM:215-224) establishes domain 0 *live* via `ctbit1off/ctbit2off` and *then* `move.b d0,setupon` + programs `mmucodemmu`; `do_an_mmu` (LDASM:364-376 establish, 387-425 program) does the identical establish-then-`setupon`-then-program pattern. If `setupon` targeted the *inactive* domain, `mmucodemmu` would land in a non-running domain and no Lisa would boot. The original M1a transcription most likely conflated "registers staged until setup-off" with "a different domain." OQ1's active-vs-inactive question is now **ANSWERED: current (active) domain** — source-established, matching our current-domain `MMU.translate`/`slimSorgPortAccess` model (rom-trace-notes.md "Checkpoint D (M3 Task 2)" / "OQ1 status"). The "without disturbing live translation" half stands, now doubly proven (see the M3 Task 2 note below).
 - Sequence (per do_an_mmu): toggle setupoff → interrupt-window → setupon per write (LDASM:387-394)
 - **"Without disturbing live translation" is load-bearing (M3 Task 2):** SETUP
   redirects the SORG/SLIM *register* ports, but general instruction/data

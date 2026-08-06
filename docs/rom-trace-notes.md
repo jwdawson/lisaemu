@@ -1439,9 +1439,10 @@ running from an already-mapped segment (the loader's `do_an_mmu`) changes. All
 `do_an_mmu` now executes cleanly and `rte`s to the loader's `prog_mmu` return
 site **`$10041A`** (the trap frame's stacked PC), `busErrorPulseCount==0`. The
 loader then drives `do_an_mmu` (via `prog_mmu`, LDASM:257-275) **once per
-segment**, walking segment indices up through `$7F` — **127 `trap #6` calls**,
-all `d2=0` (target **domain 0**), programming ~all 128 of domain 0's segments.
-`mmuPortWrites` climbs `4386 → 4638`. Landmarks watched: `blocksRead` stays 24
+segment**, walking segment indices up through `$7F` — **126 completed domain-0
+programmings** (calls #1–#126, all `d2=0`), programming ~all 128 of domain 0's
+segments, then the faulting domain-1 pivot (call #127). `mmuPortWrites` climbs
+`4386 → 4638` (= 126 × 2). Landmarks watched: `blocksRead` stays 24
 (no new LFS reads on this stretch — the loader is mapping, not loading),
 framebuffer unchanged (`78181` px, no draw), **SR never drops below `$2700`**
 (interrupts stay masked at 7 — still no live IRQ delivery), no COPS `$02` clock
@@ -1449,10 +1450,13 @@ read, and **zero floppy writes** (`writeAttempts==0`).
 
 ### The new frontier — the domain-1 crossover (OQ1's forcing point, at last)
 
-**Call #127** is the pivot: `d0=0 d1=1 d2=1 d3=0` — program **domain 1, segment
-0**. `do_an_mmu` "establishes the desired domain" first (LDASM:317-328): it
-writes `ctbit1on` (`$A8402E`), switching the **live** context to domain 1, and
-keeps executing its own seg-84 code there. But domain 1 is **empty** — the
+Calls **#1–#126** are all `d2=0` (target **domain 0**), each programming one
+segment (SORG+SLIM = 2 writes) — **126 completed domain-0 programmings, 252
+writes** (`mmuPortWrites` `4386 → 4638`). **Call #127** is the pivot: `d0=0 d1=1
+d2=1 d3=0` — program **domain 1, segment 0**. `do_an_mmu` "establishes the
+requested context" first (executable ctbit switch, LDASM:364-376): it writes
+`ctbit1on` (`$A8402E`), switching the **live** context to domain 1, and keeps
+executing its own seg-84 code there. But domain 1 is **empty** — the
 loader has only just begun building it (this very call is domain 1's *first*
 segment) — so the in-handler instruction fetch finds seg-84 unmapped in domain
 1; the CPU tries to take the fault, the exception-vector read (`$0C-$0F`, logical
@@ -1465,9 +1469,13 @@ shape precisely:
 
 - `do_an_mmu` programs the **currently-active (just-switched-to) domain**, not
   an "inactive" one — it establishes the target domain via `ctbit`, *then*
-  `setupon` + writes. This is the first *live* data on OQ1's active-vs-inactive
-  question, and it favours the **current-domain** reading of the SORG/SLIM
-  writes (the ctbit switch precedes them).
+  `setupon` + writes. This is now **source-established**, not merely a live data
+  point: `initmmutil` (LDASM:215-224) sets domain 0 *live* via `ctbit1off/
+  ctbit2off` and *then* `setupon`-programs `mmucodemmu`; `do_an_mmu`
+  (LDASM:364-376 + 387-425) does the identical establish-then-program pattern.
+  If `setupon` targeted the *inactive* domain, `mmucodemmu` would never land in
+  the running domain and no Lisa would boot — so **OQ1's active/inactive
+  question is ANSWERED: SORG/SLIM writes program the CURRENT (active) domain.**
 - For `do_an_mmu` to run at all after switching domains, its own segment
   (`mmucodemmu`, seg-84) — and the vector/stack/SMT segments it touches — must
   be reachable in the target domain **the moment it switches**. `initmmutil`
@@ -1486,15 +1494,29 @@ shape precisely:
 
 ### OQ1 status
 
-**Forced and characterised, not yet closed.** Checkpoint D is the first path
-that (a) programs a *non-zero domain* live and (b) switches the live context
-mid-handler. New data points, all live: programming targets the active
-(just-established) domain; `mmucodemmu`/low system segments must be present in
-every domain a handler runs in. What remains undetermined (and why OQ1 stays
-open): whether that presence is hardware-global registers or an OS step we have
-not yet traced, and the exact active/inactive-domain register-write semantics.
-This is the natural subject of a dedicated multi-domain MMU task, gated on
-finding the hardware citation.
+**ANSWERED (active/current domain), with a precisely-renamed successor open
+question.** OQ1 as originally posed — "does the ROM/OS program SLIM/SORG
+targeting the CURRENT domain (our model), or does an 'inactive domain' semantic
+matter?" — is now **resolved in favour of the current (active) domain**, and
+**source-established**, not just live-inferred: `initmmutil` (LDASM:215-224) and
+`do_an_mmu` (LDASM:364-376, 387-425) both establish the target domain *live* via
+`ctbit` and *then* `setupon`-program it; the "inactive domain" reading would make
+`mmucodemmu` land in a non-running domain and no Lisa would boot. Our
+current-domain `MMU.translate`/`slimSorgPortAccess` model matches. (See the
+hardware-notes.md §1 "Setup Latch" strike-through: the original M1a "inactive
+domain" transcription is refuted — it most likely conflated *registers staged
+until setup-off* with *a different domain*.)
+
+**Renamed successor open question (OQ1′ — the Checkpoint-D crossover):**
+*per-domain vs. global segment presence.* Checkpoint D is the first path that
+switches the live context to a non-zero domain mid-handler, and it needs
+`mmucodemmu` (seg-84) — and the vector/stack/SMT segments `do_an_mmu` touches —
+present in domain 1 the instant it switches, yet `initmmutil` programmed seg-84
+in domain 0 only. What remains undetermined: whether that cross-domain presence
+is a hardware-global register file (some segment indices shared across all
+domains) or an OS step not yet traced. The seg-84-global-alone experiment (above)
+shows it is not a one-register answer. This is the subject of a dedicated
+multi-domain MMU task, gated on finding the hardware citation.
 
 ### What the M3 Task 2 tests pin (`ROMFloppyBootTests`)
 

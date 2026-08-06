@@ -387,11 +387,16 @@ public final class EmulationController {
         // never replays a stale wall-clock anchor from before a pause.
         var throttleAnchor: TimeInterval?
         var lastStatusPublish = ProcessInfo.processInfo.systemUptime
-        // Whether a HALTED status has already been force-published for the
-        // CURRENT halt (see `haltedStatusPublish(...)`, below, and this
+        // Whether a HALTED status has been force-published at least ONCE for
+        // the CURRENT halt (see `haltedStatusPublish(...)`, below, and this
         // function's "guard running, !machine.halted" branch) -- reset
-        // whenever the machine is not halted (including a fresh `.reset`)
-        // so the next halt gets its own forced publish.
+        // whenever the machine is not halted (including a fresh `.reset`) so
+        // the next halt gets its own immediate forced publish. Does NOT
+        // suppress every publish thereafter (M3 Task 3, M1c parked debt):
+        // once true, `haltedStatusPublish` still answers `true` again every
+        // `statusPublishInterval`, so a halted machine's status (throttled
+        // flag, cycle count) keeps refreshing instead of going stale forever
+        // after the one transition publish.
         var haltedPublished = false
         // `FloppyController.commandsProcessed` as of the last published
         // `EmuStatus` -- diffed against the live value at each publish site
@@ -470,19 +475,30 @@ public final class EmulationController {
                 // forever after -- so the one iteration where `run(until:)`
                 // just discovered the halt was the ONLY chance to publish
                 // it, and that iteration only actually published if it also
-                // happened to cross the independent 0.25s `lastStatusPublish`
-                // gate (empirically ~7% of transitions, per the review). Use
-                // `haltedStatusPublish` (pure decision function, see below)
-                // to force exactly one publish per halt, regardless of the
-                // 0.25s gate, from right here -- both immediately after the
-                // transition (next loop iteration after `run(until:)`
-                // discovers it) and, defensively, from this branch on any
-                // subsequent iteration if that first attempt were ever
-                // somehow missed.
+                // happened to cross the independent `statusPublishInterval`
+                // `lastStatusPublish` gate (empirically ~7% of transitions,
+                // per the review).
+                //
+                // M3 Task 3 (M1c parked debt -- "halted-status staleness"):
+                // the original fix stopped at forcing exactly ONE publish
+                // per halt, transition-only -- which fixed the "almost never
+                // published" bug but left a narrower staleness: once halted,
+                // NOTHING published again for the rest of the run, so a
+                // throttle toggle or (hypothetically) any other post-halt
+                // status change would never reach the app. The halted branch
+                // now gets its OWN interval check, mirroring the running
+                // branch's `now - lastStatusPublish >= statusPublishInterval`
+                // gate below: `haltedStatusPublish` (pure decision function,
+                // see below) forces exactly one IMMEDIATE publish at the
+                // transition (`!alreadyPublished`), then republishes again
+                // every `statusPublishInterval` for as long as the halt
+                // continues, same cadence as ordinary running-mode status.
+                let now = ProcessInfo.processInfo.systemUptime
                 if EmulationController.haltedStatusPublish(machineHalted: machine.halted,
-                                                             alreadyPublished: haltedPublished) {
+                                                             alreadyPublished: haltedPublished,
+                                                             secondsSinceLastPublish: now - lastStatusPublish) {
                     haltedPublished = true
-                    lastStatusPublish = ProcessInfo.processInfo.systemUptime
+                    lastStatusPublish = now
                     shared.onStatus?(currentStatus(halted: true))
                 }
                 Thread.sleep(forTimeInterval: 0.005)
@@ -510,22 +526,43 @@ public final class EmulationController {
             }
 
             let now = ProcessInfo.processInfo.systemUptime
-            if now - lastStatusPublish >= 0.25 {
+            if now - lastStatusPublish >= EmulationController.statusPublishInterval {
                 lastStatusPublish = now
                 shared.onStatus?(currentStatus(halted: machine.halted))
             }
         }
     }
 
-    /// Pure decision function for the HALTED force-publish, above --
-    /// extracted so the transition logic is unit-testable without a real
-    /// `Machine`/ROM/thread (see `EmulationControllerHaltedPublishTests`).
-    /// Answers "should THIS iteration force-publish a HALTED status": true
-    /// exactly once per halt (`machineHalted && !alreadyPublished`), never
-    /// while not halted, and never a second time for the same halt once
-    /// `alreadyPublished` is true.
-    static func haltedStatusPublish(machineHalted: Bool, alreadyPublished: Bool) -> Bool {
-        machineHalted && !alreadyPublished
+    /// Minimum interval, in seconds, between `onStatus` publishes -- the
+    /// ~4Hz cadence the type's doc comment ("## Threading") promises.
+    /// Shared by both the ordinary running-mode gate (`runEmulationThread`'s
+    /// final `if now - lastStatusPublish >= ...` check) and the halted-mode
+    /// periodic republish (`haltedStatusPublish`, below) -- factored out
+    /// (M3 Task 3) so the two gates can't drift apart, and so tests can
+    /// reference the real production cadence instead of hardcoding `0.25`
+    /// a second time.
+    static let statusPublishInterval: TimeInterval = 0.25
+
+    /// Pure decision function for the HALTED-branch publish, above --
+    /// extracted so the logic is unit-testable without a real `Machine`/
+    /// ROM/thread (see `HaltedStatusPublishTests`). Answers "should THIS
+    /// iteration publish a HALTED status":
+    /// - `false` whenever `!machineHalted` (the running branch owns
+    ///   publishing then, via its own `statusPublishInterval` gate).
+    /// - `true` on the FIRST call for a given halt (`!alreadyPublished`),
+    ///   unconditionally and immediately -- this is what fixes the original
+    ///   "HALTED status almost never published" bug: the transition is never
+    ///   missed regardless of `secondsSinceLastPublish`.
+    /// - Thereafter (M3 Task 3, the halted-status-staleness parked debt):
+    ///   `true` again once `secondsSinceLastPublish >= statusPublishInterval`
+    ///   -- so a status keeps flowing periodically for as long as the halt
+    ///   lasts, at the same cadence as ordinary running-mode status, instead
+    ///   of publishing exactly once and then never again.
+    static func haltedStatusPublish(machineHalted: Bool, alreadyPublished: Bool,
+                                     secondsSinceLastPublish: TimeInterval) -> Bool {
+        guard machineHalted else { return false }
+        guard alreadyPublished else { return true }
+        return secondsSinceLastPublish >= statusPublishInterval
     }
 }
 

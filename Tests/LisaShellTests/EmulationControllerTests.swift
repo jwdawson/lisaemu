@@ -52,48 +52,98 @@ enum LisaShellMusashiSuites {}
 /// at a chosen PC/SSP, `EmulationController` only ever creates its
 /// `Machine` internally (`makeMachine`, private) and boots the REAL ROM
 /// from `romDirectory` -- there is no seam to inject a synthetic program
-/// before the ROM's own boot code starts running, and driving the real ROM
-/// all the way to a genuine CPU halt (as opposed to `BusErrorTests`'
-/// deliberately minimal repro) is not a documented/discovered path. Per
-/// the finding's own fallback guidance, the transition-publish DECISION is
-/// instead extracted into `EmulationController.haltedStatusPublish(
-/// machineHalted:alreadyPublished:)`, a pure function taking no `Machine`
-/// at all, and tested directly here -- this pins the exact logic bug (the
-/// old code's publish was reachable only from the `running` branch, so
-/// once `guard running, !machine.halted` started failing every iteration,
-/// the transition published only if it happened to also cross the
-/// independent 0.25s gate in the one iteration where the halt was
-/// discovered -- empirically ~7% of transitions) without needing a live
-/// halt to reproduce it.
+/// before the ROM's own boot code starts running. **M3 Task 3 revisit:**
+/// tried anyway, per the M1c re-review's sketch (boot to menu, then via
+/// `debugSync` write a double-fault program + point PC/A7 into an absent
+/// segment) -- see `EmulationControllerFloppyIntegrationTests`-adjacent
+/// `HaltedStatusIntegrationTests`, below, which found the seam DOES exist
+/// after all (the ROM-gated suite already boots a real `Machine` on a real
+/// thread; `debugSync` can clobber its low-core vectors and PC once parked
+/// at the idle-wait poll, exactly like `BusErrorTests`' bare-`Machine`
+/// repro, just reached through the controller's public/test surface
+/// instead of a hand-built `Machine`). Per the finding's own fallback
+/// guidance, the transition-publish DECISION is ALSO extracted into
+/// `EmulationController.haltedStatusPublish(machineHalted:alreadyPublished:
+/// secondsSinceLastPublish:)`, a pure function taking no `Machine` at all,
+/// and tested directly here -- this pins the exact logic bug (the old
+/// code's publish was reachable only from the `running` branch, so once
+/// `guard running, !machine.halted` started failing every iteration, the
+/// transition published only if it happened to also cross the independent
+/// 0.25s gate in the one iteration where the halt was discovered --
+/// empirically ~7% of transitions) without needing a live halt to
+/// reproduce it, and (M3 Task 3) additionally pins the parked-debt fix
+/// itself: status must keep publishing periodically while halted, not just
+/// once at the transition, so throttled-flag changes and cycle counts
+/// (e.g. a later `reset()` or `setThrottled` while paused at HALT) stay
+/// visible to the app instead of going stale forever.
 @Suite
 struct HaltedStatusPublishTests {
     @Test func firstIterationAfterHaltAlwaysForcesAPublish() {
-        #expect(EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: false))
+        #expect(EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: false,
+                                                          secondsSinceLastPublish: 0))
     }
 
-    @Test func subsequentIterationsWhileStillHaltedDoNotRepublish() {
-        #expect(!EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: true))
+    @Test func doesNotRepublishBeforeTheIntervalElapses() {
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: true,
+                                                           secondsSinceLastPublish: 0.1))
+    }
+
+    /// M3 Task 3 (M1c parked debt): the whole point of the fix -- unlike the
+    /// old "exactly once, ever" behavior, once the interval has elapsed the
+    /// halted branch must publish AGAIN, so a periodic ~4Hz-equivalent
+    /// cadence continues while halted, matching the running branch's own
+    /// `now - lastStatusPublish >= EmulationController.statusPublishInterval`
+    /// gate (`EmulationController.statusPublishInterval`, below).
+    @Test func republishesOnceTheIntervalElapsesWhileStillHalted() {
+        #expect(EmulationController.haltedStatusPublish(
+            machineHalted: true, alreadyPublished: true,
+            secondsSinceLastPublish: EmulationController.statusPublishInterval))
+        #expect(EmulationController.haltedStatusPublish(
+            machineHalted: true, alreadyPublished: true,
+            secondsSinceLastPublish: EmulationController.statusPublishInterval + 1))
     }
 
     @Test func neverForcesAPublishWhileNotHalted() {
-        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: false))
-        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: true))
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: false,
+                                                           secondsSinceLastPublish: 999))
+        #expect(!EmulationController.haltedStatusPublish(machineHalted: false, alreadyPublished: true,
+                                                           secondsSinceLastPublish: 999))
     }
 
-    /// The old bug's exact shape, pinned as a regression: a decision made
-    /// EVERY iteration while halted (as the guard-continue branch now is)
-    /// must publish EXACTLY ONCE across a run of iterations, not once per
-    /// iteration and not zero times.
-    @Test func publishesExactlyOnceAcrossManyIterationsOfTheSameHalt() {
+    /// The old bug's exact shape, pinned as a regression, EXTENDED for the
+    /// periodic-republish fix: a decision made EVERY iteration while halted
+    /// (as the guard-continue branch now is) must publish once IMMEDIATELY
+    /// at the transition, then again on a fixed cadence thereafter -- never
+    /// twice within one interval, never zero times across a long halt.
+    /// Simulates 5 simulated seconds of iterations at a fine-grained
+    /// (10ms) polling cadence -- finer than the real 5ms `Thread.sleep`
+    /// this decision gates, so no publish opportunity is skipped -- and
+    /// checks both bounds.
+    @Test func publishesImmediatelyThenOnAFixedCadenceAcrossManyIterationsOfTheSameHalt() {
         var alreadyPublished = false
-        var publishCount = 0
-        for _ in 0..<1_000 {
-            if EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: alreadyPublished) {
-                publishCount += 1
+        var lastPublishTime: Double = 0
+        var publishTimes: [Double] = []
+        var now: Double = 0
+        let step = 0.01
+        while now < 5.0 {
+            now += step
+            if EmulationController.haltedStatusPublish(machineHalted: true, alreadyPublished: alreadyPublished,
+                                                         secondsSinceLastPublish: now - lastPublishTime) {
+                publishTimes.append(now)
                 alreadyPublished = true
+                lastPublishTime = now
             }
         }
-        #expect(publishCount == 1)
+        #expect(!publishTimes.isEmpty)
+        #expect(publishTimes.first! <= step, "the first publish must happen on essentially the first iteration")
+        for i in 1..<publishTimes.count {
+            let gap = publishTimes[i] - publishTimes[i - 1]
+            #expect(gap >= EmulationController.statusPublishInterval,
+                    "no two publishes may land inside the same interval; got gap \(gap)")
+        }
+        // Over 5 simulated seconds at a 0.25s cadence, expect roughly 20
+        // republishes (allow slack for the 0.01s simulation quantum).
+        #expect(publishTimes.count >= Int(5.0 / EmulationController.statusPublishInterval) - 2)
     }
 }
 
@@ -423,6 +473,117 @@ extension LisaShellMusashiSuites {
             let hashAfterClick = framebufferHash()
             #expect(hashAfterClick != hashBeforeClick,
                     "clicking STARTUP FROM should draw a new window (device list), changing the framebuffer")
+        }
+    }
+}
+
+// MARK: - M3 Task 3 (M1c parked debt, "halted-status staleness"): the
+// debugSync-based GENUINE halt this task's ledger asked us to try, per the
+// M1c re-review's sketch -- boot the real ROM to the menu, then via
+// `debugSync` write a double-fault program and point PC/A7 into an absent
+// segment. `HaltedStatusPublishTests` above judged this impractical for the
+// ORIGINAL "almost never published" bug (no seam existed to inject a
+// program before the ROM's own boot code ran); revisited here because the
+// seam DOES exist once the Machine is already live and parked at the
+// boot-menu idle-wait poll -- `debugSync` gives the same raw `Machine`
+// access `BusErrorTests` uses on a bare `Machine`, just reached through the
+// controller's already-booted one instead of a hand-built one.
+
+extension LisaShellMusashiSuites {
+    @Suite(.enabled(if: romDir != nil, "Set LISAEMU_ROM_DIR to run the genuine-halt integration test"))
+    struct HaltedStatusIntegrationTests {
+        private func makeController() throws -> EmulationController {
+            try EmulationController(romDirectory: URL(fileURLWithPath: romDir!))
+        }
+
+        /// **The M3 Task 3 acceptance test for item 1**: drives a REAL
+        /// double bus fault through the controller's live, already-booted
+        /// `Machine`, then observes the CONTROLLER's own background loop --
+        /// not the pure `haltedStatusPublish` decision function
+        /// `HaltedStatusPublishTests` exercises -- republish HALTED status
+        /// periodically. Before this task's fix, the transition publish was
+        /// the ONLY publish ever delivered for a given halt; this test
+        /// would have hung on its second `publishSem.wait` (timing out
+        /// after 5s) against the pre-fix code.
+        @Test
+        func haltedStatusRepublishesPeriodicallyAfterAGenuineDoubleFault() throws {
+            let controller = try makeController()
+
+            // Boot to the menu's idle-wait poll -- same 25M-cycle anchor as
+            // `mouseAndClickDriveTheRealBootMenu`, above. Driven entirely
+            // through `debugSync`, with the controller's `start()` never
+            // called: the background thread's mailbox-drain loop (and its
+            // halted-branch status publish) is already spinning from the
+            // moment `makeController()` returns regardless of `running`, so
+            // once the live `Machine` flips `halted` under it (below), that
+            // loop discovers it on its very next iteration exactly as it
+            // would during a real `start()`-driven run.
+            controller.debugSync { m in m.run(until: 25_000_000) }
+
+            // Genuine double bus fault -- same mechanism as `BusErrorTests
+            // .doubleBusFaultDuringExceptionStackingHalts`
+            // (Tests/LisaCoreTests/BusErrorTests.swift), reached here on the
+            // live, already-booted Machine instead of a hand-built one:
+            // force two segments in the CPU's currently-active domain
+            // absent (explicitly, regardless of what the ROM's boot-to-menu
+            // path happened to map -- segments 100/101 are unused by it in
+            // any case, per docs/rom-trace-notes.md "OQ2"'s segment
+            // inventory), point PC at one and both stack-pointer registers
+            // at the other, then step. Instruction fetch at PC faults
+            // (segment absent); pushing the resulting exception frame
+            // through the also-absent supervisor stack pointer faults a
+            // SECOND time while already stacking -- a genuine double bus
+            // fault, which `Bus`'s consecutive-fault tracking turns into
+            // `cpu.forceHalt()`.
+            let halted = controller.debugSync { m -> Bool in
+                let domain = m.bus.domain
+                m.bus.mmu.domains[domain][100] = SegmentRegister()
+                m.bus.mmu.domains[domain][101] = SegmentRegister()
+                let faultingPC = UInt32(100) * MMU.segmentSize
+                let faultingSSP = UInt32(101) * MMU.segmentSize
+                m.cpu[.sr] |= 0x2000       // force supervisor mode (already true at the boot menu)
+                m.cpu[.isp] = faultingSSP  // whichever stack pointer the exception path uses...
+                m.cpu[.a7] = faultingSSP   // ...both point into the absent segment.
+                m.cpu[.pc] = faultingPC
+                for _ in 0..<10 where !m.halted { _ = m.step() }
+                return m.halted
+            }
+            #expect(halted, "the crafted double-fault program should have halted the live, already-booted Machine")
+
+            // Observe the CONTROLLER's background loop -- not the pure
+            // function -- publish HALTED status more than once.
+            let publishSem = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var statuses: [EmuStatus] = []
+            controller.onStatus = { status in
+                lock.lock(); statuses.append(status); lock.unlock()
+                publishSem.signal()
+            }
+
+            // First (transition) publish: immediate, no interval gate --
+            // this part alone was already fixed before M3 Task 3 (the
+            // "HALTED status almost never published" finding).
+            #expect(publishSem.wait(timeout: .now() + 5) == .success,
+                    "the transition publish should fire promptly")
+
+            // Toggle throttled mid-halt -- proves the second publish isn't
+            // some other coincidental signal: it must reflect mailbox state
+            // that changed strictly AFTER the transition publish, which
+            // only a genuine PERIODIC republish (not a one-shot) can ever
+            // surface to the app.
+            controller.throttled = true
+
+            // Second, periodic republish -- this is the M3 Task 3 fix under
+            // test. Pre-fix, `haltedStatusPublish` never answered `true`
+            // again for the same halt, so this would time out.
+            #expect(publishSem.wait(timeout: .now() + 5) == .success,
+                    "a periodic republish should follow ~statusPublishInterval after the transition publish")
+
+            lock.lock(); let captured = statuses; lock.unlock()
+            #expect(captured.count >= 2)
+            #expect(captured.allSatisfy { $0.halted }, "every published status while halted must report halted == true")
+            #expect(captured.last?.throttled == true,
+                    "the periodic republish should reflect the throttle toggle issued after the transition publish")
         }
     }
 }

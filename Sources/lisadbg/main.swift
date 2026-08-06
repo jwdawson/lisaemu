@@ -82,6 +82,13 @@ func formatMMUPortWrite(_ e: (domain: Int, segment: Int, isSorg: Bool, value: UI
     return "      mmu dom\(e.domain) seg\(e.segment) \(reg)=$\(String(format: "%03X", e.value))  [\(decodeMMUValue(isSorg: e.isSorg, value: e.value))]"
 }
 
+/// Compact disk-state suffix for the `t`/`g` status lines (M2 Task 4 brief:
+/// "status line shows disk state").
+func diskStatus(_ machine: Machine) -> String {
+    guard machine.bus.floppy.isInserted else { return "disk=OUT" }
+    return "disk=IN blocksRead=\(machine.bus.floppy.blocksRead)"
+}
+
 func formatIOAccess(_ access: IOAccess) -> String {
     let offsetStr = String(format: "%06X", access.offset)
     let rw = access.isWrite ? "W" : "R"
@@ -219,9 +226,21 @@ func asciiPreview(_ framebuffer: [UInt8], outCols: Int = 90, outRows: Int = 45) 
     return lines.joined(separator: "\n")
 }
 
-let args = CommandLine.arguments
+// `--disk <path.dc42>` (M2 Task 4) can appear anywhere alongside either the
+// `--rom <dir>` or `<binary> [hex-load-address]` forms below -- pulled out
+// first so the rest of the parsing is unaffected by its position.
+var args = CommandLine.arguments
+var diskPath: String?
+if let diskFlagIndex = args.firstIndex(of: "--disk") {
+    guard diskFlagIndex + 1 < args.count else {
+        fail("--disk requires a path argument")
+    }
+    diskPath = args[diskFlagIndex + 1]
+    args.removeSubrange(diskFlagIndex...(diskFlagIndex + 1))
+}
+
 guard args.count >= 2 else {
-    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>")
+    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>]")
 }
 
 let machine = Machine()
@@ -253,6 +272,16 @@ if args[1] == "--rom" {
     print("lisadbg — \(data.count) bytes @ \(String(format: "%06X", loadAddr)). ? for help.")
 }
 
+if let diskPath {
+    do {
+        let image = try DC42Image.load(url: URL(fileURLWithPath: diskPath))
+        machine.bus.floppy.insert(image)
+        print("lisadbg — inserted disk image \(diskPath) (\(image.blockCount) blocks)")
+    } catch {
+        fail("cannot load disk image \(diskPath): \(error)")
+    }
+}
+
 let monitor = Monitor(machine: machine)
 print(monitor.registerDump())
 while let line = readLine(strippingNewline: true) {
@@ -281,7 +310,7 @@ while let line = readLine(strippingNewline: true) {
                 print(formatIOAccess(access))
             }
         }
-        var status = "      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount)"
+        var status = "      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) \(diskStatus(machine))"
         if machine.bus.ioTraceDropped > 0 {
             status += " ioTraceDropped=\(machine.bus.ioTraceDropped)"
         }
@@ -302,7 +331,7 @@ while let line = readLine(strippingNewline: true) {
         for access in machine.bus.ioTrace[beforeIO...] {
             print(formatIOAccess(access))
         }
-        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted)")
+        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted) \(diskStatus(machine))")
         print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
     case .screenshot(let path):

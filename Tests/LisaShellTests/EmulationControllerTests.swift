@@ -181,31 +181,70 @@ extension LisaShellMusashiSuites {
 
         // MARK: reset() -> boots again
 
-        /// Interim semantic (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
-        /// Task 1 "reset() interim semantics"): `reset()` tears down and
-        /// recreates the `Machine`; warm reset is an M2 task.
+        /// M2 Task 2: `reset()` now performs a true hardware warm reset
+        /// (`machine.reset()` posted through the mailbox), not the M1c
+        /// interim recreate-the-Machine behavior. From this test's vantage
+        /// point the externally observable outcome is the same either way
+        /// (cycles back to 0, boots to the menu again) -- see
+        /// `resetKeepsTheSameMachineAndBusIdentity` below for the
+        /// assertion that actually distinguishes "warm reset" from
+        /// "recreate".
         @Test
-        func resetTearsDownAndRebootsMachine() throws {
+        func resetWarmResetsAndRebootsMachine() throws {
             let controller = try makeController()
             controller.throttled = false
             controller.start()
             #expect(waitForStatus(controller, timeout: 15) { $0.cycles >= 3_000_000 })
 
             controller.reset()
-            // reset() leaves the fresh Machine paused (does not
-            // auto-resume) -- give the mailbox a moment to process it, then
-            // confirm cycles are back at 0.
+            // reset() leaves the Machine paused (does not auto-resume) --
+            // give the mailbox a moment to process it, then confirm cycles
+            // are back at 0.
             var cyclesAfterReset: UInt64 = 0
             for _ in 0..<200 {
                 cyclesAfterReset = controller.debugSync { $0.cycles }
                 if cyclesAfterReset == 0 { break }
                 Thread.sleep(forTimeInterval: 0.01)
             }
-            #expect(cyclesAfterReset == 0, "reset() should recreate the Machine at cycles == 0")
+            #expect(cyclesAfterReset == 0, "reset() should bring the Machine back to cycles == 0")
 
             controller.start()
             #expect(waitForStatus(controller, timeout: 30) { $0.cycles >= 20_000_000 },
-                    "the recreated Machine should boot to the menu again, same as a fresh controller")
+                    "the warm-reset Machine should boot to the menu again, same as a fresh controller")
+        }
+
+        /// The assertion that actually distinguishes a warm reset from the
+        /// M1c interim "recreate the Machine" behavior this task replaces:
+        /// `ObjectIdentifier(machine.bus)` must be UNCHANGED across
+        /// `reset()`. This is the seam the task brief asked for in place of
+        /// a media-survives-reset test (Task 4's floppy image doesn't exist
+        /// yet) -- proving the `Bus` (hence every device hanging off it:
+        /// VIAs, COPS, MMU, and whatever Task 4 attaches later) is the SAME
+        /// object after `reset()`, not a fresh one, is exactly what
+        /// guarantees any future Bus-attached media state will survive a
+        /// controller reset by construction, without needing that state to
+        /// exist yet to prove it.
+        @Test
+        func resetKeepsTheSameMachineAndBusIdentity() throws {
+            let controller = try makeController()
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller, timeout: 15) { $0.cycles >= 3_000_000 })
+
+            let busBefore = controller.debugSync { ObjectIdentifier($0.bus) }
+
+            controller.reset()
+            var cyclesAfterReset: UInt64 = 0
+            var busAfter = busBefore
+            for _ in 0..<200 {
+                cyclesAfterReset = controller.debugSync { $0.cycles }
+                busAfter = controller.debugSync { ObjectIdentifier($0.bus) }
+                if cyclesAfterReset == 0 { break }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            #expect(cyclesAfterReset == 0, "precondition: reset() completed")
+            #expect(busAfter == busBefore,
+                    "reset() must warm-reset the live Machine, not recreate it -- Bus identity (and any Task 4 media state attached to it) must survive")
         }
 
         // MARK: input events reach COPS

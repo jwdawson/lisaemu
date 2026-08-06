@@ -147,12 +147,18 @@ private final class Shared {
 /// cycles) back-to-back with no sleep, still draining the mailbox between
 /// slices so input/pause/etc. stay responsive.
 ///
-/// ## reset() interim semantics
+/// ## reset() semantics
 ///
-/// `reset()` tears down and recreates the `Machine` on the emulation thread
-/// (a fresh `Machine(ramSize:)` + `loadROM` + `reset()`), NOT a hardware
-/// warm reset -- that lands in M2 (see `Machine.reset()`'s own doc comment
-/// for the same interim-semantics precedent at the `LisaCore` layer).
+/// `reset()` posts a mailbox command that calls `machine.reset()` -- a true
+/// hardware warm reset (see `LisaCore.Machine.reset()`'s doc comment) -- on
+/// the live emulation-thread `Machine`, rather than tearing down and
+/// recreating it. M1c's interim behavior (recreate `Machine` from scratch)
+/// is gone: warm reset is simpler (no ROM re-read, no re-wiring `onVsync`/
+/// the bus closures), faster, and -- the load-bearing reason -- means any
+/// Bus-attached device state a later task adds (e.g. Task 4's inserted
+/// floppy image) survives a controller reset BY CONSTRUCTION, since the
+/// `Machine`/`Bus` object identity never changes. Real hardware's RESTART
+/// button doesn't eject media either.
 public final class EmulationController {
     public let framePublisher = FramePublisher()
 
@@ -295,7 +301,7 @@ public final class EmulationController {
     private static func runEmulationThread(shared: Shared, startupGate: DispatchSemaphore,
                                             shutdownGate: DispatchSemaphore) {
         let romBytes: [UInt8]
-        var machine: Machine
+        let machine: Machine
         do {
             romBytes = try ROMImage.load(directory: shared.romDirectory)
             machine = makeMachine(romBytes: romBytes, shared: shared)
@@ -330,7 +336,10 @@ public final class EmulationController {
                 case .pause:
                     running = false
                 case .reset:
-                    machine = makeMachine(romBytes: romBytes, shared: shared)
+                    // Warm reset (M2 Task 2): same Machine/Bus identity,
+                    // not a recreate -- see this type's "reset() semantics"
+                    // doc comment above.
+                    machine.reset()
                     running = false
                     throttleAnchor = nil
                     haltedPublished = false

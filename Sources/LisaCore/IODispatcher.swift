@@ -67,6 +67,12 @@ final class IODispatcher {
     /// `Bus.vsyncInterruptHandler`.
     let videoTiming: VideoTiming
 
+    /// HLE floppy controller (Task 4) -- see `FloppyController`'s type doc
+    /// comment. Owns the `$C000-$C7FF` shared-RAM window and VIA2 PORTB2
+    /// bit 4 (completion line), composed into `via2.portBInput` below
+    /// alongside `cops`'s own bit 6 (CRDY).
+    let floppy: FloppyController
+
     private var contextBit1 = false
     private var contextBit2 = false
 
@@ -96,10 +102,25 @@ final class IODispatcher {
             scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
             setIRQPending: { [weak bus] pending in bus?.vsyncInterruptHandler(pending) }
         )
+        // Same reasoning as `videoTiming` above: no `self` capture yet.
+        floppy = FloppyController(
+            scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
+            setLevel1Pending: { [weak bus] pending in bus?.floppyInterruptHandler(pending) }
+        )
         // `self` is fully initialized as of the line above -- safe to
         // capture from here on.
         via2.portAInput = cops.portAInput
-        via2.portBInput = cops.portBInput
+        via2.portBInput = { [weak self] in
+            guard let self else { return 0xFF }
+            var value = self.cops.portBInput()
+            if self.floppy.completionLineAsserted {
+                value |= 0x10   // VIA2 PORTB2 bit 4 -- see FloppyController's
+                                 // "Completion line polarity" doc comment.
+            } else {
+                value &= ~0x10
+            }
+            return value
+        }
         via2.onPortAAccess = { [weak self] index, value, isWrite in
             self?.cops.handlePortAAccess(index: index, value: value, isWrite: isWrite)
         }
@@ -150,6 +171,18 @@ final class IODispatcher {
         case 0xE800: return videoPageLatch
         case 0xF801: return statusByte | (videoTiming.pending ? 0x04 : 0)
         case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
+        // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"):
+        // 0=twiggy, 1=single-sided Sony, 2=double-sided Sony. Task 4 moves
+        // this from unknown-I/O (0xFF) to 1 -- matches the 400K install
+        // disks this HLE controller serves; Task 5 validates against the
+        // boot path with trace evidence. Checked BEFORE the $C000-$C7FF
+        // window case below since $C015 falls inside that range but is a
+        // distinct hardware register, not one of FloppyController's named
+        // protocol cells.
+        case 0xC015: return 1
+        // FloppyController's 2KB shared-RAM window (docs/hardware-notes.md
+        // §9), Task 4. Checked after the two explicit board-ID cases above.
+        case 0xC000...0xC7FF: return floppy.read(Int(offset - 0xC000))
         default:
             if let (via, index) = Self.viaRegisterIndex(offset) {
                 return viaInstance(via).peek(index)
@@ -198,7 +231,8 @@ final class IODispatcher {
     private func applyNonLatchWrite(_ offset: UInt32, _ value: UInt8) {
         switch offset {
         case 0xE800: videoPageLatch = value
-        case 0xF801, 0xC031: break   // hardware-driven; CPU writes have no effect
+        case 0xF801, 0xC031, 0xC015: break   // hardware-driven; CPU writes have no effect
+        case 0xC000...0xC7FF: floppy.write(Int(offset - 0xC000), value)
         default: break   // unknown I/O space -- write has no effect beyond being logged
         }
     }

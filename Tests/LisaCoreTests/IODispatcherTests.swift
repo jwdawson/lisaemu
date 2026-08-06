@@ -272,3 +272,50 @@ import Testing
     _ = bus.read8(0xFC_1234)
     #expect(bus.ioTrace.last?.cycles == 42)
 }
+
+// MARK: - FloppyController window ($C000-$C7FF) + board IDs (M2 Task 4)
+//
+// Pure Bus/IODispatcher routing checks -- FloppyController's own protocol
+// (go-byte state machine, zone mapping, etc.) is covered CPU-free and
+// Bus-free in FloppyControllerTests.swift. A bare `Bus`'s `scheduleEvent`
+// defaults to a no-op (see that property's doc comment), so a DISKCMD
+// write's scheduled command-processing event never actually fires here --
+// these tests only exercise that IODispatcher hands offsets in this range
+// to `floppy.read`/`floppy.write` at all, and that the two explicit
+// board-ID cells sharing this address range stay independently correct.
+
+@Test func c015ReturnsSingleSidedSonyBoardID() {
+    // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"): Task 4
+    // moves this from unknown-I/O (0xFF) to 1 (single-sided Sony).
+    let bus = Bus(ramSize: 0x1000)
+    #expect(bus.read8(0xFC_C015) == 1)
+    bus.write8(0xFC_C015, 0x42)   // hardware-driven; CPU writes have no effect
+    #expect(bus.read8(0xFC_C015) == 1)
+}
+
+@Test func c031BoardIDUnchangedByTheFloppyWindow() {
+    // $FCC031 falls inside the $C000-$C7FF window but must keep its own
+    // pre-existing (Task 3 era) behavior, not become a plain window byte.
+    let bus = Bus(ramSize: 0x1000)
+    #expect(bus.read8(0xFC_C031) == 0x00)
+}
+
+@Test func floppyWindowRoutesPlainCellsAsRAMThroughTheBus() {
+    // DISKSEC ($C009) has no address-decoded side effect of its own --
+    // a plain read-back through the real Bus, same as any other window
+    // cell besides DISKCMD.
+    let bus = Bus(ramSize: 0x1000)
+    bus.write8(0xFC_C009, 0x07)
+    #expect(bus.read8(0xFC_C009) == 0x07)
+    #expect(bus.floppy.read(0x09) == 0x07, "the same byte, seen directly on the owning FloppyController")
+}
+
+@Test func floppyWindowDiskCmdWriteReachesTheController() {
+    // DISKCMD ($C001) IS address-decoded (the go-byte hook) -- a bus write
+    // must reach FloppyController.write, not just land in a dumb byte
+    // store, even though a bare Bus's no-op scheduleEvent means the
+    // command itself never actually completes here.
+    let bus = Bus(ramSize: 0x1000)
+    bus.write8(0xFC_C001, FloppyController.GoByte.excmd.rawValue)
+    #expect(bus.floppy.read(0x01) == FloppyController.GoByte.excmd.rawValue)
+}

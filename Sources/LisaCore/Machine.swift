@@ -16,6 +16,14 @@ public final class Machine {
     /// itself (that lives in `VideoTiming`), so this stands in for it in
     /// the IRQ-level computation below.
     public var vsyncPending = false
+    /// Level-1 IRQ source alongside VIA1 and `vsyncPending` (docs/hardware-
+    /// notes.md §5: Twiggy/Sony floppy interrupts are Level 1). Driven by
+    /// `FloppyController`'s completion line via `Bus.floppyInterruptHandler`
+    /// -- see `FloppyController`'s type doc comment "Level-1 IRQ
+    /// contribution" for why this can't just fold into VIA2's own IFR/IER
+    /// (VIA2 is wired to CPU level 2). Cleared by `Machine.reset()`
+    /// (`FloppyController.reset()` calls the handler with `false`).
+    public var floppyPending = false
 
     /// M1c shell hook (docs/superpowers/plans/2026-08-05-m1c-app-shell.md
     /// Task 1): called on the emulation thread at every `VideoTiming` vsync
@@ -52,6 +60,7 @@ public final class Machine {
             self.schedule(at: self.cycles &+ delay) { _ in action() }
         }
         bus.vsyncInterruptHandler = { [weak self] pending in self?.vsyncPending = pending }
+        bus.floppyInterruptHandler = { [weak self] pending in self?.floppyPending = pending }
         bus.videoTiming.onVsyncTick = { [weak self] in self?.onVsync?() }
     }
 
@@ -73,6 +82,9 @@ public final class Machine {
     /// - Cycle counter, halt flag, and event queue cleared.
     /// - COPS and VideoTiming re-initialized (re-triggering their
     ///   recurring/power-on events) — unchanged from before this task.
+    /// - `FloppyController.reset()` (M2 Task 4): drops any in-flight
+    ///   command and clears the shared-RAM window, but an inserted disk
+    ///   survives — see that method's doc comment.
     ///
     /// `mmu` (the SORG/SLIM segment registers) is deliberately left
     /// untouched — modeled as RAM-like, surviving reset. This is a
@@ -104,6 +116,7 @@ public final class Machine {
         // `COPS.reset()`'s doc comment.
         bus.cops.reset()
         bus.videoTiming.reset()
+        bus.floppy.reset()
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {
@@ -185,7 +198,7 @@ public final class Machine {
         guard executed > 0 else { return }
         bus.via1.tick(cycles: executed)
         bus.via2.tick(cycles: executed)
-        let level1 = (bus.via1.irqAsserted || vsyncPending) ? 1 : 0
+        let level1 = (bus.via1.irqAsserted || vsyncPending || floppyPending) ? 1 : 0
         let level2 = bus.via2.irqAsserted ? 2 : 0
         cpu.setIRQ(level: max(level1, level2))
     }

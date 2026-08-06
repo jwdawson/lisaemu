@@ -76,6 +76,15 @@ public final class Bus {
     /// injection pattern. `Machine.init` wires this to `{ [weak self] in
     /// self?.vsyncPending = $0 }`; defaults to a no-op for bare `Bus` use.
     public var vsyncInterruptHandler: (Bool) -> Void = { _ in }
+    /// Reaches `Machine.floppyPending` -- the level-1 IRQ OR-term for the
+    /// floppy completion line (docs/hardware-notes.md §5: Twiggy/Sony
+    /// floppy interrupts are Level 1, not VIA2's level 2, even though the
+    /// completion line itself lives on VIA2 port B -- see
+    /// `FloppyController`'s type doc comment "Level-1 IRQ contribution").
+    /// Mirrors `vsyncInterruptHandler`'s injection pattern exactly.
+    /// `Machine.init` wires this to `{ [weak self] in self?.floppyPending =
+    /// $0 }`; defaults to a no-op for bare `Bus` use.
+    public var floppyInterruptHandler: (Bool) -> Void = { _ in }
     /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.
@@ -494,6 +503,14 @@ public final class Bus {
     /// clearing its own event queue) to (re-)start the self-rescheduling
     /// vsync event, mirroring `cops.reset()`.
     public var videoTiming: VideoTiming { io.videoTiming }
+    /// HLE floppy controller (Task 4), owned by `IODispatcher` and wired to
+    /// `via2`'s port B (completion line) and `floppyInterruptHandler`
+    /// above -- see `FloppyController`'s type doc comment.
+    /// `Machine.reset()` calls `floppy.reset()` (after clearing its own
+    /// event queue) to drop any in-flight command, mirroring
+    /// `cops.reset()`/`videoTiming.reset()` -- the inserted disk, if any,
+    /// survives (see `FloppyController.reset()`'s doc comment).
+    public var floppy: FloppyController { io.floppy }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

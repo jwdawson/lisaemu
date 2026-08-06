@@ -210,3 +210,54 @@ import Testing
     via.write(0, 0x42)
     #expect(via.peek(0) == via.read(0))
 }
+
+// MARK: - Hardware reset (M2 Task 2)
+
+@Test func resetClearsDDRsORsACRPCRIERIFRAndDisarmsTimers() {
+    let via = VIA6522()
+    via.write(2, 0xFF)     // DDRB
+    via.write(3, 0xFF)     // DDRA
+    via.write(0, 0x11)     // ORB
+    via.write(1, 0x22)     // ORA
+    via.write(11, 0x40)    // ACR: T1 free-run
+    via.write(12, 0xC9)    // PCR
+    via.write(14, 0x82)    // IER: enable bit1
+    via.write(6, 5)        // T1LL
+    via.write(5, 0)        // T1CH: loads + arms T1 (free-run)
+    via.tick(cycles: 6)    // let it fire once, confirming it was really armed
+    #expect(via.read(13) == 0x40, "precondition: T1 fired and set IFR6")
+
+    via.reset()
+
+    #expect(via.peek(2) == 0, "DDRB cleared")
+    #expect(via.peek(3) == 0, "DDRA cleared")
+    #expect(via.peek(11) == 0, "ACR cleared")
+    #expect(via.peek(12) == 0, "PCR cleared")
+    #expect(via.peek(14) == 0x80, "IER cleared (bit7 is always-synthesized, not stored)")
+    #expect(via.peek(13) == 0x00, "IFR cleared, no bits, no synthesized master bit")
+    #expect(via.irqAsserted == false)
+
+    // Timers stopped: a full 16-bit wrap with no reload must NOT set any
+    // further IFR flag, even though ACR/T1 were free-run and armed right
+    // before reset (see `VIA6522.reset()`'s doc comment on this exact
+    // simplification vs. some datasheets' "T1/T2 unaffected by RES").
+    via.tick(cycles: 0x1_0000)
+    #expect(via.peek(13) == 0x00, "T1 must not refire after reset without an explicit reload")
+}
+
+@Test func resetLeavesUnaffectedRegistersReadableForATestFollowingReload() {
+    // After reset, a fresh reload (matching real post-reset software
+    // init) must still successfully re-arm and fire -- reset must not
+    // leave the VIA in some permanently-disarmed state.
+    let via = VIA6522()
+    via.write(11, 0x00)
+    via.write(6, 5)
+    via.write(5, 0)
+    via.tick(cycles: 6)
+    via.reset()
+
+    via.write(6, 5)
+    via.write(5, 0)   // re-arm one-shot T1
+    via.tick(cycles: 6)
+    #expect(via.read(13) == 0x40, "T1 fires again once explicitly re-armed after reset")
+}

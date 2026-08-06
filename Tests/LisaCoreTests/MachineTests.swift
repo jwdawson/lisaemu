@@ -111,6 +111,68 @@ extension MusashiSuites {
             #expect(Machine.boundedSlice(from: 0, to: 1) == 1)
         }
 
+        /// M2 Task 2 exit criterion: `reset()` is now a true hardware warm
+        /// reset, not the M1b cold-init-only stub. Dirties setup mode,
+        /// domain, and both VIAs' registers through the SAME paths real
+        /// hardware/software would use (address-decoded latches for
+        /// setup/domain, direct register writes for the VIAs -- there is
+        /// no address-decoded VIA path exercised here, matching
+        /// `VIA6522Tests`' own convention of driving the register file
+        /// directly), then asserts `reset()` restores the documented
+        /// baseline.
+        @Test
+        func resetRestoresTheDocumentedWarmResetBaseline() {
+            let m = Machine(ramSize: 0x10000)
+            var rom = [UInt8](repeating: 0, count: 0x4000)
+            rom[0] = 0xAB   // distinctive byte at the low ROM mirror's address 0
+            m.bus.loadROM(rom)
+
+            // Dirty setup + domain via the REAL address-decoded latches
+            // (docs/hardware-notes.md "Setup Latch"/"Domain Context
+            // Latches") -- both writes happen while setup mode is still ON
+            // so flat addressing reaches IODispatcher directly; dropping
+            // setup ($FCE012) must be the LAST of the two, since once
+            // setup is off these addresses would otherwise have to route
+            // through the (unprogrammed) MMU instead.
+            m.bus.write8(0x00FC_E00E, 0)   // ctbit2on -> domain 2 (bit1 off, bit2 on)
+            m.bus.write8(0x00FC_E012, 0)   // SetUpReset -> setup mode off
+            #expect(m.bus.domain == 2, "precondition: domain latch dirtied")
+            #expect(m.bus.setupMode == false, "precondition: setup latch dirtied")
+
+            // Dirty both VIAs' registers directly (DDR/ACR/IER + an armed
+            // T1), matching VIA6522Tests' own register-file-level access.
+            for via in [m.bus.via1, m.bus.via2] {
+                via.write(2, 0xFF)    // DDRB
+                via.write(3, 0xFF)    // DDRA
+                via.write(11, 0x40)   // ACR: T1 free-run
+                via.write(12, 0xC9)   // PCR
+                via.write(14, 0x82)   // IER: enable bit1
+                via.write(6, 5)       // T1LL
+                via.write(5, 0)       // T1CH: loads+arms T1
+            }
+
+            m.reset()
+
+            #expect(m.bus.setupMode == true, "reset re-asserts the SETUP flip-flop")
+            #expect(m.bus.domain == 0, "reset clears the domain-context latches")
+            #expect(m.cycles == 0, "reset clears the cycle counter")
+
+            for via in [m.bus.via1, m.bus.via2] {
+                #expect(via.peek(2) == 0, "DDRB cleared")
+                #expect(via.peek(3) == 0, "DDRA cleared")
+                #expect(via.peek(11) == 0, "ACR cleared")
+                #expect(via.peek(12) == 0, "PCR cleared")
+                #expect(via.peek(14) == 0x80, "IER cleared (bit7 is always-synthesized, not stored)")
+                #expect(via.peek(13) == 0x00, "IFR cleared, no bits, no synthesized master bit")
+            }
+
+            // Setup being re-asserted brings the low ROM mirror back:
+            // vectors (and everything else in $0000-$3FFF) fetch from the
+            // ROM mirror again, not through the (now-cleared) domain-2
+            // translation that was active right before reset.
+            #expect(m.bus.read8(0x0) == 0xAB, "low-address reads hit the ROM mirror again once setup is back on")
+        }
+
         @Test
         func stepAdvancesCyclesAndDrainsDueEvents() {
             let m = Machine(ramSize: 0x10000)

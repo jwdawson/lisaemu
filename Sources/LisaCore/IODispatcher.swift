@@ -207,6 +207,18 @@ final class IODispatcher {
         bus.domain = (contextBit1 ? 1 : 0) | (contextBit2 ? 2 : 0)
     }
 
+    /// Clears both domain-context latch bits and recomputes `bus.domain`
+    /// back to 0 -- the M2 Task 2 warm-reset counterpart to the
+    /// address-decoded $E008/$E00A/$E00C/$E00E handlers in `applyLatch`
+    /// above, called directly (not via a synthetic bus access) since a
+    /// hardware reset re-asserts these lines without the CPU issuing any
+    /// bus cycle. `Bus.resetSetupAndContextLatches()` is the sole caller.
+    func resetContextLatches() {
+        contextBit1 = false
+        contextBit2 = false
+        syncDomain()
+    }
+
     private func viaInstance(_ via: Int) -> VIA6522 {
         via == 1 ? via1 : via2
     }

@@ -5,7 +5,6 @@ extension MusashiSuites {
     @Suite struct BusErrorTests {
         @Test func mmuFaultRaisesRealBusErrorException() {
             let machine = Machine(ramSize: 0x10000)
-            machine.bus._setSetupModeForTesting(false)
             // Domain 0, segment 0 (logical 0x0...0x1FFFF): vectors + code,
             // mapped identity read/write. Segment 1 (logical 0x2_0000...) is
             // left absent (the default slim 0 -> absent nibble), so the
@@ -23,7 +22,13 @@ extension MusashiSuites {
             // then NOP.
             machine.bus.load([0x10, 0x39, 0x00, 0x02, 0x00, 0x00, 0x4E, 0x71], at: 0x400)
 
+            // machine.reset() (M2 Task 2: a true hardware warm reset) itself
+            // re-asserts the SETUP flip-flop -- dropping setup mode (to
+            // reach the MMU-translated fault path this test exercises) must
+            // happen AFTER reset, not before, mirroring how the real ROM
+            // only drops setup once its own boot code chooses to.
             machine.reset()
+            machine.bus._setSetupModeForTesting(false)
             machine.run(until: 500)
 
             #expect(machine.cpu[.d1] == 99)
@@ -47,7 +52,6 @@ extension MusashiSuites {
             // without a base case and crashes the process (SIGBUS/stack
             // overflow), not merely fails an assertion.
             let machine = Machine(ramSize: 0x10000)
-            machine.bus._setSetupModeForTesting(false)
             machine.bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 128, access: .readWrite)
             // Segment 1 (0x2_0000...) and segment 2 (0x4_0000...) are both
             // left absent (the default): segment 1 is the program's
@@ -61,7 +65,11 @@ extension MusashiSuites {
             // then NOP.
             machine.bus.load([0x10, 0x39, 0x00, 0x02, 0x00, 0x00, 0x4E, 0x71], at: 0x400)
 
+            // See mmuFaultRaisesRealBusErrorException's comment: machine.
+            // reset() re-asserts setup mode, so dropping it again must
+            // happen AFTER reset.
             machine.reset()
+            machine.bus._setSetupModeForTesting(false)
             machine.run(until: 500)   // must return promptly -- no crash, no hang
 
             #expect(machine.halted == true)

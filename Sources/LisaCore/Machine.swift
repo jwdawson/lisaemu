@@ -55,14 +55,45 @@ public final class Machine {
         bus.videoTiming.onVsyncTick = { [weak self] in self?.onVsync?() }
     }
 
-    /// Cold-init only: assumes a freshly constructed Bus (setup mode on, MMU/VIAs pristine). Resets CPU, cycle
-    /// counter, halt flag, and event queue; also re-triggers COPS and VideoTiming periodic events.
+    /// A true hardware warm reset (M2 Task 2), matching what the Lisa's
+    /// reset line does to every device on the bus:
     ///
-    /// NOT a hardware warm reset — VIA registers, setup latch, domain latches, and MMU state are deliberately
-    /// untouched. Calling on a machine that has dropped setup mode would fetch vectors through the
-    /// programmed MMU (wrong for a warm reset). Real RESTART semantics (the boot menu's RESTART button) are
-    /// an M2 task; see the M1b final review.
+    /// - `Bus.resetSetupAndContextLatches()`: re-asserts the SETUP
+    ///   flip-flop and clears both domain-context latch bits (`domain`
+    ///   back to 0) — see that method's doc comment.
+    /// - Both VIAs (`VIA6522.reset()`): DDRs/ORs/ACR/PCR/IER/IFR cleared,
+    ///   timers disarmed — see that method's doc comment for the
+    ///   datasheet basis and the one documented simplification.
+    /// - `cpu.reset()`: CPU reset, deliberately AFTER the two resets above
+    ///   — `m68k_pulse_reset()` immediately fetches the SSP/PC vectors
+    ///   from the bus, and that fetch must see the FRESH setup/domain
+    ///   state (flat addressing, domain 0), not whatever was dirty right
+    ///   before reset, exactly like real hardware where the bus-level
+    ///   reset conditions settle before the CPU's own vector fetch.
+    /// - Cycle counter, halt flag, and event queue cleared.
+    /// - COPS and VideoTiming re-initialized (re-triggering their
+    ///   recurring/power-on events) — unchanged from before this task.
+    ///
+    /// `mmu` (the SORG/SLIM segment registers) is deliberately left
+    /// untouched — modeled as RAM-like, surviving reset. This is a
+    /// modeling choice, not a hardware citation either way: with SETUP
+    /// re-asserted, the CPU always fetches vectors (and everything else in
+    /// $0000-$3FFF) through the flat ROM-mirror path regardless of what
+    /// those registers still contain, so stale MMU content is unobservable
+    /// at reset time — see `Bus.resetSetupAndContextLatches()`'s doc
+    /// comment. `ram` is also untouched (real hardware: RAM survives a
+    /// warm reset too).
+    ///
+    /// M1c interplay: `EmulationController.reset()` (LisaShell) now posts
+    /// a mailbox command that calls this method on the live emulation-
+    /// thread `Machine`, instead of tearing down and recreating it — so
+    /// any Bus-attached device state a later task adds (e.g. Task 4's
+    /// inserted floppy image) survives a controller reset by construction,
+    /// exactly like real hardware's RESTART button doesn't eject media.
     public func reset() {
+        bus.resetSetupAndContextLatches()
+        bus.via1.reset()
+        bus.via2.reset()
         cpu.reset()
         cycles = 0
         halted = false

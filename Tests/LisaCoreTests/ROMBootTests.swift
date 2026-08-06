@@ -306,5 +306,48 @@ extension MusashiSuites {
             #expect(fnv1a(fb) == 0xd092_34d2_5516_d0b8,
                     "stable boot-menu framebuffer fingerprint; got \(String(format: "%016llx", fnv1a(fb)))")
         }
+
+        /// **M2 Task 2 exit criterion:** a true hardware warm `Machine.
+        /// reset()` (not the M1b cold-init-only stub, and not tearing down
+        /// the `Machine`) can reboot the SAME `Machine`/`Bus` instance back
+        /// to an indistinguishable boot-menu state. Reuses this file's
+        /// >1%-black-pixels ROBUST invariant and the documented POST-
+        /// complete markers (setup off, domain 0, alive, parked in the
+        /// menu input-idle poll) from `romCompletesPOSTAndReachesBootMenu`
+        /// -- deliberately NOT the exact FNV anchor, which the brief notes
+        /// may legitimately move once a later M2 task (media/floppy state)
+        /// lands.
+        @Test
+        func machineResetRebootsToTheSameDocumentedMenuState() throws {
+            let m = try bootedMachine()
+            m.run(until: 25_000_000)
+            #expect(m.bus.setupMode == false, "precondition: first boot reached the menu")
+            #expect(m.halted == false)
+
+            m.reset()
+
+            #expect(m.bus.setupMode == true, "warm reset re-asserts the SETUP flip-flop")
+            #expect(m.bus.domain == 0, "warm reset clears the domain-context latches")
+            #expect(m.cycles == 0, "warm reset clears the cycle counter")
+
+            m.run(until: 25_000_000)
+
+            #expect(m.bus.setupMode == false, "second boot dropped setup mode again")
+            #expect(m.bus.domain == 0, "domain 0 active again")
+            #expect(m.halted == false,
+                    "second boot should reach the same live idle state, not a halt/fault; PC=\(String(format: "%08X", m.cpu[.pc]))")
+            #expect(m.bus.busErrorPulseCount == 0, "no bus error on the second boot")
+            let pc = m.cpu[.pc]
+            #expect((0x00FE_2DBE...0x00FE_2DD6).contains(pc),
+                    "second boot should park in the same boot-menu input-wait poll; got \(String(format: "%08X", pc))")
+
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fb.count == Bus.framebufferByteCount)
+            var blackPixels = 0
+            for b in fb { blackPixels += b.nonzeroBitCount }
+            let totalPixels = fb.count * 8
+            #expect(Double(blackPixels) / Double(totalPixels) > 0.01,
+                    ">1% of pixels set on the second boot too; got \(blackPixels)/\(totalPixels)")
+        }
     }
 }

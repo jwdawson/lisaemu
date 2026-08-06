@@ -106,6 +106,33 @@ Source: OS/source-starasm1.text.unix.txt:232-258 (SET_DOMAIN), LDASM:145-151
 - ctbit2off = $FCE00C
 - Behavior: Access-triggered like SetUp; 2 bits encode domains 0..3
 
+### Reset Line (Warm Reset)
+
+M2 Task 2 modeling note, not a primary-source citation (no OS-source
+listing describing the 68000 RESET line's effect on these specific
+latches/registers has surfaced): the SETUP flip-flop's own documented
+power-on default is "on" (translation off, flat `$FCxxxx` I/O addressing --
+see "Setup Latch" above), and a hardware reset re-establishes that same
+default state, re-asserting SETUP and clearing both domain-context latch
+bits (`domain` back to 0) -- this is the natural reading of "reset returns
+the machine to its power-on state" applied to latches whose power-on state
+is independently documented above, not a separately-sourced fact about the
+RESET line itself.
+- The SORG/SLIM MMU segment registers are modeled as SURVIVING a warm
+  reset (RAM-like storage, not re-zeroed) -- a deliberate simplification,
+  not a hardware citation either way. With SETUP re-asserted, the CPU's
+  vector fetch and everything else in `$0000-$3FFF` goes through the flat
+  ROM-mirror path (see "ROM Range" under Memory Map) regardless of what
+  those registers still contain, so their survival is unobservable at
+  reset time either way -- see `LisaCore/Machine.swift`'s `reset()` doc
+  comment.
+- Both VIA6522 chips are reset per the 6522/65C22 datasheet's documented
+  RES behavior (see "VIA 6522 Chips" below) -- `LisaCore/VIA6522.swift`'s
+  `reset()` doc comment has the full citation and the one documented
+  simplification (this model additionally disarms in-flight timers, where
+  some datasheets describe T1/T2 counter/latch content as unaffected by
+  RES).
+
 ### Physical Byte 0 Relocation Cell
 
 - Address: prom_byte0 = $2A4 (OS/source-LDEQU.TEXT.unix.txt:65)
@@ -341,6 +368,18 @@ Source: libhw-DRIVERS:592-620
 - PCR2 = $C9
 - ACR2 = $01
 - IER2 = $82
+
+### Reset (RES) Behavior
+
+Per the commonly-documented 6522/65C22 datasheet RES pin behavior: clears
+DDRA/DDRB/ORA/ORB/ACR/PCR/IER/IFR to 0 (all peripheral pins become inputs,
+both timers forced to one-shot mode with handshaking disabled, every
+interrupt source masked). See "Reset Line (Warm Reset)" above for the
+cross-reference to the MMU/setup-latch side of a Lisa hardware reset, and
+`LisaCore/VIA6522.swift`'s `reset()` doc comment for the one documented
+simplification this model makes (disarming in-flight timers, where some
+datasheet variants describe T1/T2 counter/latch content as unaffected by
+RES).
 
 ## 4. COPS (via VIA2 Port A for data; Port B for the CRDY handshake)
 

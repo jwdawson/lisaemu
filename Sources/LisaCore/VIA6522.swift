@@ -127,6 +127,41 @@ public final class VIA6522 {
 
     public init() {}
 
+    /// Hardware reset state (M2 Task 2, docs/hardware-notes.md §3 "Reset
+    /// Line"): clears DDRA/DDRB/ORA/ORB/ACR/PCR/IER/IFR to 0 -- all
+    /// peripheral pins become inputs, both output registers go to 0, ACR
+    /// forces T1 back to one-shot mode (bit6=0) with handshaking disabled
+    /// (PCR=0), and IER=0 masks every interrupt source (IFR reads back as
+    /// bits 0-6 all clear, bit 7 synthesized 0 since `ifr & ier == 0`).
+    /// This matches the commonly-documented 6522/65C22 RES pin behavior.
+    ///
+    /// Datasheet nuance NOT modeled literally: several 6522/65C22
+    /// datasheets describe T1/T2's counter/latch registers and the shift
+    /// register (SR) as UNAFFECTED by RES -- only the surrounding control
+    /// registers (ACR/IER/etc.) are cleared, so a real chip's T1 counter
+    /// keeps counting from wherever it was and could still set an IFR bit
+    /// on its next underflow (just masked from IRQ by the now-zero IER).
+    /// This model instead also disarms both timers (`t1Armed`/`t2Armed =
+    /// false`, leaving counter/latch/SR *contents* untouched) -- i.e.
+    /// "timers stopped" per the task brief: no further IFR flag can be set
+    /// until an explicit reload (T1C-H/T2C-H write) re-arms them. Chosen
+    /// for deterministic, fully-testable post-reset behavior; no ROM
+    /// boot-path dependency on a stale pre-reset-armed timer surviving
+    /// through reset has been observed to require the literal datasheet
+    /// reading.
+    public func reset() {
+        ddrb = 0
+        ddra = 0
+        orb = 0
+        ora = 0
+        acr = 0
+        pcr = 0
+        ier = 0
+        ifr = 0
+        t1Armed = false
+        t2Armed = false
+    }
+
     /// True whenever any enabled interrupt flag is set (`(ifr & ier & 0x7F)
     /// != 0`) -- the same condition IFR bit 7 synthesizes on read. `Machine`
     /// reads this after every slice/step to compute the CPU's IRQ level.

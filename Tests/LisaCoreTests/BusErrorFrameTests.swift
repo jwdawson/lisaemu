@@ -31,7 +31,6 @@ extension MusashiSuites {
     @Suite struct BusErrorFrameTests {
         @Test func rteRoundTripReadsFaultAddressAndResumesAtSuccessor() {
             let machine = Machine(ramSize: 0x10000)
-            machine.bus._setSetupModeForTesting(false)
             // Domain 0, segment 0 (logical 0x0...0x1FFFF) mapped identity
             // read/write -- vectors, code, handler, and the captured-address
             // cell all live here. Segment 1 (logical 0x2_0000...) is left
@@ -72,7 +71,14 @@ extension MusashiSuites {
                 at: 0x600
             )
 
+            // machine.reset() (M2 Task 2: a true hardware warm reset) itself
+            // re-asserts the SETUP flip-flop -- exactly like real hardware
+            // always starts a reset in flat/setup mode. Dropping setup mode
+            // (to reach the MMU-translated fault path this test exercises)
+            // must happen AFTER reset, not before, mirroring how the real
+            // ROM only drops setup once its own boot code chooses to.
             machine.reset()
+            machine.bus._setSetupModeForTesting(false)
             machine.run(until: 500)
 
             #expect(machine.bus.lastFault?.reason == .invalidSegment)

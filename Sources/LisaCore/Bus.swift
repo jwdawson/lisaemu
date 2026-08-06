@@ -180,6 +180,27 @@ public final class Bus {
         setupMode = value
     }
 
+    /// True hardware warm reset of the setup/domain-context latches (M2
+    /// Task 2): the reset line re-asserts the SETUP flip-flop -- real
+    /// hardware's power-on default is SETUP on (see `setupMode`'s own doc
+    /// comment, "Starts `true` at power-on"), and a reset re-establishes
+    /// that same flat-addressing state (docs/hardware-notes.md "Setup
+    /// Latch") -- and clears both domain-context latch bits, so `domain`
+    /// returns to 0 (docs/hardware-notes.md "Domain Context Latches").
+    /// Deliberately does NOT touch `mmu` (the SORG/SLIM segment registers
+    /// are modeled as RAM-like, surviving reset -- with SETUP re-asserted
+    /// the CPU's vector fetch and everything else in $0000-$3FFF goes
+    /// through the flat ROM-mirror path regardless of what those registers
+    /// still contain, so their survival is unobservable at reset time
+    /// either way; see `Machine.reset()`'s doc comment for the same
+    /// modeling note at the orchestration layer) or `ram`. `Machine.reset()`
+    /// is the sole caller; VIA/COPS/VideoTiming reset are handled
+    /// separately there.
+    func resetSetupAndContextLatches() {
+        setupMode = true
+        io.resetContextLatches()
+    }
+
     /// SLIM/SORG MMU port intercept, checked before every other setup-mode
     /// routing decision. Unlike everything else `Bus.access` hands off to
     /// `IODispatcher`, these ports are addressed per 128KB segment block

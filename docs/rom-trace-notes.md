@@ -1550,9 +1550,109 @@ multi-domain MMU task, gated on finding the hardware citation.
   `busErrorPulseCount==0`, `!halted`, `mmuPortWrites>4386`. Without either the
   M3 Task 1 wrap fix or the Task 2 setup-latch fix this derails to `$FE0030`.
 - `loaderBuildsDomain0MMUThenHaltsAtTheDomain1Crossover` — the **Checkpoint-D
-  frontier anchor**: `≥120` `do_an_mmu` (`trap #6`) calls, `mmuPortWrites`
-  climbs past the gate value, the boot **crosses into domain 1** (OQ1), then
-  **halts** at the multi-domain boundary, with `writeAttempts==0` (no-writes).
+  frontier anchor** (SUPERSEDED by M3 Task 4, which resolved OQ1′ so the
+  crossover no longer halts; the test was re-anchored to the new furthest
+  state — see "Kernel push" below): `≥120` `do_an_mmu` (`trap #6`) calls,
+  `mmuPortWrites` climbs past the gate value, the boot **crosses into domain
+  1** (OQ1), then **halts** at the multi-domain boundary, `writeAttempts==0`.
+
+## Kernel push (M3 Task 4) — OQ1′ resolved; the loader loads the OS image; the OS's own COPS driver
+
+### OQ1′ answered — supervisor-mode translation uses the OS domain (0)
+
+OQ1′ asked: on real hardware, when `do_an_mmu` switches the live context into
+the *empty* domain 1 mid-handler (setup off) and keeps fetching its own seg-84
+code, what makes that code reachable? The three candidates were (a) a
+SETUP-mode global bypass, (b) the loader pre-programming domain 1 before the
+pivot, (c) some segments being hardware-global. **Deterministic single-step to
+the fault instant + the OS source refute (a) and (b) and establish the real
+mechanism:**
+
+- **Trace (single-step to the pivot).** The last successful fetch is `$A8402E`
+  (`move.b d1,ctbit1on`, domain 0, **`setup=OFF`**); the very next fetch
+  `$A84034` is in domain 1 and faults. So the context switch is **outside** the
+  `setupon` window — **candidate (a) refuted** (setup is off at the switch, in
+  both the trace and the source: `do_an_mmu` does `setupon` only later, at
+  LDASM:394, inside its loop). And **zero** non-domain-0 SLIM/SORG writes have
+  occurred at that instant — domain 1 is provably empty — so **candidate (b) is
+  refuted**: nothing pre-programs domain 1.
+- **Source (the OS's universal pattern).** `SET_DOMAIN` (starasm1:232-258,
+  header "*Can only be called from the supervisor stack*") writes the `ctbit`
+  latch to the target domain and then `jmp (a0)` straight back to the caller —
+  it *requires* the caller's code to stay mapped across the switch. `do_an_mmu`
+  (LDASM:364-425) does the identical establish-then-keep-running dance with
+  setup off. Neither can work if the context latch gated supervisor fetches.
+  Even the domain-*construction* routines (`MAP_SPACE`/`MAP_DOMAIN`,
+  MMPRIM:491-624) run through `do_an_mmu`, switching to the target domain
+  *before* programming it — a chicken-and-egg that only closes if supervisor
+  code is domain-independent.
+- **The model.** Domain 0 is the **OS/system domain** (`initmmutil` LDASM:215
+  "establish domain 0, the OS domain"); **domains 1-3 are per-user-process**,
+  LRU-assigned from the DCT (`SYSGLOBAL:60/137` `domainRange`/`domvalue`
+  "*user's domain on sys call entry*"; SCHED `Set_Address_Space`/`SelectDomain`
+  212-453; EXCEPASM's "system code" vs "user domain", 108-178). The context
+  (`ctbit`) latch selects the translation map **only for user-mode accesses**;
+  **supervisor-mode accesses always translate through domain 0.** That is the
+  ONLY reading under which every domain-switching OS routine keeps running.
+  Implemented as `Bus.translationDomain` (`supervisor ? 0 : latched domain`);
+  SLIM/SORG *register* programming is a separate mechanism and still targets
+  the raw latched domain, so the loader still builds domains 1-3 for later
+  user-mode execution. Refutes the M3 Task 2 "per-domain vs global" framing:
+  it is neither — it is **supervisor-vs-user**. (hardware-notes.md §1 "Domain
+  Context Latches" updated in lockstep.)
+
+### What the fix reveals — the loader loads the OS image; the OS's COPS driver
+
+With OQ1′ resolved the domain-1 pivot **survives** (`do_an_mmu` establishes
+domain 1, programs it, restores domain 0, `rte`s — `busErrorPulseCount==0`, no
+halt). The loader then builds domain 1's whole register file (an
+`MAP_SPACE`-style clear-to-`mmuabsent` pass — `SLIM=$C00`/`SORG=$000` per
+segment — then the mapped entries; `mmuPortWrites` `4638 → 5414`), completes,
+and **reads the OS image off the floppy**: `blocksRead` climbs **24 → 75**
+(51 OS-image blocks), every read via the PROM twig read routine `$FE1E4C`,
+`lastError==0`. Control then enters **loaded OS code at `$520000`**.
+
+The boot stops in the OS's own **COPS command-send driver** (`$520824`). It is
+the very protocol the ROM uses (COPS.swift type doc "command-send protocol",
+hardware-notes.md §4): stage the command byte to **IORA2 register 15** (the
+*no-handshake* ORA alias, `$FCDD9F`), then drive it by flipping **DDRA2**
+(`$FCDD87`) to `$FF` (`move.b D3,(A1)` at `$520894`, `D3=$FFFF`), polling
+**CRDY** (VIA2 PORTB bit 6, `$FCDD81`) throughout. The routine is sending
+`$7C` ("enable mouse interrupts", §4). It **spins** at `$520842-$52084E`
+because our simplified COPS model drops CRDY on *every* register-15 write
+(`COPS.handlePortAAccess` → `handleCommandWrite`, no index guard on writes),
+and this driver re-writes register 15 on every poll iteration — so CRDY, which
+the loop waits to read *high*, never recovers. On real hardware a register-15
+write is *no-handshake*: it stages the byte without strobing the COPS, so CRDY
+is untouched and the loop falls straight through to the DDRA2 drive (which is
+the real "send"). The ROM path tolerates the shortcut because it writes
+register 15 exactly once; this OS driver does not.
+
+### The M3 Task 4 STOP — a genuinely-new subsystem boundary (M4)
+
+This is the OS's **first non-ROM COPS use**, and closing it faithfully means
+modeling the **DDRA2-gated COPS handshake** (register-15 stages, no CRDY
+change; the `DDRA2 $00→$FF` transition drops CRDY; the ack raises it) and
+re-validating the pinned ROM COPS path (menu FNV fingerprint, the POST presence
+probe, `COPSTests`, M1c input) — the ROM currently *relies* on the reg-15-drops-
+CRDY shortcut, so this is a rework, not a one-liner. Parked as an **M4
+requirement** (COPS-driver fidelity / interrupt-driven COPS), alongside the
+already-recorded observation that interrupts stay masked at 7 the entire path
+(`minSR=$2700` — the COPS/floppy IRQ is never delivered) and no floppy WRITE
+ever occurs (`writeAttempts==0`). Framebuffer unchanged (menu still present,
+`78181` px) — the loader/OS draw nothing before this boundary.
+
+### What the M3 Task 4 tests pin (`ROMFloppyBootTests` / `BusTests`)
+
+- `BusTests.supervisorTranslationUsesOSDomainZeroRegardlessOfContextLatch` —
+  the OQ1′ mechanism as a unit: with the latch on (empty) domain 1, a
+  **supervisor** access resolves through domain 0 (succeeds); a **user** access
+  follows the latch into domain 1 (faults).
+- `domain1CrossoverSurvivesLoaderLoadsOSImageAndReachesTheCOPSDriver` (re-anchor
+  of the Task 2 frontier test) — the crossover **survives** (`!halted`,
+  `busErrorPulseCount==0`), `do_an_mmu` returns to domain 0, `≥120` trap-#6
+  calls, `mmuPortWrites` climbs past 4638, `blocksRead==75`, `lastError==0`,
+  the PC reaches the OS COPS driver `$520800-$5208FF`, `writeAttempts==0`.
 
 ## M3 Task 3 — deferrals re-recorded to M4 (parked-debt bundle)
 

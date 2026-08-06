@@ -136,6 +136,31 @@ Source: OS/source-starasm1.text.unix.txt:232-258 (SET_DOMAIN), LDASM:145-151
 - ctbit2on = $FCE00E
 - ctbit2off = $FCE00C
 - Behavior: Access-triggered like SetUp; 2 bits encode domains 0..3
+- **Domain 0 is the OS/system domain; domains 1-3 are per-user-process
+  (M3 Task 4, OQ1′).** `initmmutil` (LDASM:215) "establish domain 0, the OS
+  domain"; domains 1-3 are LRU-assigned to user processes from the DCT
+  (`SYSGLOBAL:60/137` `domainRange`/`domvalue` "user's domain on sys call
+  entry"; SCHED `Set_Address_Space`/`SelectDomain` 212-453; EXCEPASM
+  "system code" vs "user domain", 108-178).
+- **The context latch selects the translation map ONLY for user-mode
+  accesses; supervisor-mode accesses always translate through domain 0**
+  (M3 Task 4, OQ1′). This is the only reading consistent with the OS's own
+  code: `SET_DOMAIN` (starasm1:232-258, "*can only be called from the
+  supervisor stack*") flips the latch then `jmp (a0)` back to the caller, and
+  `do_an_mmu` (LDASM:364-425) flips the latch **with setup OFF** then keeps
+  fetching its own seg-84 code and reading the SMT — both would fault on the
+  first post-switch fetch if the latch gated supervisor translation, and no
+  Lisa would boot. Even the domain-construction routines
+  (`MAP_SPACE`/`MAP_DOMAIN`, MMPRIM:491-624) switch to the target domain
+  *before* programming it. Deterministic single-step confirms the pivot fetch
+  `$A84034` occurs in the freshly-latched, empty domain 1 with `setup=OFF` and
+  nothing written to domain 1 (rom-trace-notes.md "Kernel push (M3 Task 4)").
+  Implemented as `LisaCore/Bus.swift`'s `translationDomain`
+  (`supervisor ? 0 : latched domain`); SLIM/SORG *register* programming
+  (`slimSorgPortAccess`) still targets the raw latched domain, so the loader
+  builds domains 1-3 for later user-mode execution. (This SUPERSEDES the M3
+  Task 2 "per-domain vs global segment presence" framing of OQ1′: it is
+  neither — it is supervisor-vs-user.)
 
 ### Reset Line (Warm Reset)
 
@@ -455,6 +480,26 @@ Step numbering above is the ROM's actual order (DDRA2 → output happens
 AFTER, not before, the "wait for not-ready" poll) — the original OS-source
 listing's step numbering implied output-then-poll; the ROM trace is the
 primary source for the corrected order.
+
+**M4 boundary — the OS's own COPS command-send driver (M3 Task 4 STOP).**
+Once M3 Task 4 resolved OQ1′ (§1 Domain Context Latches), the boot loads the
+OS image and reaches loaded OS code at `$520000` running the identical
+command-send protocol from RAM — an OS driver (`$520824`) sending `$7C`
+("enable mouse interrupts"). It **stages** to IORA2 register 15 (`$FCDD9F`,
+no-handshake) and then **drives** via DDRA2 (`$FCDD87` ← `$FF`), exactly as
+steps 1-4 above. The emulator STALLS here: `LisaCore/COPS.swift`'s simplified
+model drops CRDY on *every* register-15 write (it has no per-index guard on
+writes), but this driver re-writes register 15 on **every poll iteration**, so
+CRDY — which the loop reads *high* to proceed — never recovers. The ROM path
+survives the shortcut only because it writes register 15 exactly once. Closing
+this needs a **DDRA2-gated CRDY handshake** (register-15 write = no CRDY
+change; the `DDRA2 $00→$FF` transition = the real send that drops CRDY; the ack
+raises it) **plus** re-validation of the pinned ROM COPS path (menu FNV, the
+POST presence probe, `COPSTests`, M1c input) — a rework, deferred to M4.
+Companion observations at this boundary: interrupts stay masked at 7 the whole
+path (`minSR=$2700` — the COPS/floppy IRQ is never delivered), and no floppy
+WRITE ever occurs (`writeAttempts==0`). See rom-trace-notes.md "Kernel push
+(M3 Task 4)".
 
 ### Command Bytes
 

@@ -136,12 +136,20 @@ final class InputCapture {
 
     /// Host Carbon virtual keycodes bound to a `LisaEmuApp.swift`
     /// `.commands` keyboard shortcut (all Command-only chords): `kVK_ANSI_P`
-    /// (Pause/Start), `kVK_ANSI_R` (Reset), `kVK_ANSI_T` (Throttle) -- see
-    /// this type's "Keyboard precedence" doc comment, above. Kept in sync
-    /// BY HAND with `LisaEmuApp.swift`'s `CommandMenu("Machine")`; there is
-    /// no shared source of truth to derive this from (SwiftUI's
+    /// (Pause/Start), `kVK_ANSI_R` (Reset), `kVK_ANSI_T` (Throttle),
+    /// `kVK_ANSI_I` (M2 Task 7: File > Insert Disk…) -- see this type's
+    /// "Keyboard precedence" doc comment, above. Kept in sync BY HAND with
+    /// `LisaEmuApp.swift`'s `.commands` block (`CommandMenu("Machine")` AND
+    /// the `CommandGroup`s outside it, e.g. Insert Disk…); there is no
+    /// shared source of truth to derive this from (SwiftUI's
     /// `.keyboardShortcut` isn't introspectable from outside the view
-    /// builder that declared it).
+    /// builder that declared it). **Whenever a new `.keyboardShortcut` is
+    /// added anywhere in `LisaEmuApp.swift`'s `.commands`, add its keycode
+    /// here too** -- this list existing at all doesn't help if it's the one
+    /// place that goes stale (M2 Task 7's own review found exactly this:
+    /// ⌘I was wired to a menu action without a matching entry here, so the
+    /// local monitor forwarded keycap `$53` to the Lisa on every Insert
+    /// Disk… invocation, alongside opening the panel).
     /// `nonisolated`: read by the `nonisolated static func
     /// isReservedMenuShortcut`, below -- a `Set<UInt16>` constant is
     /// trivially `Sendable`/safe to read from any isolation domain, but
@@ -149,7 +157,7 @@ final class InputCapture {
     /// `@MainActor` isolation regardless (only certain "simple literal"
     /// types get an automatic exemption; a collection literal doesn't), so
     /// this needs the explicit annotation.
-    private nonisolated static let reservedMenuShortcutKeyCodes: Set<UInt16> = [0x23, 0x0F, 0x11] // P, R, T
+    private nonisolated static let reservedMenuShortcutKeyCodes: Set<UInt16> = [0x23, 0x0F, 0x11, 0x22] // P, R, T, I
 
     /// `kVK_Escape` -- not in `KeyMap` (the Lisa keyboard predates
     /// Escape), used here only to recognize Command-Escape, the pointer

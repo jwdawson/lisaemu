@@ -52,6 +52,25 @@ struct InputCaptureLogicTests {
         #expect(!InputCapture.isReservedMenuShortcut(modifierFlags: [.command, .shift], keyCode: 0x23))
     }
 
+    // MARK: - Command-I / Insert Disk… (M2 Task 7 review fix: ⌘I was wired
+    // to LisaEmuApp.swift's File > Insert Disk… menu action without a
+    // matching entry in `reservedMenuShortcutKeyCodes`, so the local
+    // keyDown monitor forwarded Lisa keycap $53 (I) to the Lisa on every
+    // Insert Disk… invocation, alongside opening the NSOpenPanel. Pinned as
+    // a regression the same way the P/R/T tests above pin theirs.
+
+    @Test func commandIIsReservedForInsertDiskMenuAction() {
+        // kVK_ANSI_I = 0x22 -- matches LisaEmuApp.swift's Command-I Insert Disk….
+        #expect(InputCapture.isReservedMenuShortcut(modifierFlags: [.command], keyCode: 0x22))
+    }
+
+    @Test func bareIWithoutCommandStillForwardsToTheLisa() {
+        // Only the Command-I CHORD is reserved -- a bare "I" keypress (e.g.
+        // typing into a Lisa application) must still reach the Lisa
+        // uninterrupted, exactly like every other non-shortcut key.
+        #expect(!InputCapture.isReservedMenuShortcut(modifierFlags: [], keyCode: 0x22))
+    }
+
     // MARK: - CaptureState / button-stuck-down (Important 2)
 
     @Test func mouseDownCapturesAndPostsButtonDown() {

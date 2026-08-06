@@ -539,15 +539,19 @@ extension LisaShellMusashiSuites {
                     "precondition: disk inserted before reset")
 
             controller.reset()
-            var cyclesAfterReset: UInt64 = 0
-            var insertedAfterReset = false
-            for _ in 0..<200 {
-                cyclesAfterReset = controller.debugSync { $0.cycles }
-                insertedAfterReset = controller.debugSync { $0.bus.floppy.isInserted }
-                if cyclesAfterReset == 0 { break }
-                Thread.sleep(forTimeInterval: 0.01)
-            }
-            #expect(cyclesAfterReset == 0, "precondition: reset() completed")
+            // `debugSync` is itself the deterministic drain barrier proving
+            // `reset()` was processed: per its own doc comment, it blocks
+            // until the mailbox has been drained "up to and including this
+            // request" -- `.reset` was posted strictly before this `.debug`
+            // command, so FIFO draining guarantees `machine.reset()` has
+            // already run by the time this closure executes. (Fix, code
+            // review: the previous version polled `cycles == 0` in a loop
+            // as a proxy for "reset happened," but this controller is never
+            // started here -- cycles are 0 the whole time regardless of
+            // whether reset ran -- so that loop always exited on its first
+            // iteration and proved nothing. `debugSync`'s own FIFO ordering
+            // guarantee is the real proof, not an observed side effect.)
+            let insertedAfterReset = controller.debugSync { $0.bus.floppy.isInserted }
             #expect(insertedAfterReset,
                     "media must survive reset() by construction (Task 2's warm-reset design; Bus/FloppyController identity never changes) -- proven here through the app-facing insertFloppy()/reset() API")
         }

@@ -43,7 +43,12 @@ import Foundation
 /// (real silicon has no such guard; a real protocol violation would just be
 /// undefined), not a cited hardware behavior.
 ///
-/// ## Completion line polarity -- FLAGGED for Task 5
+/// ## Completion line polarity -- CONFIRMED (Task 5): the ROM's read
+    /// routine waits at `$FE1E3E` (`btst #$4,(A3)` / `bne done`, A3=$FCDD81) --
+    /// it spins until PORTB2 bit 4 is SET, so this model's idle=0/asserted=1
+    /// choice is exactly right; block 0 reads to completion and the boot block
+    /// executes under it (docs/rom-trace-notes.md "Floppy boot (checkpoint C)",
+    /// `ROMFloppyBootTests`). Original design rationale, now validated:
 ///
 /// hardware-notes.md §9 cites the completion line as "VIA2 PORTB2 bit 4
 /// (`BTST #4` in the Level1 handler), level-1 autovector" but gives no
@@ -93,16 +98,17 @@ public final class FloppyController {
         static let pMemAd = 0x180
         static let diskHdr = 0x3E8
 
-        /// AMBIGUITY (a) (hardware-notes.md §9): FINISH_READ/START_WRITE
-        /// treat DISKDATA+1024 as the END of a 512-byte transfer
-        /// (SONYASM:221-231,323-326), so live data may actually sit at
-        /// `$600-$7FF`, not `$400-$5FF`. Kept as ONE constant, per the task
-        /// brief, so Task 5's ROM-trace settlement (the ROM's own RWTS
-        /// reads the buffer -- where it looks IS the answer) is a one-line
-        /// change. Both candidates fit inside the 2KB window either way
-        /// (`$400+512=$600`, `$600+512=$800` -- the window's exact upper
-        /// bound), so this choice has no bounds-safety implications.
-        static let diskData = 0x400   // ALTERNATIVE per ambiguity (a): 0x600
+        /// AMBIGUITY (a) -- SETTLED (Task 5, ROM disassembly). The Rev H boot
+        /// ROM's own read routine (twig_entry `$FE1D76`) reads the data buffer
+        /// at `$FE1DC6: lea ($400,A0),A4` with `A0 = $FCC001`, then
+        /// `movep.l` (stride 2), so the buffer BASE is **`$400`** (NOT the
+        /// `$600` the SONYASM:221-231 FINISH_READ+1024 reading suggested), and
+        /// the 512 data bytes live on the ODD lane of the window -- offsets
+        /// `$401,$403,...,$7FF`. (`performRead` writes them there.) The tag
+        /// buffer is the same shape one movep-group earlier (`$FE1DB0: lea
+        /// ($3E8,A0),A4` -> `$3E9,$3EB,...,$3FF`). See docs/rom-trace-notes.md
+        /// "Floppy boot (checkpoint C)".
+        static let diskData = 0x400
     }
 
     /// The 2KB shared-RAM window, `$000-$7FF` relative to `$FCC000` (the
@@ -360,8 +366,19 @@ public final class FloppyController {
         }
         let data = image.data(block: block)
         let tag = image.tag(block: block)
-        for i in 0..<512 { window[Cell.diskData + i] = data[i] }
-        for i in 0..<12 { window[Cell.diskHdr + i] = tag[i] }
+        // The 6504 shared RAM appears on the ODD bytes of the 68000's
+        // $FCC000 window: the ROM's own read routine (twig_entry $FE1D76 ->
+        // $FE1DB0/$FE1DC6) reads the tag and data buffers with `movep.l`
+        // (stride 2) from base+1 -- `lea ($3E8,A0),A4` / `lea ($400,A0),A4`
+        // where A0 = $FCC001 -- so tag byte i lands at window offset
+        // $3E8+1+2i and data byte i at $400+1+2i. (The single-byte command
+        // cells DISKCMD=$01/DISKPARM=$03/... are already at their odd
+        // offsets, so this interleave only applies to the multi-byte
+        // buffers.) Settles hardware-notes.md §9 ambiguity (a): the buffer
+        // BASE is $400 (not $600), read stride-2 from the odd lane. See
+        // docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
+        for i in 0..<512 { window[Cell.diskData + 1 + 2 * i] = data[i] }
+        for i in 0..<12 { window[Cell.diskHdr + 1 + 2 * i] = tag[i] }
         blocksRead += 1
         setError(ErrorCode.none)
         raiseCompletionLineAfterDelay()

@@ -163,12 +163,17 @@ private func issueRead(_ floppy: FloppyController, _ scheduler: FakeScheduler,
 
         let expectedData = image.data(block: block)
         let expectedTag = image.tag(block: block)
+        // The 6504 shared RAM occupies the ODD bytes of the window: the ROM's
+        // read routine (twig_entry $FE1D76) reads the buffers with `movep.l`
+        // (stride 2) from base+1, so byte i lands at `diskData + 1 + 2*i` /
+        // `diskHdr + 1 + 2*i` (settled from ROM disassembly in Task 5 --
+        // docs/rom-trace-notes.md "Floppy boot (checkpoint C)").
         for i in 0..<512 {
-            #expect(floppy.read(FloppyController.Cell.diskData + i) == expectedData[i],
+            #expect(floppy.read(FloppyController.Cell.diskData + 1 + 2 * i) == expectedData[i],
                     "block \(block) data byte \(i)")
         }
         for i in 0..<12 {
-            #expect(floppy.read(FloppyController.Cell.diskHdr + i) == expectedTag[i],
+            #expect(floppy.read(FloppyController.Cell.diskHdr + 1 + 2 * i) == expectedTag[i],
                     "block \(block) tag byte \(i)")
         }
         #expect(floppy.read(FloppyController.Cell.diskErr) == 0, "block \(block): DISKERR=0 on success")

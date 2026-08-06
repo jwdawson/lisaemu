@@ -1331,12 +1331,13 @@ so all prior MMU/Bus/boot assertions still hold.
 
 **Gate outcome — it falls.** With the wrap, virtual `$A84000` → phys `$800`
 (in RAM), and at the gate the CPU now **executes the real `do_an_mmu`** code
-(`$A84000, $A84004, …$A8406E`) instead of `$FF` garbage; the trap completes and
-`rte`s. Forward progress is **materially further**, then reaches a NEW,
-later stop: after the first `do_an_mmu` return, control lands in ROM at
-`$FE0030` and settles into a tight `$FE019E-$FE01A4` spin, ending at the menu
-idle loop `$FE2DCA`. Characterising and advancing past that new frontier is
-**Task 2** (do not over-trace here).
+(`$A84000, $A84004, …$A8406E`) instead of `$FF` garbage. Task 1 characterised
+the next stop as a `$FE0030` bounce and left it undiagnosed for Task 2.
+**M3 Task 2 diagnosed and moved it:** the `$FE0030` landing was NOT a
+`do_an_mmu` return — it was `do_an_mmu` derailing when it toggles SETUP *on*
+inside its own loop (a *second* emulation divergence, the setup-latch one). See
+"Checkpoint D (M3 Task 2)" below, which supersedes this paragraph's "new stop"
+as the authoritative account.
 
 ### Sanity-negative sweep (device / interrupt / MMU / screen)
 
@@ -1379,3 +1380,130 @@ Robust invariants + exact deterministic anchors: `ldbaseptr($21C)==$100000`,
 `$98==$A84000` (PROM handler overwritten), `mmuPortWrites>4384` (seg-84
 programmed live), framebuffer still populated (`>70000` px), and `!halted`
 (a live progression, not a fault).
+
+## Checkpoint D (M3 Task 2) — beyond the fallen gate: the loader's MMU build and the domain-1 crossover
+
+With the M3 Task 1 page-wrap fix in place, `trap #6` dispatches the CPU to the
+real `do_an_mmu` at logical `$A84000` (phys `$800`). Task 2 traced what happens
+next, from the `bootIntoLoader` bench (parks at `$A84000`), single-stepping.
+
+### The `$FE0030` stop was a *second* emulation divergence — the setup latch
+
+`do_an_mmu` (LDASM:305-446) is a **loop** that programs one MMU segment per
+iteration. Each iteration does `setupoff → (interrupt window) → setupon`, then
+reads the SMT entry and writes the SLIM/SORG ports (LDASM:387-425). The handler
+lives in seg-84 (logical `$A84xxx` → phys `$800`) and it toggles **SETUP on
+inside that loop while continuing to fetch its own code and read the SMT from
+that same seg-84 window.**
+
+Our emulator modelled `setupMode ⇒ flat physical addressing` (the POST-era
+model). So the *instant* `do_an_mmu` executed `move.b d1,setupon` (`$A84068`),
+the next instruction fetch at logical `$A8406E` was treated as flat physical
+`$A8406E` — 2 KB past the 2 MB RAM top — returning `$FFFF` garbage. Executing
+that garbage took an exception whose vector (`$8`/`$C`, the ROM's default
+bus/address-error handler) lands at **`$FE0030`**: `movea.w #$480,A7` (reset SP)
+→ `bra $FE0194` (restart the ROM checksum self-test) → the menu. That IS the
+"`$FE0030` → `$FE019E` spin → menu bounce" Task 1 saw. **It is not a
+`do_an_mmu` return and not a fault-driven load — it is `do_an_mmu` pulling its
+own rug out**, because our SETUP model diverged from hardware.
+
+**Evidence (single-step, deterministic):** at `$A84068` `setupMode` flips
+`false→true`; the very next step has `PC=$A8406E`, `setup=true`, the fetched
+opcode is `$FFFF` ("dc.w $ffff"), and the step after lands at `$FE0030`.
+`busErrorPulseCount` stays **0** throughout — this was never a bus error, it was
+executing `$FF` filler.
+
+### The fix — SETUP does not disturb live translation
+
+hardware-notes.md §1 "Setup Latch" already records the hardware rule: *while
+SETUP is on, SORG/SLIM register writes are redirected, **without disturbing live
+translation.*** The setup-toggling code idiom confirms it — `initmmutil` copies
+itself to low `$7800` ("*work area where setup can be turned on safely*",
+LDASM:165) and `libhw`'s `ReadMagic`/`WriteMagic` run from a fixed low
+`MMURoutine`; `do_an_mmu` runs from seg-84 (phys `$800`). All of these keep
+executing across their own `setupon`, which is only possible if translation
+stays live.
+
+`Sources/LisaCore/Bus.swift` (setup-mode branch): before falling back to flat
+physical, attempt `mmu.translate`; use it **only when it resolves to a present
+memory segment**. Unprogrammed segments decode to `.fault` (default SLIM nibble
+0 → invalidSegment), so every POST setup-mode access — which runs before any
+segment is programmed — still falls through to flat exactly as before; only code
+running from an already-mapped segment (the loader's `do_an_mmu`) changes. All
+172 pre-existing assertions stay green (release + debug); the seg-84 SLIM/SORG
+*register* writes were, and remain, intercepted separately by
+`slimSorgPortAccess`.
+
+### What the fix reveals — the loader's full domain-0 MMU build
+
+`do_an_mmu` now executes cleanly and `rte`s to the loader's `prog_mmu` return
+site **`$10041A`** (the trap frame's stacked PC), `busErrorPulseCount==0`. The
+loader then drives `do_an_mmu` (via `prog_mmu`, LDASM:257-275) **once per
+segment**, walking segment indices up through `$7F` — **127 `trap #6` calls**,
+all `d2=0` (target **domain 0**), programming ~all 128 of domain 0's segments.
+`mmuPortWrites` climbs `4386 → 4638`. Landmarks watched: `blocksRead` stays 24
+(no new LFS reads on this stretch — the loader is mapping, not loading),
+framebuffer unchanged (`78181` px, no draw), **SR never drops below `$2700`**
+(interrupts stay masked at 7 — still no live IRQ delivery), no COPS `$02` clock
+read, and **zero floppy writes** (`writeAttempts==0`).
+
+### The new frontier — the domain-1 crossover (OQ1's forcing point, at last)
+
+**Call #127** is the pivot: `d0=0 d1=1 d2=1 d3=0` — program **domain 1, segment
+0**. `do_an_mmu` "establishes the desired domain" first (LDASM:317-328): it
+writes `ctbit1on` (`$A8402E`), switching the **live** context to domain 1, and
+keeps executing its own seg-84 code there. But domain 1 is **empty** — the
+loader has only just begun building it (this very call is domain 1's *first*
+segment) — so the in-handler instruction fetch finds seg-84 unmapped in domain
+1; the CPU tries to take the fault, the exception-vector read (`$0C-$0F`, logical
+`$0F`) *also* finds domain-1 seg-0 unmapped, and it **double-faults to a halt**.
+
+This is a genuine **multi-domain-bootstrap boundary**, and it is exactly the
+long-carried **OQ1** forcing point ("the Pascal segment loader mapping many
+segments … if it switches domains, capture EVERYTHING"). The evidence pins the
+shape precisely:
+
+- `do_an_mmu` programs the **currently-active (just-switched-to) domain**, not
+  an "inactive" one — it establishes the target domain via `ctbit`, *then*
+  `setupon` + writes. This is the first *live* data on OQ1's active-vs-inactive
+  question, and it favours the **current-domain** reading of the SORG/SLIM
+  writes (the ctbit switch precedes them).
+- For `do_an_mmu` to run at all after switching domains, its own segment
+  (`mmucodemmu`, seg-84) — and the vector/stack/SMT segments it touches — must
+  be reachable in the target domain **the moment it switches**. `initmmutil`
+  programmed seg-84 in **domain 0 only** (LDASM:214-225). So real hardware must
+  make these essential segments **global across domains** (or the context latch
+  has semantics our per-domain-independent model does not capture).
+- **Confirmatory experiment (read-only, not shipped):** mirroring domain-0's
+  seg-84 registers into domains 1-3 lets `do_an_mmu` advance only **2 more
+  instructions** (`$A84034→$A8403A`) before faulting again on the same
+  domain-1-empty vector read. So seg-84-global alone is insufficient — domain 1
+  needs its whole essential segment set. Resolving this needs the real Lisa
+  per-domain-vs-global segment semantics, which no surfaced primary source
+  documents; forcing a fix here would bake in **uncited** hardware behavior.
+  **Parked as the Checkpoint-D frontier / OQ1 (still open, but now FORCED and
+  characterised with live evidence, not merely predicted).**
+
+### OQ1 status
+
+**Forced and characterised, not yet closed.** Checkpoint D is the first path
+that (a) programs a *non-zero domain* live and (b) switches the live context
+mid-handler. New data points, all live: programming targets the active
+(just-established) domain; `mmucodemmu`/low system segments must be present in
+every domain a handler runs in. What remains undetermined (and why OQ1 stays
+open): whether that presence is hardware-global registers or an OS step we have
+not yet traced, and the exact active/inactive-domain register-write semantics.
+This is the natural subject of a dedicated multi-domain MMU task, gated on
+finding the hardware citation.
+
+### What the M3 Task 2 tests pin (`ROMFloppyBootTests`)
+
+- `doAnMmuExecutesAtItsWrappedHomeAndReturnsToLoader` — the **boot-level guard
+  for the fallen gate** (reviewer's ask): from the `$A84000` park, stepping
+  through `do_an_mmu` re-enters the loader at **`$10041A`** with
+  `busErrorPulseCount==0`, `!halted`, `mmuPortWrites>4386`. Without either the
+  M3 Task 1 wrap fix or the Task 2 setup-latch fix this derails to `$FE0030`.
+- `loaderBuildsDomain0MMUThenHaltsAtTheDomain1Crossover` — the **Checkpoint-D
+  frontier anchor**: `≥120` `do_an_mmu` (`trap #6`) calls, `mmuPortWrites`
+  climbs past the gate value, the boot **crosses into domain 1** (OQ1), then
+  **halts** at the multi-domain boundary, with `writeAttempts==0` (no-writes).

@@ -65,7 +65,7 @@ private final class InterruptObserver {
     func callAsFunction() -> Bool { pending }
 }
 
-private func makeCOPS(clockBytes: @escaping () -> [UInt8] = { COPS.defaultHostClockBytes(now: Date(timeIntervalSince1970: 0)) })
+private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSince1970: 0) })
     -> (cops: COPS, scheduler: FakeScheduler, interruptRaised: InterruptObserver) {
     let scheduler = FakeScheduler()
     let interruptPending = InterruptObserver()
@@ -74,7 +74,7 @@ private func makeCOPS(clockBytes: @escaping () -> [UInt8] = { COPS.defaultHostCl
         currentCycle: { scheduler.now() },
         raiseInterrupt: { interruptPending.raise() },
         clearInterrupt: { interruptPending.clear() },
-        hostClockBytes: clockBytes
+        clockSource: clockSource
     )
     return (cops, scheduler, interruptPending)
 }
@@ -127,9 +127,22 @@ private func makeCOPS(clockBytes: @escaping () -> [UInt8] = { COPS.defaultHostCl
 
 // MARK: - Command decode
 
+/// M2 Task 2 fold-in: `COPS` takes an injectable `clockSource: () -> Date`
+/// (default `{ Date() }`, `Date()` being LisaCore's only nondeterminism)
+/// instead of a raw byte-array override, used by the `$02` read-clock
+/// reply. This test injects a FIXED `Date` and asserts the deterministic
+/// reply byte sequence that `COPS.defaultHostClockBytes(now:)` produces
+/// from it (per hardware-notes.md §4's currently-understood, best-effort
+/// placeholder clock-payload format -- see that function's doc comment;
+/// this test is exercising/pinning what IS modeled, not asserting a
+/// verified-correct real-hardware byte layout).
 @Test func readClockCommandEnqueuesAClockReplyPacket() {
+    // 0x1122_3344 seconds since the epoch -> big-endian bytes $11,$22,$33,$44
+    // -- an explicit, hand-computed expectation (not derived from the
+    // function under test) so this stays a genuine regression pin.
+    let fixedDate = Date(timeIntervalSince1970: 0x1122_3344)
     let fixedBytes: [UInt8] = [0xE0, 0x11, 0x22, 0x33, 0x44, 0x00]
-    let (cops, scheduler, interruptRaised) = makeCOPS(clockBytes: { fixedBytes })
+    let (cops, scheduler, interruptRaised) = makeCOPS(clockSource: { fixedDate })
     cops.reset()
     drainPowerOnStream(cops, scheduler)
     #expect(interruptRaised() == false, "FIFO drained")

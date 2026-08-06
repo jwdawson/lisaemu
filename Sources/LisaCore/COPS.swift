@@ -195,7 +195,13 @@ public final class COPS {
     private let currentCycle: () -> UInt64
     private let raiseInterrupt: () -> Void
     private let clearInterrupt: () -> Void
-    private let hostClockBytes: () -> [UInt8]
+    /// Injectable clock source for the `$02` read-clock reply
+    /// (`enqueueClockReply`/`defaultHostClockBytes`) -- `Date()` is
+    /// LisaCore's only source of nondeterminism, and the OS loader (a
+    /// later M2 task) may exercise this path. Defaults to the real host
+    /// clock; tests inject a fixed `Date` for a deterministic reply byte
+    /// sequence. Fold-in from the M1b final review.
+    private let clockSource: () -> Date
 
     // MARK: - CRDY / output (command) state
 
@@ -270,12 +276,12 @@ public final class COPS {
                 currentCycle: @escaping () -> UInt64,
                 raiseInterrupt: @escaping () -> Void,
                 clearInterrupt: @escaping () -> Void,
-                hostClockBytes: @escaping () -> [UInt8] = { COPS.defaultHostClockBytes() }) {
+                clockSource: @escaping () -> Date = { Date() }) {
         self.scheduleEvent = scheduleEvent
         self.currentCycle = currentCycle
         self.raiseInterrupt = raiseInterrupt
         self.clearInterrupt = clearInterrupt
-        self.hostClockBytes = hostClockBytes
+        self.clockSource = clockSource
     }
 
     /// Resets all COPS state and (re-)delivers the power-on stream. Callers
@@ -340,7 +346,7 @@ public final class COPS {
 
     private func enqueueClockReply() {
         enqueue(0x80)
-        for byte in hostClockBytes() {
+        for byte in Self.defaultHostClockBytes(now: clockSource()) {
             enqueue(byte)
         }
     }

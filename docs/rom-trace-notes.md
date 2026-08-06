@@ -1110,7 +1110,7 @@ contrast-DAC delay, and **JMPs into the loaded block at `$020000`** (cycle
 `$AAAA` signature. **This is checkpoint C's stop line — the loader's journey
 beyond boot-block entry is Task 6.**
 
-## OS loader (Task 6) — the loader runs from RAM, reads the LFS, and reaches its Pascal segment gate
+## OS loader (Task 6) — the loader runs from RAM, reads the LFS, and reaches ~~its Pascal segment gate~~ the `do_an_mmu` trap gate (diagnosed M3 Task 1)
 
 **M2 exit criterion met.** Picking up from checkpoint C (boot block executing
 at `$020000`), this section follows the boot block into the OS loader and

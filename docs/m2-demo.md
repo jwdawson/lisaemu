@@ -161,13 +161,16 @@ open -a LisaApp/LisaApp.xcodeproj  # or run the built .app directly
    nothing before its stop line; the boot menu/device-list window stays on
    screen throughout. The visible confirmation that real progress happened is
    the disk-activity flash, not new pixels.
-4. **Where it stops, and why**: the loader reaches its Lisa Pascal `trap #6`
-   inter-segment call gate (`$A84000`, an unrelocated segment-base
-   placeholder) and halts forward progress there — no new peripheral would
-   get it further; whatever unblocks it is M3-scoped work, not more
-   floppy/device modeling.
+4. **Where it stops, and why** *(M3 Task 1: diagnosed as an emulation bug — see
+   the corrected account below; the struck text is the original, now-refuted
+   framing, kept per the both-docs rule):*
 
-   That said, the recorded facts (vector `$98` overwritten with the
+   ~~the loader reaches its Lisa Pascal `trap #6` inter-segment call gate
+   (`$A84000`, an unrelocated segment-base placeholder) and halts forward
+   progress there — no new peripheral would get it further; whatever unblocks
+   it is M3-scoped work, not more floppy/device modeling.~~
+
+   ~~That said, the recorded facts (vector `$98` overwritten with the
    unrelocated `$A84000` placeholder, domain-0 segment 84 mapped with
    `SORG=$FE4` → phys `$1FC800`, `$A84000` translating to phys `$200800` —
    just past this environment's 2 MB RAM end, and the placeholder bytes
@@ -182,7 +185,19 @@ open -a LisaApp/LisaApp.xcodeproj  # or run the built .app directly
    two** — cheapest probe: re-run the same trace with a 1 MB RAM
    configuration and see whether the stop point changes. See
    `docs/rom-trace-notes.md` "OS loader (Task 6)" → "Two open hypotheses for
-   the stop" for the full citations.
+   the stop" for the full citations.~~
+
+   **Corrected (M3 Task 1 — hypothesis (b) confirmed):** that `trap #6` is the
+   OS's **MMU-programming trap** `do_an_mmu`, not a Pascal segment-call gate;
+   vector `$98 = $A84000` is the *deliberate* relocated home of `do_an_mmu`
+   (`initmmutil`, LDASM:174-252), not an "unrelocated placeholder"; and the
+   stop was an **emulation divergence** — our `MMU.translate` omitted the
+   hardware's 12-bit page-add wrap, so seg-84 origin page `$FE4` (a *negative*
+   page, −28) plus offset `$4000` decoded to phys `$200800` (past 2 MB) instead
+   of wrapping to `$800`. Fixed in `LisaCore/MMU.swift`; the gate now falls and
+   the boot advances to a new, later stop (Task 2's frontier). Full evidence
+   chain: `docs/rom-trace-notes.md` "Gate diagnosis (M3 Task 1)" and
+   hardware-notes.md §1.
 5. **Reset survives the inserted disk**: Machine > Reset (⌘R) warm-resets the
    CPU/ROM but the floppy stays inserted (Task 2's by-construction guarantee,
    proven end-to-end at the controller level by

@@ -102,3 +102,75 @@ loader run is the boot menu / device-list window from step 1, which
 `lisadbg … sca` (or `sc <path>.png`) renders. Any PNG belongs outside the repo
 (e.g. `~/Development/LisaEmu-artifacts/`) and is never committed — it renders
 Apple's ROM-drawn UI.
+
+Task 7's manual checkpoint (`--insert-disk … --auto-screenshot
+~/Development/LisaEmu-artifacts/m2-live-loader.png`, no menu click scripted)
+captures exactly this: the boot-menu screen, disk inserted. Stated honestly,
+not as a bug -- `--insert-disk` only attaches the image; it does not also
+drive the STARTUP FROM click sequence, and the loader itself (once driven)
+draws nothing new anyway. See task-7-report.md for the captured PNG's
+dimensions/content confirmation.
+
+## 4. In the app — insert, boot, and watch it live (M2 Task 7)
+
+The steps above drive the emulator headlessly (`lisadbg`/`swift test`). The
+same journey is reachable interactively in `LisaApp`, the SwiftUI window shell
+(`docs/superpowers/plans/2026-08-05-m1c-app-shell.md`):
+
+```
+xcodegen generate --spec LisaApp/project.yml
+xcodebuild -project LisaApp/LisaApp.xcodeproj -scheme LisaApp build
+open -a LisaApp/LisaApp.xcodeproj  # or run the built .app directly
+```
+
+1. **Insert Disk 1** — File > Insert Disk… (**⌘I**), an `NSOpenPanel`
+   filtered to `.dc42` files, and pick `OS31_Install_1.dc42`; or just drag the
+   `.dc42` file onto the window. Either path calls
+   `EmulationController.insertFloppy(url:)`, which loads the image on the
+   emulation thread and attaches it via `Machine.bus.floppy.insert(_:)` — a
+   load failure (bad path, malformed image) surfaces as a dismissible
+   "Could Not Insert Disk" alert, never a crash. The status strip's new disk
+   indicator (a small dot + "DISK" label, bottom-right) lights up once
+   attached.
+2. **Click STARTUP FROM…**, then a device item in the list that opens — the
+   same two clicks `ROMFloppyBootTests`/`EmulationControllerFloppyIntegrationTests`
+   script automatically. Mouse/keyboard reach the Lisa through the existing
+   M1c input path (`InputCapture`/`COPS.postMouse`/`postKey`); no new input
+   plumbing was needed for this.
+3. **What you'll see**: the Sony loader reads block 0, the boot block JMPs
+   into RAM, and the OS loader relocates itself and reads ~24 blocks off the
+   floppy (the disk indicator's dot flashes green each time
+   `FloppyController` finishes a command — `EmuStatus.diskActivity`) — but
+   **the screen itself does not change**. Per step 3 above, the loader draws
+   nothing before its stop line; the boot menu/device-list window stays on
+   screen throughout. The visible confirmation that real progress happened is
+   the disk-activity flash, not new pixels.
+4. **Where it stops, and why**: the loader reaches its Lisa Pascal `trap #6`
+   inter-segment call gate (`$A84000`, an unrelocated segment-base
+   placeholder) and halts forward progress there — a Lisa Pascal
+   segment-loader/relocation runtime dependency, not a device this emulator
+   is missing. That boundary is **M3**: resolving it needs the Pascal
+   segment-loader runtime, which is the next milestone's work, not more
+   floppy/device modeling.
+5. **Reset survives the inserted disk**: Machine > Reset (⌘R) warm-resets the
+   CPU/ROM but the floppy stays inserted (Task 2's by-construction guarantee,
+   proven end-to-end at the controller level by
+   `EmulationControllerFloppyTests.insertedMediaSurvivesReset`) — real
+   hardware's RESTART button doesn't eject media either.
+6. **Debug launch argument**: `--insert-disk <path>`, alongside
+   `--auto-screenshot <path>`, inserts a floppy at launch without a human
+   driving the open panel or drag-and-drop — used for the manual
+   verification checkpoint (task-7-report.md).
+
+### Conscious deferral: no Power menu
+
+M1c first deferred "power on/off via COPS" to a later task; this task
+(M2 Task 7, the app-integration task where it was next scheduled) defers it
+again, deliberately — `LisaCore.COPS.powerCommandLog` already exists (it
+captures the OS-driven soft-power-off command byte sequence), but a Power
+menu item needs somewhere to actually GO (suspend the emulation thread, show
+a "powered off" UI state, wire a wake path) that doesn't exist until M3's
+soft-power/Widget work. This task lands the OTHER still-open M1c item
+instead: the status-strip disk-activity indicator. See
+`LisaApp/Sources/LisaApp.swift`'s doc comment at the `CommandMenu("Machine")`
+declaration for the same note in code.

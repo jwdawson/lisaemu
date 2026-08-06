@@ -339,6 +339,25 @@ public final class Bus {
                 let offset = a & 0x1_FFFF
                 return ioAccess(offset, isWrite: isWrite, value: value)
             }
+            // SETUP does not disturb live translation (docs/hardware-notes.md
+            // §1 "Setup Latch"): while SETUP is on, SORG/SLIM *register* writes
+            // are redirected (handled above by `slimSorgPortAccess`), but a
+            // logical address that a PRESENT memory segment maps still
+            // translates. The OS loader's `do_an_mmu` (LDASM:305-446) relies on
+            // this -- it is entered at logical `$A84000` (seg-84 -> phys `$800`)
+            // and toggles SETUP on *inside its own loop* while continuing to
+            // fetch its code and read the SMT from that same seg-84 window
+            // (M3 Task 2, rom-trace-notes.md "Checkpoint D"). So before falling
+            // back to flat physical, try translation; use it only when it
+            // resolves to a present memory segment. Unprogrammed segments
+            // decode to `.fault` (default SLIM nibble 0 -> invalidSegment), so
+            // every POST setup-mode access -- which runs before any segment is
+            // programmed -- still falls through to flat exactly as before; only
+            // code running from an already-mapped segment (the loader) changes.
+            if case .memory(let p) = mmu.translate(
+                a, domain: domain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
+                return ramAccess(address, Int(p), isWrite: isWrite, value: value)
+            }
             return ramAccess(address, Int(a), isWrite: isWrite, value: value)
         }
 

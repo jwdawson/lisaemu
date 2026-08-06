@@ -112,6 +112,20 @@ Source: LIBHW/libhw-DRIVERS.TEXT.unix.txt:139-140, LDASM:154-155
 - Behavior: ANY access (read or write, e.g., TST.B) toggles the flip-flop; data is irrelevant (libhw-MACHINE:641-645, 681-685)
 - While SETUP is on, SORG/SLIM writes program the inactive domain's registers without disturbing live translation
 - Sequence (per do_an_mmu): toggle setupoff → interrupt-window → setupon per write (LDASM:387-394)
+- **"Without disturbing live translation" is load-bearing (M3 Task 2):** SETUP
+  redirects the SORG/SLIM *register* ports, but general instruction/data
+  translation stays active. `do_an_mmu` (LDASM:305-446) proves it — the handler
+  runs from seg-84 (logical `$A84xxx` → phys `$800`) and toggles SETUP *on
+  inside its own loop* while it keeps fetching its code and reading the SMT from
+  that seg-84 window; it could not if SETUP forced flat addressing. Likewise
+  `initmmutil` copies itself to low `$7800` ("work area where setup can be
+  turned on safely", LDASM:165) and `libhw`'s Read/WriteMagic run from a fixed
+  low `MMURoutine` (libhw-MACHINE:611-685) — all setup-on code sits at a
+  low-physical / already-mapped home. Emulator: `Bus.access`'s setup-mode branch
+  models POST as flat (segments unprogrammed → `.fault` → flat), but now also
+  applies `mmu.translate` to a **present** memory segment before the flat
+  fallback, so `do_an_mmu` executes at its wrapped home (rom-trace-notes.md
+  "Checkpoint D (M3 Task 2)").
 
 ### Domain Context Latches
 

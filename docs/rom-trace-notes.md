@@ -1109,3 +1109,143 @@ contrast-DAC delay, and **JMPs into the loaded block at `$020000`** (cycle
 `blocksRead≥1`, `lastError==0`, `PC==$020000`, the `4E FA` opcode, and the
 `$AAAA` signature. **This is checkpoint C's stop line — the loader's journey
 beyond boot-block entry is Task 6.**
+
+## OS loader (Task 6) — the loader runs from RAM, reads the LFS, and reaches its Pascal segment gate
+
+**M2 exit criterion met.** Picking up from checkpoint C (boot block executing
+at `$020000`), this section follows the boot block into the OS loader and
+records how far it gets, matched to the original loader sources
+(`Lisa_Source/LISA_OS/OS/source-ldmicro.text.unix.txt` = the "ldsony"
+loader-loader; `source-ldlfs.text.unix.txt` = the compiled Pascal loader;
+`source-LDEQU.TEXT.unix.txt` = the low-core hand-off cell equates).
+Reproduce via `ROMFloppyBootTests.osLoaderExecutesFromRAMAndReachesPascalSegmentGate`
+(env-gated on `LISAEMU_ROM_DIR` + `LISAEMU_DISK_DIR`); every observation below
+came from a `@testable import LisaCore` scratch harness that single-stepped the
+same menu-driven boot and dumped PC / floppy stats / low-core cells / MMU-port
+log (deleted before commit, but each finding is reproducible from that test's
+assertions).
+
+### The boot block is the "ldsony" loader-loader (source-ldmicro)
+
+The block-0 code at `$020000` is `LDRLDR` (`.proc LDRLDR`, source-ldmicro:5).
+Its first instruction `4E FA 00 0E` = `jmp over_ldr_data` skips the 8-byte
+loader-data area (`boot_id`/`ldr_version` + reserved words, source-ldmicro:62-74;
+this is why the `$AAAA` = `boot_id` signature sits at `$020004`), then:
+
+1. **Relocates itself to the RAM midpoint.** `move.l prom_realsize,d0 / lsr.l
+   #1,d0` (source-ldmicro:77-78): `prom_realsize` (cell `$2A8`, LDEQU:66) was
+   populated by the PROM to `$200000` (2 MB), so `ldbase = $100000`. The stub
+   copies itself there and `jmp`s into the relocated copy (`ldbaseptr` cell
+   `$21C` = `$100000` afterwards; LDEQU:35). **Confirmed live:** control enters
+   the relocated loader at `$100042` ~5.8 K cycles after `$020000`.
+2. **Reads its remaining code blocks + the LFS MDDF off the floppy.** `main_loop`
+   (source-ldmicro:128-134) calls `ldr_read_block` (→ `drv_enable` → `twig_entry`
+   `$FE0094`, the shared RWTS) until `codesize` is exhausted. Every read is
+   `excmd`/`readdisk` (go-byte `$81`, DISKPARM 0), bracketed by `clristat`
+   (`$85`) — the same go-byte choreography checkpoint C documented. `blocksRead`
+   climbs deterministically **1 → 24**: 23 loader code blocks (linear blocks
+   1-22 read as trak0 sec1-11 / trak1 sec0-10, then the Pascal side) **plus
+   block 28** — the MDDF. Block 28 is `ld_fs_block0`, the MDDF address the boot
+   block's own `fs_block0` field named (see step 3); it maps (CONVERT,
+   source-ldmicro:436-531) to trak2/sec4, and `FloppyController.blockNumber`
+   returns DC42 block 28, whose data the HLE serves **byte-for-byte identical to
+   the raw image** (`00 11 9c f9 …` = `fsversion` 17 + `volname` "Office System
+   1 3.0"). Every read `lastError == 0`.
+3. **Writes the loader hand-off cells** (source-ldmicro:121-125, LDEQU:29-40):
+   `dev_type` (`$22E`) = **2** = `dev_sony`; `ld_fs_block0` (`$210`) = **`$1C`**
+   (MDDF block); `log_volume` (`$212`) = **1** (drive). `start_pascal`
+   (source-ldmicro:327-340) then pushes the Pascal entry frame and `jmp`s into
+   the compiled loader (`source-ldlfs`), which runs as position-relative code
+   using **A5 as the Pascal globals base** (e.g. `move.l (A7)+,(-$b0,A5)` at
+   `$100FE0`) — confirming translated execution reached the real Pascal loader,
+   not just the asm stub.
+
+### The stop line — a Lisa Pascal `trap #6` segment-call gate (M3 boundary)
+
+The compiled Pascal loader reaches an **inter-segment call gate** and stops
+making forward progress there. The gate (at `$1003F8`-`$10041E` in the relocated
+image) is a classic Lisa Pascal segmented-code thunk:
+
+```
+1003F8: lea    ($26,PC),A1        ; A1 = return point
+1003FC: lea    ($fe,PC),A2
+100400: suba.l A1,A2              ; A2 = offset within the target segment
+100402: movea.l #$a84000,A1       ; A1 = HARDCODED segment base  <-- placeholder
+100408: adda.l A1,A2              ; A2 = $A84000 + offset  (target routine)
+...
+100418: trap   #$6                ; dispatch the call via the TRAP #6 vector
+```
+
+The immediate `#$a84000` is **baked into the on-disk loader** (the bytes
+`22 7C 00 A8 40 00` appear at DC42 block 1 offset 478, and the value `00 A8 40
+00` occurs 9× across the image) — it is Lisa Pascal's placeholder base for a
+code **segment 84** (`$A80000 = 84 × $20000`) that the loader is meant to
+resolve/relocate at runtime. Two things then happen that our environment cannot
+carry through:
+
+- **The loader overwrites the PROM's TRAP #6 vector.** At `$020000` entry,
+  vector `$98` (TRAP #6 = vector 38) holds `$FE1D14` (a valid PROM handler in
+  ROM). By the time the gate is reached the Pascal-loader startup has replaced
+  it with the **unrelocated** `$A84000` placeholder. So `trap #6` vectors the
+  CPU to `$A84000`.
+- **`$A84000` has no code.** The loader *did* map a live MMU segment for its
+  Pascal code — the only two SLIM/SORG writes on the whole loader path are
+  `dom0 seg84 SORG=$FE4` / `SLIM=$7DB` (readWrite, origin phys `$1FC800`),
+  i.e. it mapped logical segment 84 to the top of physical RAM. But logical
+  `$A84000` (segment-84 offset `$4000`) then translates to phys `$200800` —
+  **just past our 2 MB** — and, regardless, the loader loaded its code to
+  `$100000`, not to segment 84's physical window, so the `$A84000`-based
+  references were never fixed up to the real load base. The CPU fetches garbage
+  at `$A84000`, wanders, and the loader's fault path ejects (`shutdown`:
+  `unclamp`/`clristat`/`clrmask $88`, source-ldmicro:184-203) and re-enters
+  `prom_monitor` (source-ldmicro:141-150) — i.e. it bombs back to the boot menu.
+
+**This TRAP-based segment loader is the documented M3 boundary — a Lisa Pascal
+*runtime* dependency (68000 trap-vector / segment-relocation semantics), not a
+device.** No new peripheral is required to get here, and none would get the
+loader past `trap #6`; resolving it needs the Pascal segment-loader/relocation
+runtime, which is M3's requirements work. Per the task brief's "stop at the
+documented boundary" rule, Task 6 stops here with the evidence above rather than
+scope-creeping into that runtime.
+
+### Sanity-negative sweep (device / interrupt / MMU / screen)
+
+The brief asked to watch for new device expectations, interrupt-mask changes,
+MMU reprogramming, and screen drawing on the loader path. Findings, all live:
+
+- **No new device.** Every floppy access is the checkpoint-C go-byte protocol
+  (`$85`/`$86`/`$87`/`$81`+readdisk, plus `unclamp` in the eject path). No SCC,
+  Widget, or clock probe occurs before the `trap #6` stop. The loader's
+  `shutdown` issues `unclamp` (sub-command 2), which the read-only HLE answers
+  with `notIssued` (DISKERR 9) — **cosmetically harmless**: `shutdown`
+  (source-ldmicro:196-197) waits on the VIA2-PB4 completion line and never reads
+  DISKERR, so the eject/teardown completes regardless (see hardware-notes.md §9).
+- **Interrupts stay masked at 7.** SR is `$2704` throughout (supervisor, IPL
+  mask 7): the loader's read routine masks with `ori #$700,SR` and never drops
+  below 7 on this path, so the level-1 floppy line is polled (VIA2 PB4 /
+  VIA1 PB6), never delivered as a real IRQ. No unmasking observed.
+- **MMU: exactly one new segment, in domain 0, setup-bracketed — OQ1 still
+  NOT discriminated.** The loader's only MMU writes are the two seg-84 SLIM/SORG
+  above, programmed in the **active domain 0** with setup momentarily on
+  (the `do_an_mmu` bracket), then off. It does **not** switch domains and does
+  **not** program an *inactive* domain, so this path still cannot tell the
+  current-domain model from the hardware inactive-domain semantics (OQ1 remains
+  open, as in Trace checkpoint B). **New OQ1 data point though:** this is the
+  first observed *post-POST, live* SLIM/SORG programming of a fresh segment by
+  running OS code — future work that gets past `trap #6` (into the Pascal
+  segment loader, which maps many segments) is the natural place OQ1 will
+  finally be forced.
+- **The loader draws nothing pre-gate.** The framebuffer set-pixel count is
+  identical (`78181`) at `$020000` entry and at the `trap #6` gate — the boot
+  UI (menu + opened device-list window) stays on screen unchanged; the loader
+  produces no new drawing before it stops. (After the bomb, `prom_monitor`
+  redraws — a different, post-stop state, not asserted.)
+
+### What `ROMFloppyBootTests.osLoaderExecutesFromRAMAndReachesPascalSegmentGate` pins
+
+Robust invariants + exact deterministic anchors: `ldbaseptr($21C)==$100000`,
+`prom_realsize($2A8)==$200000`, `blocksRead>=20` **and** `==24`, `lastError==0`,
+`dev_type($22E)==2`, `ld_fs_block0($210)==$1C`, `log_volume($212)==1`, vector
+`$98==$A84000` (PROM handler overwritten), `mmuPortWrites>4384` (seg-84
+programmed live), framebuffer still populated (`>70000` px), and `!halted`
+(a live progression, not a fault).

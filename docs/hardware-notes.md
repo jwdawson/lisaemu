@@ -999,6 +999,22 @@ zone/track/sector/side:
   verifies the boot block's `$AAAA` signature (`$FE1EF2: cmpi.w #-$5556`) at
   block offset 4, then **JMPs to the loaded block at `$020000`** (first bytes
   `4E FA …` = JMP). Task 6 owns the loader journey beyond boot-block entry.
+- **Boot-ROM read sequence — Task 6 loader-path validation (no device change).**
+  Following the boot block into the "ldsony" loader-loader (source-ldmicro), the
+  loader reads its remaining code blocks **and the LFS MDDF** (block `$1C`) via
+  `twig_entry`, `blocksRead` climbing 1 → 24, every read `lastError == 0`; the
+  block-28 MDDF data is served **byte-for-byte identical to the raw DC42 image**
+  (`fsversion` 17, `volname` "Office System 1 3.0"), confirming the go-byte
+  protocol, odd-lane buffer, and CONVERT zone map end-to-end on real OS-loader
+  traffic. One new interface fact: the loader's `shutdown`/eject path
+  (source-ldmicro:184-203) issues an `excmd` with sub-command **`unclamp`
+  (2)**, which the read-only M2 HLE answers with `notIssued` (DISKERR `9`).
+  This is **cosmetically harmless and needs no model change**: `shutdown` waits
+  only on the VIA2-PB4 completion line and never reads DISKERR, so the eject
+  teardown (`unclamp` → `clristat $85` → `clrmask $87`/parm `$88`) completes
+  regardless. The loader stops at a Lisa Pascal `trap #6` segment-call gate (an
+  M3 CPU-runtime dependency, not a device) — see docs/rom-trace-notes.md "OS
+  loader (Task 6)".
 
 ### Board IDs
 

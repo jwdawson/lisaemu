@@ -1160,7 +1160,21 @@ this is why the `$AAAA` = `boot_id` signature sits at `$020004`), then:
    `$100FE0`) — confirming translated execution reached the real Pascal loader,
    not just the asm stub.
 
-### The stop line — a Lisa Pascal `trap #6` segment-call gate (M3 boundary)
+### The stop line — ~~a Lisa Pascal `trap #6` segment-call gate (M3 boundary)~~ an MMU page-wrap divergence (DIAGNOSED + FIXED, M3 Task 1)
+
+> **M3 Task 1 update (both-docs rule, strike-through-not-erase):** the
+> reproducible FACT pattern below stands unchanged, but its causal
+> interpretation was WRONG. `trap #6` is not a "Pascal segment-call gate" — it
+> is the OS's **MMU-programming trap** (`do_an_mmu`; hardware-notes.md §1,
+> LDASM:174-446). Vector `$98 = $A84000` is installed **by design**
+> (`initmmutil` relocates `do_an_mmu` into segment 84 and points the vector at
+> it), not as an "unrelocated placeholder." And the stop was an **emulation
+> divergence**, not a runtime boundary: our MMU physical decode failed to wrap
+> the 12-bit page arithmetic, sending virtual `$A84000` to phys `$200800`
+> (past 2 MB) instead of the intended `$800`. Fixed. Full evidence chain in
+> "Gate diagnosis (M3 Task 1)" below; read that section as the authoritative
+> conclusion and the text immediately following as the (partly superseded)
+> original observation.
 
 The compiled Pascal loader reaches an **inter-segment call gate** and stops
 making forward progress there. The gate (at `$1003F8`-`$10041E` in the relocated
@@ -1250,6 +1264,79 @@ regardless of RAM size; the RAM-size-dependent strand of (b) predicts a
 DIFFERENT stop point or failure mode. Only after that probe should M3 commit
 its scope to segment-loader-runtime implementation as the confirmed correct
 next investment, rather than as the untested default assumption it is today.
+
+> **RESOLVED (M3 Task 1): hypothesis (b) — emulation divergence — confirmed.**
+> Not the RAM-size strand, not OQ1: a **12-bit MMU page-wrap** our decode
+> omitted. See "Gate diagnosis (M3 Task 1)" immediately below.
+
+### Gate diagnosis (M3 Task 1)
+
+**Root cause — a missing 12-bit physical-page wrap in `MMU.translate`.** The
+loader's `trap #6` is the OS **MMU-programming trap** `do_an_mmu`
+(hardware-notes.md §1; `source-LDASM.TEXT.unix.txt:305-446`), *not* a Pascal
+segment-call/lazy-load trap. There is **no fault-driven segment loader** in the
+loader sources (`ldlfs`/`ldmicro`/`LDASM` install only trap #6 → `do_an_mmu`
+and a transient trap #8 stack-switch; loads are eager `READ_PAGE`/`READ_BLOCK`,
+ldlfs:138-159). So the ledger's "lazy fault-load, our frame delivery diverges"
+hypothesis is **refuted by source**; the M2 group-0 frame work is not
+load-bearing here.
+
+`initmmutil` (`LDASM:174-252`) sets this up deliberately:
+
+1. `move.l #mmusegorg+bit_14,trap6` (L177-179): vector `$98` :=
+   `84*$20000 + $4000 = $A84000`. **`$A84000` is the intended final virtual
+   address of `do_an_mmu`, not an "unrelocated placeholder."**
+2. It maps segment 84 (`mmucodemmu`) to a *negative* origin page:
+   `SORG = ((utiladr + prom_byte0) >> 9) − 32` (L208-213), `SLIM = $DB + $700`
+   (`mmuseglen`, readWrite). Live-observed: `utiladr = $800`, `prom_byte0 = 0`
+   ⇒ `SORG = 4 − 32 = −28`, stored as the 12-bit value **`$FE4`**; `SLIM =
+   $7DB` — **byte-for-byte the values M2 recorded.**
+3. It copies `do_an_mmu` into that window at virtual `$A84000` (L234-242).
+
+On real hardware virtual `$A84000` (segment-84 page 32) decodes to physical
+page `(SORG + 32) mod 4096 = (−28 + 32) = 4` → phys **`$800`** = `utiladr`,
+exactly where the handler was copied. The wrap is intrinsic: SORG is a 12-bit
+register (hardware-notes.md §1 "AND.W #$0FFF"), page size 512 ⇒ a **21-bit /
+2 MB** physical space; `(SORG + pageWithinSegment)` truncates to 12 bits.
+
+**Our `MMU.translate` computed `(sorg<<9) + offset` without the truncation**,
+so `$A84000` → `$FE4<<9 + $4000 = $200800` — 2 KB **past** the 2 MB RAM top.
+`Bus.ramAccess` returns `$FF` for out-of-range physical (no fault), so `trap
+#6` dispatched the CPU to `$A84000` → phys `$200800` → it fetched `FF FF…`
+garbage, wandered, and bombed back to `prom_monitor` (the recorded menu
+bounce). This is a pure 68000/MMU-modeling divergence — **hypothesis (b)** —
+reachable with nothing but a 68000 + MMU + disk.
+
+**Discriminators, as run:**
+
+- **(i) 1 MB probe.** `utiladr` is a *fixed low address* (`$800`), not
+  RAM-size-relative, so the gate is RAM-size-**independent** — (a)'s RAM-strand
+  is dead either way. (Aside: at `ramSize=$100000` the ROM POST correctly
+  writes `prom_realsize=$100000` but our menu-driven boot never reaches the
+  loader — a *separate* 1 MB POST-path divergence at `$FE099C`, parked for a
+  later milestone; it does not bear on this gate.)
+- **(ii) source-ldlfs/ldmicro/LDASM contract.** As above: `trap #6` =
+  `do_an_mmu`; vector `$98 = $A84000` by design; no lazy-load handler.
+- **(iii) MMU decode of `SORG=$FE4`/`SLIM=$7DB`.** `SLIM` nibble 7 = readWrite,
+  limit byte `$DB` ⇒ 37 pages, so page 32 (offset `$4000`) is *within* limit —
+  it does **not** fault at the limit check. The only decode question is the
+  physical formula, and that is exactly where the wrap was missing.
+
+**Fix (`Sources/LisaCore/MMU.swift`):** mask the memory/stack physical result
+to 21 bits — `((sorg<<9) &+ offset) & 0x1F_FFFF` — implementing the hardware's
+12-bit page-add wrap. Regression-pinned by `MMUTests.physicalPageAddWrapsAt12Bits`
+(the exact `SORG=$FE4`/offset `$4000` → `$800` case, plus a top-of-range wrap
+invariant; verified RED without the mask). Sub-2 MB translations are unchanged,
+so all prior MMU/Bus/boot assertions still hold.
+
+**Gate outcome — it falls.** With the wrap, virtual `$A84000` → phys `$800`
+(in RAM), and at the gate the CPU now **executes the real `do_an_mmu`** code
+(`$A84000, $A84004, …$A8406E`) instead of `$FF` garbage; the trap completes and
+`rte`s. Forward progress is **materially further**, then reaches a NEW,
+later stop: after the first `do_an_mmu` return, control lands in ROM at
+`$FE0030` and settles into a tight `$FE019E-$FE01A4` spin, ending at the menu
+idle loop `$FE2DCA`. Characterising and advancing past that new frontier is
+**Task 2** (do not over-trace here).
 
 ### Sanity-negative sweep (device / interrupt / MMU / screen)
 

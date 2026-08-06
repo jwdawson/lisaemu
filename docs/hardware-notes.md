@@ -80,6 +80,22 @@ Derived from `do_an_mmu` (OS/source-LDASM.TEXT.unix.txt:305-446) and ReadMMU/Wri
 - For memory access types ($5/$6/$7, access ≤ mmunotmem $700): prom_byte0 (physical byte 0 offset) is added to origin before programming (LDASM:417-420)
 - I/O and absent types skip relocation
 
+**Physical Address Width — 12-bit page-add WRAP (21-bit / 2 MB space):**
+The physical page number the MMU forms is `(SORG + pageWithinSegment)`
+**truncated to SORG's 12-bit width**, i.e. it wraps modulo 4096 pages. With a
+512-byte page that is a **21-bit (2 MB) physical space**: `physical =
+(((SORG & $FFF) << 9) + offsetWithinSegment) & $1FFFFF`. This is not cosmetic —
+the loader relies on it. `initmmutil` (LDASM:174-252, "MMU Programming (TRAP #6)"
+below) programs `mmucodemmu` (seg 84) with a **negative** origin page
+`SORG = ((utiladr + prom_byte0) >> 9) − 32`; for the live-observed
+`utiladr=$800, prom_byte0=0` that is page `−28`, stored as the 12-bit value
+`$FE4`. It points TRAP #6's vector at `mmusegorg+bit_14 = $A84000` and expects
+virtual `$A84000` (seg-84 page 32) to decode back to physical `$800`:
+`(−28 + 32) mod 4096 = 4` → `$800`. Without the wrap the same access lands at
+`$FE4<<9 + $4000 = $200800`, past 2 MB. Implemented in `LisaCore/MMU.swift`
+(`& 0x1F_FFFF` on the memory/stack result); diagnosed and fixed in M3 Task 1
+(rom-trace-notes.md "Gate diagnosis (M3 Task 1)").
+
 ### Register Port Addressing
 
 Source: OS/source-LDASM.TEXT.unix.txt:139-179, 380-425

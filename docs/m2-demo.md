@@ -4,7 +4,12 @@ M2's exit criterion: with a real Apple Lisa OS floppy image inserted, the Rev H
 boot ROM (driven through its own startup menu) reads the boot block off the
 disk, executes it, and the **Lisa OS loader runs from RAM and makes documented
 progress** — relocating itself, reading the LFS off the floppy, and reaching
-its Lisa Pascal segment-call runtime (the M3 boundary).
+its first `trap #6` MMU-programming call. ~~its Lisa Pascal segment-call runtime
+(the M3 boundary).~~ *(M3 Task 1 correction: that `trap #6` is the OS's
+MMU-programming trap `do_an_mmu`, not a Pascal segment-call runtime, and it was
+NOT an M3 boundary — it was an emulation divergence (a missing 12-bit MMU
+page-wrap), since diagnosed and fixed. See rom-trace-notes.md "Gate diagnosis
+(M3 Task 1)".)*
 
 Full narrative + citations: `docs/rom-trace-notes.md` "OS loader (Task 6)" and
 "Floppy boot (checkpoint C)"; the floppy interface itself is
@@ -81,18 +86,25 @@ loader progression:
   mapped Pascal code segment:    MMU dom0 seg84 SORG=$FE4 SLIM=$7DB (readWrite)   mmuPortWrites 4384->4386
   entered compiled Pascal loader: A5-relative globals code running at $100000+
 
-stop line (M3 boundary):
-  Pascal trap #6 segment gate:   vec98(TRAP#6)=$A84000 (loader overwrote PROM's; unrelocated placeholder)
-                                 trap #6 at $100418 -> PC=$A84000 (unmapped) -> bombs back to PROM menu
+stop line (was mislabeled "M3 boundary"; DIAGNOSED as an emulation bug, M3 Task 1):
+  trap #6 = do_an_mmu:           vec98(TRAP#6)=$A84000 (installed BY DESIGN — do_an_mmu relocated into seg 84)
+                                 trap #6 -> PC=$A84000; our MMU decode sent it to phys $200800 (past 2MB) not $800
+                                 -> fetched FF garbage -> bombed back to PROM menu.  FIXED: 12-bit page-wrap in MMU.translate
   interrupts:                    SR=$2704 throughout (IPL mask 7 — loader polls, never unmasks)
   screen:                        framebuffer unchanged (78181 px — loader draws nothing pre-gate)
   halted:                        false (a live progression, not a fault)
 ```
 
-The `trap #6` gate is Lisa Pascal's inter-segment call runtime (`#$a84000` is a
-segment-base placeholder baked into the on-disk loader). Resolving it needs the
-Pascal segment-loader/relocation runtime — an M3 CPU-runtime requirement, not a
-new device. See `docs/rom-trace-notes.md` "OS loader (Task 6)".
+~~The `trap #6` gate is Lisa Pascal's inter-segment call runtime (`#$a84000` is
+a segment-base placeholder baked into the on-disk loader). Resolving it needs
+the Pascal segment-loader/relocation runtime — an M3 CPU-runtime requirement,
+not a new device.~~ **M3 Task 1 correction:** `trap #6` is the OS's
+MMU-programming trap (`do_an_mmu`); `$A84000` is the *deliberate* relocated
+address of that handler (`initmmutil`, LDASM:174-252), not a placeholder. The
+stop was an **emulation divergence** — our `MMU.translate` omitted the
+hardware's 12-bit page-add wrap, so `$A84000` decoded to phys `$200800` (past
+2 MB) instead of `$800`. Fixed in `LisaCore/MMU.swift`; the gate now falls. See
+`docs/rom-trace-notes.md` "Gate diagnosis (M3 Task 1)" and hardware-notes.md §1.
 
 ## Artifacts
 

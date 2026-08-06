@@ -171,15 +171,20 @@ extension MusashiSuites {
         ///      (`dev_sony`; source-ldmicro:124 / LDEQU:32,40), `ld_fs_block0`
         ///      (`$210`) = `$1C` (MDDF block; LDEQU:29), `log_volume` (`$212`)
         ///      = 1 (LDEQU:30),
-        ///   4. maps its Pascal code segment 84 (logical `$A80000`) live via
-        ///      the MMU and enters the compiled Pascal loader (source-ldlfs),
-        ///      then reaches its Pascal inter-segment call gate `trap #6`,
-        ///      installing an (unrelocated) `$A84000` handler at vector `$98`.
-        /// Step 4's TRAP-based segment loader is the documented M3 boundary --
-        /// a Lisa Pascal runtime dependency, not a device (see the report /
-        /// rom-trace-notes.md). This test asserts the loader-execution markers
-        /// at the point it is reached; robust invariants alongside the exact
-        /// deterministic anchors.
+        ///   4. maps its MMU-utility code segment 84 (logical `$A80000`) live
+        ///      via the MMU and enters the compiled Pascal loader, then reaches
+        ///      its first inter-segment `trap #6` -- the OS **MMU-programming
+        ///      trap** `do_an_mmu`, whose handler `initmmutil` relocated into
+        ///      segment 84 and pointed vector `$98` at (`$A84000`, BY DESIGN --
+        ///      NOT an "unrelocated placeholder").
+        /// M3 Task 1 DIAGNOSED the stop here as an emulation divergence (a
+        /// missing 12-bit MMU page-wrap: `$A84000` decoded to phys `$200800`
+        /// past 2 MB instead of `$800`) and FIXED it; the gate now falls and
+        /// the boot advances to a new stop in ROM (Task 2's frontier). See
+        /// rom-trace-notes.md "Gate diagnosis (M3 Task 1)". This test still
+        /// parks AT `$A84000` (the last common anchor) and asserts the
+        /// loader-execution markers reached there; robust invariants alongside
+        /// the exact deterministic anchors.
         @Test func osLoaderExecutesFromRAMAndReachesPascalSegmentGate() throws {
             let m = try bootIntoLoader()
 
@@ -205,11 +210,13 @@ extension MusashiSuites {
             #expect(m.bus.read16(0x212) == 1,
                     "log_volume ($212) should be drive 1")
 
-            // It entered the Pascal loader and reached its trap-based segment
-            // gate: the PROM's ROM TRAP #6 vector was overwritten with the
-            // loader's own (unrelocated) $A84000 segment-loader placeholder.
+            // It entered the loader and reached its first TRAP #6: the OS's
+            // MMU-programming trap. `initmmutil` relocated `do_an_mmu` into
+            // segment 84 and pointed vector $98 at its virtual home $A84000
+            // (BY DESIGN -- see rom-trace-notes.md "Gate diagnosis"), over the
+            // PROM's $FE1D14.
             #expect(m.bus.read32(0x98) == 0x00A8_4000,
-                    "the loader should install its own TRAP #6 handler ($A84000) over the PROM's ($FE1D14)")
+                    "the loader should install its relocated do_an_mmu TRAP #6 vector ($A84000) over the PROM's ($FE1D14)")
 
             // It programmed a new MMU segment (84, its Pascal code segment)
             // live -- more SLIM/SORG writes than the 4384 POST leaves behind.

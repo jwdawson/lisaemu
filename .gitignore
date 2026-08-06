@@ -11,3 +11,4 @@ LisaApp/LisaApp.xcodeproj/
 # inline `info.properties` at generate time -- generated output, not
 # hand-authored, same as the .xcodeproj above.
 LisaApp/Info.plist
+.swiftpm/

@@ -798,6 +798,164 @@ model does neither at the COPS/KeyMap layer.
   `$58`-`$6F` (NMI-key ranges) lives in COPS firmware, not this source
   tree.
 
+## 9. Floppy Controller Interface (Sony 400K)
+
+Source: mined from `Lisa_Source/LISA_OS/` (M2 Task 1 pre-implementation
+research, `.superpowers/sdd/2026-08-05-m2-floppy-boot/research-floppy-interface.md`).
+Key files: `OS/SOURCE-SONY.TEXT.unix.txt` (Pascal driver, Rich Castro),
+`OS/SOURCE-SONYASM.TEXT.unix.txt` (68000 asm), `OS/source-twiggy.text.unix.txt`,
+`OS/source-mover.text.unix.txt` (equates + interrupt dispatch),
+`OS/source-ldmicro.text.unix.txt` ("ldsony" boot loader-loader),
+`OS/source-LDTWIG.TEXT.unix.txt`, `OS/source-LDEQU.TEXT.unix.txt`,
+`OS/SOURCE-STARTUP.TEXT.unix.txt`, `LIBHW/LIBHW-DRIVERS.TEXT.unix.txt`.
+
+> **Numbering note:** the M2 plan document labeled this section "§7", written
+> before this doc's own §7 ("Boot ROM and Power Management", added in M1b)
+> existed. Renumbering §7/§8 here would break the many existing citations to
+> them elsewhere in this codebase (Bus.swift, Machine.swift, ROMBootTests,
+> rom-trace-notes.md, etc.), so this content is filed as a new §9 instead of
+> overwriting/renumbering. Flagged here rather than silently deviating.
+
+### Shared-RAM Window (68000 ↔ 6504)
+
+- **Internal Sony/Twiggy base:** `$FCC000` (IOMMU+`$C000`) — SONY.TEXT:602-605
+  (`hwbase := iospacemmu*$20000 + $0C000` when iochannel<0); `TWIGBAS .EQU
+  IOMMU+$0C000` (mover:17); `dskbase equ $fcc000` (ldmicro:37,42; LDTWIG:45,50).
+- **External slot Sony base:** `$FC0000 + $4000*slot + $2000` (SONY.TEXT:602-605).
+- **Cell layout** (offsets from base; Sony names from SONYASM:11-33, Twiggy
+  from mover:12-42):
+  - `$01` DISKCMD (go-byte; write triggers 6504)
+  - `$03` DISKPARM (sub-command)
+  - `$05` DISKDRIV (0=top/`$80`=bottom)
+  - `$07` DISKHEAD (side 0-1)
+  - `$09` DISKSEC
+  - `$0B` DISKTRAK
+  - `$0F` DISKCNFM (format confirm)
+  - `$11` DISKERR (nonzero=error)
+  - `$13` DISKFLG (single/double-sided flag)
+  - `$19` DISKSKING (`$FF` while seeking)
+  - `$41` DISKIN (nonzero=disk present; Sony)
+  - `$5F` DISKSTAT (interrupt/status)
+  - `$95` DISKCS (checksum err count; mover says `TWIGCS=$BB`!)
+  - `$B9` DISKB2
+  - `$FB` CMDINDEX (+0/+2/+A = prev cmd/parm/trak save)
+  - `$180` PMEMAD (64-byte parameter memory mirror)
+  - `$3E8` DISKHDR (12-byte packed tag)
+  - `$400` DISKDATA (512-byte sector buffer)
+
+**AMBIGUITY (a):** FINISH_READ/START_WRITE treat DISKDATA+1024 as the END of
+a 512-byte transfer (SONYASM:221-231,323-326) → live data may sit at
+`$600`-`$7FF`, not `$400`-`$5FF`. Settle from ROM disassembly (Task 5).
+
+### Command Protocol
+
+- **Handshake:** 68000 busy-waits DISKCMD==0 before writing a command
+  (START_RWTS: `TST.B DISKCMD; BNE` — SONYASM:123-125); the 6504 clears it
+  when ready.
+- **Go-bytes** (to `$01`) — SONY.TEXT:61-68: nulcmd=`$80` (no-op handshake),
+  excmd=`$81` (execute staged sub-command), seek=`$83` (pre-seek,
+  non-interrupting), clristat=`$85` (clear int status), enabstat=`$86`
+  (enable drive/ints), clrmask=`$87` (disable ints), goaway=`$89` (disable
+  controller). Teardown sequence: `$88`→DISKPARM then `$87`→DISKCMD
+  (mover:737-738).
+- **Sub-commands** (to `$03`, paired with excmd) — SONY.TEXT:51-59:
+  readdisk=0, writedisk=1, unclamp=2, format=3, verify=4, formattrk=5,
+  verifytrk=6, read_bf=7, write_bf=8 (Twiggy adds clampcmd=9 — twiggy:83).
+- **Completion:** interrupt-generating commands return immediately
+  (`response := waitint`); completion arrives as a hardware interrupt
+  (SONYASM:136-157).
+- **Errors:** DISKERR + 1800 = OS error (`ADDI.W #1800` —
+  SONYASM:127-131,396-400). not_issued=1809 (driver resends the packet —
+  twiggy:1520-1525), vererr=1821, read_err=1823, write_err=1824
+  (SONY.TEXT:39-42).
+
+### Sector Addressing (Sony GCR Zones)
+
+CONVERT (SONYASM:444-513; duplicated in ldmicro:436-531) maps linear block ↔
+zone/track/sector/side:
+
+- **Zones:** tracks 0-15 → 12 sec/trk; 16-31 → 11; 32-47 → 10; 48-63 → 9;
+  64-79 → 8. 80 tracks/side, 800 blocks/side (SNYSNGL=800 — SONYASM:38). 400K
+  single-sided = blocks 0-799 side 0 (TOPSIDE=0); double-sided adds side 1
+  blocks 800-1599.
+- **Zone offset table** (block-number bases): side0: trk0-15 off0(12/trk),
+  trk16-31 off192(11), trk32-47 off368(10), trk48-63 off528(9), trk64-79
+  off672(8) → 800.
+- The "FORMATTED 2:1 INTERLEAVE" comment (SONYASM:16) documents that physical
+  interleave lives in the 6504 firmware, invisible at this interface —
+  HLE serves logical sectors.
+- **Sector layout:** 512 data bytes + 12-byte packed on-disk tag at DISKHDR
+  (`$3E8`); Pascal pagelabel record (24-byte unpacked): version:int2,
+  datastat 2bit, volume:int1, fileid:int2, dataused:int2, abspage:int4
+  (reconstructed, not stored), relpage:int4, fwdlink:int4, bkwdlink:int4
+  (DRIVERDEFS:206-219; pack/unpack SONYASM:186-379). DC42's 12 tag
+  bytes/block are exactly this packed tag.
+
+### Interrupt Wiring
+
+- **Completion line:** VIA2 PORTB2 bit 4 (`BTST #4` in the Level1 handler —
+  LIBHW-DRIVERS:895-928); level-1 autovector. TwiggyRoutine → SONYINT
+  installed per iomodel (STARTUP:1894-1896; mover:725-743) →
+  SONY.DISK_INT (SONY.TEXT:417-541).
+- **DISKSTAT (`$5F`) bits** (SONY.TEXT:84-90; eject masks
+  ldmicro:48-49,213-224): bit7 bot_int, bit6 bot_done, bit5 (Twiggy
+  button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
+  top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
+- **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
+- **disk_control idle bit — AMBIGUITY (b):** bit 6 of a byte at `$FCD901`
+  (LDEQU:47, boot ROM wait_drv LDTWIG:174-186) vs `$FCD801` (twiggy:258
+  computes `iospacemmu*$20000+$0D801`). In-source contradiction; settle from
+  ROM disassembly (Task 5). NOTE: `$FCD901` is ALSO our ROM-established
+  VIA1 base (§3) — plausibly the same address serving double duty (VIA1
+  port bit), which would resolve the contradiction in favor of `$D901`.
+
+### Boot Path
+
+- **Boot-device byte:** absolute `$1B3` (adr_bootdev — STARTUP:198;
+  LDEQU:44). `$1B2` separately used by PROF for interleave choice
+  (PROF:60-68).
+- **FIND_BOOT decode** (STARTUP:1297-1393): bootdev 1 = internal Sony
+  (2/10-class); 0 = internal hard disk (Pepsi) or upper Twiggy; 2 =
+  parallel-port ProFile; 3-14 slots.
+- **ROM entry points** (LDEQU:59-62): prof_entry=`$FE0090`,
+  twig_entry=`$FE0094` (SHARED by Sony — "use same entrypoint as twiggy",
+  ldmicro:38-40,301-302,389-390), prom_monitor=`$FE0084`,
+  prom_version=`$FE3FFC`.
+- **twig_entry call signature** (LDTWIG:256-289; ldmicro:242-274): A0=
+  controller base (`$FCC000`), A1=header dest, A2=data dest, D0=0 (drive
+  speed), D1=packed drive/side/block/track, D2=timeout, A3=`$FCDD81`
+  (prom_via1 compat dummy — note: that's our VIA2 base, §3); out: Carry set
+  on error.
+- **Low-core dev_type (`$22E`):** dev_twig=0/dev_prof=1/dev_sony=2/
+  dev_widget=3 (LDEQU:38-41; ldmicro:124) — consumed by the Pascal loader
+  (ldlfs).
+- **ProFile interleave table** for contrast (LDPROF:311-314): 0,5,10,15,4,
+  9,14,3,8,13,2,7,12,1,6,11.
+
+### Board IDs
+
+- `$FCC031` (DiskROMId/adr_machinfo): bit7 = Pepsi-class; bit5 (when bit7)
+  = LisaLite slow-timer variant (LIBHW-DRIVERS:578-588; changelog :54).
+  iomodel decode (STARTUP:1876-1891): ≥0 → iob_lisa; `[$A0,$BF]` →
+  iob_sony; `[$C0,$DF]` → iob_lite; else check `$FCC015` (adr_intdisk):
+  0=twiggy, 1=single-sided Sony, 2=double-sided Sony (STARTUP:1747-1748)
+  → iob_twiggy/iob_pepsi.
+- **Current emulator stubs:** `$C031`=0 (validated benign through the menu
+  in M1b), `$C015` currently unknown-I/O `0xFF` → Task 4 sets `$C015`=1
+  (single-sided, matches 400K install disks), Task 5 validates against the
+  boot path with trace evidence.
+
+### Could Not Find
+
+1. The 6504 firmware itself (I/O-board ROM) — not in this tree; its
+   internal timing/GCR/steppers are invisible; HLE models the
+   68000-visible contract only.
+2. One-constant statement of the shared-RAM window size (offsets observed
+   to `$B9` + `$3E8`-`$7FF` region).
+3. Sony interleave remap table (firmware-internal).
+4. Resolution of ambiguities (a) buffer offset and (b) disk_control
+   address — both assigned to Task 5 ROM-disassembly.
+
 ## Known Gaps (Flagged for M1b, Not M1a)
 
 - Parity/bus-error status register bit layout not located. Check SOURCE-EXCEPRES/SOURCE-EXCEPASM BUS_ERR handler.

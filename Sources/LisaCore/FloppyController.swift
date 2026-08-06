@@ -43,9 +43,43 @@ import Foundation
 /// (real silicon has no such guard; a real protocol violation would just be
 /// undefined), not a cited hardware behavior.
 ///
+/// **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
+/// change).** `commandInFlight` -- the flag this rejection guard checks --
+/// only spans the FIRST delay, `commandDelayCycles` (go-byte write until
+/// `processGoByte` decodes it). For `excmd`'s readdisk/writedisk sub-
+/// commands, `performExCmd` calls `clearDiskCmd()` (dropping
+/// `commandInFlight`) as soon as it has read the staged parameters --
+/// BEFORE the SECOND delay, `completionDelayCycles`, during which the
+/// completion line actually rises (`raiseCompletionLineAfterDelay`). So
+/// there is a real window -- between DISKCMD clearing and the completion
+/// line asserting -- where this guard does NOT reject a new DISKCMD write;
+/// a second command issued in that window is accepted immediately and
+/// scheduled normally. This mirrors real hardware's own two-phase
+/// handshake (SONYASM:136-157's "response := waitint": the command ack and
+/// the interrupt arrival are two separate events, not one), so a real
+/// driver polling DISKCMD alone would see the identical "ready for a new
+/// command" window before the first command's interrupt has actually
+/// fired -- issuing a second command there without also waiting for the
+/// first's completion would be a driver protocol violation on real
+/// hardware too, not something this model is uniquely permissive about.
+/// What IS a modeling simplification: `completionLineAsserted`/the
+/// level-1-pending signal this type drives are single flags, not a queue,
+/// so two commands' completion events racing in that window would have the
+/// second's `raiseCompletionLineAfterDelay` silently coalesce with (not
+/// queue behind) the first's -- undefended, because no traced boot path
+/// (checkpoint C's block reads, the Task 6 loader's LFS reads, or the
+/// unclamp/eject teardown) has ever been observed to issue back-to-back
+/// `excmd`s without waiting for completion first.
+///
 /// ## Completion line polarity -- CONFIRMED (Task 5): the ROM's read
-    /// routine waits at `$FE1E3E` (`btst #$4,(A3)` / `bne done`, A3=$FCDD81) --
-    /// it spins until PORTB2 bit 4 is SET, so this model's idle=0/asserted=1
+    /// routine calls a wait-completion subroutine at `$FE1E3E` (`bsr $fe1e3e`
+    /// from `$FE1D94`); the actual poll instruction, 8 bytes into that
+    /// subroutine past its `move.l D2,D3` timeout-counter setup, is
+    /// `$FE1E46: btst #$4,(A3)` / `$FE1E4A: bne $fe1e54`, A3=$FCDD81 (M3 Task
+    /// 3 precision fix: the polling instruction itself is `$FE1E46`, not the
+    /// subroutine's `$FE1E3E` entry point -- see docs/rom-trace-notes.md
+    /// "The read routine" for the full disassembly) -- it spins until
+    /// PORTB2 bit 4 is SET, so this model's idle=0/asserted=1
     /// choice is exactly right; block 0 reads to completion and the boot block
     /// executes under it (docs/rom-trace-notes.md "Floppy boot (checkpoint C)",
     /// `ROMFloppyBootTests`). Original design rationale, now validated:
@@ -130,6 +164,21 @@ public final class FloppyController {
     enum SubCommand: UInt8 {
         case readdisk = 0
         case writedisk = 1
+        /// **Modeled as a benign no-op (M3 Task 3 doc note).** `unclamp` is
+        /// unimplemented -- it falls into `performExCmd`'s `default` branch
+        /// like every other unsupported sub-command, so this model answers
+        /// it with `ErrorCode.notIssued` (DISKERR 9) rather than performing
+        /// any real head-unclamp effect. This is deliberately harmless, not
+        /// an oversight: the only observed caller is the loader's
+        /// `shutdown`/eject teardown (source-ldmicro:184-203,
+        /// docs/hardware-notes.md §9 "Command Protocol"), which issues
+        /// `unclamp` -> `clristat ($85)` -> `clrmask ($87)`/parm (`$88`) and
+        /// waits ONLY on the VIA2-PB4 completion line -- it never reads
+        /// DISKERR after `unclamp`, so a nonzero error code here is
+        /// unobservable to it. Confirmed by the M2 Task 6 live trace
+        /// (docs/rom-trace-notes.md "Sanity-negative sweep"): the loader's
+        /// `unclamp` call completes the teardown regardless of this
+        /// answer, on every traced boot path through the `trap #6` gate.
         case unclamp = 2
         case format = 3
         case verify = 4
@@ -243,6 +292,26 @@ public final class FloppyController {
     /// visible protocol exchange).
     public var isInserted: Bool { image != nil }
 
+    /// **`$C015` vs. double-sided images -- a known, documented
+    /// inconsistency (M3 Task 3 doc note, not fixed here).** `insert(_:)`
+    /// happily accepts a double-sided (1600-block) DC42 image and sets
+    /// DISKFLG (`window[Cell.diskFlg]`) accordingly, below -- but
+    /// `$FCC015` (`adr_intdisk`, the board-ID byte real hardware reads to
+    /// distinguish twiggy/single-sided-Sony/double-sided-Sony,
+    /// docs/hardware-notes.md "Board IDs") is a STATIC `IODispatcher` stub
+    /// hardcoded to `1` (single-sided), independent of whatever media this
+    /// method inserts -- see hardware-notes.md's "Board IDs" section for
+    /// the citation and the same note mirrored there. On real hardware
+    /// `$C015` describes the DRIVE's fixed capability, not the inserted
+    /// disk, so a double-sided image in a single-sided-reporting model is
+    /// an inconsistent combination no real Lisa configuration could
+    /// produce. Harmless today (no traced boot path reads `$C015` after
+    /// insertion, and M2/M3's install images are all single-sided 400K),
+    /// but a future task inserting a genuine 800K double-sided image should
+    /// make `$C015` configurable (or derive it from the inserted image)
+    /// rather than leaving the two signals able to disagree -- parked as an
+    /// M4-ish resolution path, not implemented here (out of this task's
+    /// doc-only/behavioral-item-1-only scope).
     public func insert(_ image: DC42Image) {
         self.image = image
         window[Cell.diskIn] = 1

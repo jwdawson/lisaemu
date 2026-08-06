@@ -716,6 +716,24 @@ Source: libhw-MACHINE:413-481
 - Synthesized by COPS as reset-code $FB
 - Dispatched as key $08 down/up event
 
+**Emulator status (M3 Task 3 -- re-recorded deferral, consciously, to M4):**
+soft power / the Power menu are NOT implemented as behavior -- `COPS`
+recognizes and LOGS every power command byte above (`$20`/`$21`/`$23`/
+`$25`/`$2C`/`$2D`) into `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`;
+regression-pinned by `COPSTests.powerCommandsAreLogged`), but no shutdown/
+reboot/clock-for-alarm semantics are modeled -- the log exists purely so a
+future task can verify the ROM/OS issued the right command, not to drive any
+emulated effect. No boot path through M3 (menu, floppy boot, the OS loader
+through its current Checkpoint-D frontier) has been observed to issue a
+Power Command byte, so this remains untested-by-necessity, not
+under-tested. Widget (`dev_widget=3`, docs/hardware-notes.md §9 "Boot
+Path") and ProFile HLE are likewise unimplemented -- no peripheral beyond
+the internal Sony/Twiggy floppy exists in this emulator. Both are
+consciously scoped to M4, not this milestone: M3's plan document (Global
+Constraints) explicitly excludes them ("Widget + Power menu remain
+consciously deferred to M4 unless evidence forces them"), and nothing on
+the M3 boot path through Checkpoint D has forced either.
+
 ### NMI and Debugger Break-In
 
 Source: LDASM:68-106
@@ -946,6 +964,30 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
   SONYASM:127-131,396-400). not_issued=1809 (driver resends the packet —
   twiggy:1520-1525), vererr=1821, read_err=1823, write_err=1824
   (SONY.TEXT:39-42).
+- **`unclamp` (sub-command 2) — modeled as a benign no-op (M3 Task 3 doc
+  note).** `FloppyController` doesn't implement `unclamp` (it falls into the
+  same unsupported-sub-command path as `format`/`verify`/etc., answering
+  `notIssued`/DISKERR 9); this is harmless because the only observed caller
+  is the loader's `shutdown`/eject teardown (source-ldmicro:184-203):
+  `unclamp` → `clristat ($85)` → `clrmask ($87)`/parm `$88`, waiting ONLY on
+  the VIA2-PB4 completion line and never reading DISKERR — confirmed live by
+  the M2 Task 6 trace (this doc's "Boot-ROM read sequence — Task 6" bullet,
+  above, and rom-trace-notes.md "Sanity-negative sweep"). See
+  `FloppyController.SubCommand.unclamp`'s doc comment for the mirrored note.
+- **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
+  change).** The busy-rejection guard (`FloppyController.commandInFlight`)
+  only spans the command-decode delay, not the SEPARATE completion-wait
+  delay `excmd`'s readdisk/writedisk raise the completion line after
+  (`response := waitint`, above) — DISKCMD clears as soon as the staged
+  parameters are read, before the completion line rises, so a new DISKCMD
+  write in that in-between window is accepted immediately, not rejected.
+  This mirrors the real hardware's own two-phase handshake (command-ack vs.
+  interrupt-arrival are different events); it is not something this model is
+  uniquely permissive about, but the model's completion-line state is a
+  single flag, not a queue, so two overlapping completions would coalesce
+  rather than queue — undefended, because no traced boot path has ever
+  issued a second `excmd` before the first's completion. Full mechanism:
+  `FloppyController`'s type doc comment, "Handshake / busy rejection".
 
 ### Sector Addressing (Sony GCR Zones)
 
@@ -1024,7 +1066,7 @@ zone/track/sector/side:
   loader (`$FE1BCC`) → twig_entry read routine (`$FE1D76`). That routine's
   go-byte choreography for one block read: `clr.b ($2,A0)` (DISKPARM = 0 =
   readdisk) → `move.b #$81,(A0)` (DISKCMD = excmd) → wait completion
-  (`$FE1E3E`: VIA2 PORTB2 bit 4 SET) → read DISKERR (`$11`) → `move.b #$85,(A0)`
+  (`bsr $FE1E3E`, poll at `$FE1E46`: VIA2 PORTB2 bit 4 SET) → read DISKERR (`$11`) → `move.b #$85,(A0)`
   (clristat) → wait ready (`$FE1E04`: DISKCMD==0, gated on VIA1 `$FCD901` PB6) →
   check DISKERR==0 → copy 12 tag + 512 data bytes off the odd lane. The loader
   verifies the boot block's `$AAAA` signature (`$FE1EF2: cmpi.w #-$5556`) at
@@ -1043,9 +1085,17 @@ zone/track/sector/side:
   This is **cosmetically harmless and needs no model change**: `shutdown` waits
   only on the VIA2-PB4 completion line and never reads DISKERR, so the eject
   teardown (`unclamp` → `clristat $85` → `clrmask $87`/parm `$88`) completes
-  regardless. The loader stops at a Lisa Pascal `trap #6` segment-call gate (an
-  M3 CPU-runtime dependency, not a device) — see docs/rom-trace-notes.md "OS
-  loader (Task 6)".
+  regardless. ~~The loader stops at a Lisa Pascal `trap #6` segment-call gate
+  (an M3 CPU-runtime dependency, not a device) — see docs/rom-trace-notes.md
+  "OS loader (Task 6)".~~ **M3 Task 3 sweep correction (strike-through-not-
+  erase, both-docs rule):** this was left unhedged after M3 Task 1 diagnosed
+  it — `trap #6` is the OS's **MMU-programming trap** `do_an_mmu`, not a
+  Pascal segment-call gate, and the stop was an **emulation divergence** (a
+  missing 12-bit MMU page-add wrap in `MMU.translate`), since FIXED — the
+  gate now falls and the boot advances to a new, later frontier (the
+  Checkpoint-D domain-1 crossover, M3 Task 2). See
+  docs/rom-trace-notes.md "Gate diagnosis (M3 Task 1)" and "Checkpoint D
+  (M3 Task 2)" for the full evidence chain and current frontier.
 
 ### Board IDs
 
@@ -1081,10 +1131,31 @@ zone/track/sector/side:
   IDLE/ASSERTED polarity (chosen idle=0/asserted=1) and the DISKERR raw-byte
   values (inferred as the documented OS-level error codes minus the `1800`
   offset, not independently cited). **Task 5 update:** the completion-line
-  polarity is now CONFIRMED (the ROM waits at `$FE1E3E` for VIA2 PORTB2 bit 4
-  to be SET — asserted=1 is correct); block 0 reads to completion and the boot
-  block executes. The DISKERR raw-byte values remain uncited (the successful
-  read path sets DISKERR=0, so no error code was exercised).
+  polarity is now CONFIRMED (the ROM waits at `$FE1E46` — 8 bytes into the
+  wait-completion subroutine entered via `bsr $FE1E3E` from `$FE1D94` — for
+  VIA2 PORTB2 bit 4 to be SET — asserted=1 is correct; M3 Task 3 precision
+  fix: the polling instruction itself is `$FE1E46`, not the subroutine's
+  `$FE1E3E` entry point, see docs/rom-trace-notes.md "The read routine" for
+  the full disassembly); block 0 reads to completion and the boot block
+  executes. The DISKERR raw-byte values remain uncited (the successful read
+  path sets DISKERR=0, so no error code was exercised).
+- **`$C015`=1 vs. double-sided (1600-block) images — a known, documented
+  inconsistency (M3 Task 3 doc note, not fixed here).** `$C015` is a STATIC
+  stub hardcoded to `1` (single-sided Sony), per the Task 4 update above --
+  but `FloppyController.insert(_:)` accepts ANY DC42 image, including a
+  double-sided 800K one (`blockCount > 800`), and sets DISKFLG accordingly
+  regardless of what `$C015` claims. On real hardware `$C015` describes the
+  DRIVE's fixed physical capability (STARTUP:1747-1748), not the inserted
+  media, so a double-sided image combined with a single-sided-reporting
+  `$C015` is a combination no real Lisa configuration could produce. This is
+  harmless for every boot path traced so far (M2/M3's install images are
+  single-sided 400K, and no traced path reads `$C015` after insertion --
+  see the "traced boot path never reaches the floppy driver" note above),
+  but is a real latent inconsistency if a future task inserts a genuine
+  800K double-sided image. **M4-ish resolution path:** make `$C015`
+  configurable (or derive it from the currently-inserted image) instead of
+  a fixed stub, closing the gap between the two signals. See
+  `FloppyController.insert(_:)`'s doc comment for the mirrored note.
 
 ### Could Not Find
 

@@ -138,8 +138,18 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
 /// verified-correct real-hardware byte layout).
 @Test func readClockCommandEnqueuesAClockReplyPacket() {
     // 0x1122_3344 seconds since the epoch -> big-endian bytes $11,$22,$33,$44
-    // -- an explicit, hand-computed expectation (not derived from the
-    // function under test) so this stays a genuine regression pin.
+    // -- an explicit, hand-computed expectation (not literally CALLING
+    // `defaultHostClockBytes(now:)` to generate it, which would make this
+    // test tautological). (M2 Task 2 precision nit, folded in M3 Task 3:
+    // "hand-computed" doesn't make this an INDEPENDENT ORACLE -- the
+    // computation is the identical big-endian byte-swap the function under
+    // test performs, just written out by hand, so a shared error in that
+    // conversion logic would slip past both. This test is a genuine
+    // REGRESSION PIN against an accidental future change to
+    // `defaultHostClockBytes`'s byte layout/ordering -- it does NOT
+    // independently verify that layout against real Lisa hardware; see the
+    // type-level doc comment above for that same caveat stated once for
+    // the whole placeholder clock-payload format.)
     let fixedDate = Date(timeIntervalSince1970: 0x1122_3344)
     let fixedBytes: [UInt8] = [0xE0, 0x11, 0x22, 0x33, 0x44, 0x00]
     let (cops, scheduler, interruptRaised) = makeCOPS(clockSource: { fixedDate })

@@ -559,7 +559,20 @@ ROM's revision at all.
 
 ### OQ1 — Does the ROM program SLIM/SORG targeting the CURRENT domain (our model), or does the hardware "inactive domain" semantic matter?
 
-**Undetermined by the boot trace — remains OPEN for M1b.** The current-domain
+> **STATUS UPDATE (M3 Task 2, sweep-noted M3 Task 3): now ANSWERED.** The
+> "remains OPEN"/"UNVALIDATED and open" conclusion below was correct for its
+> time (M1b -- the boot trace genuinely couldn't discriminate the two models
+> yet) but is now STALE: the Checkpoint-D domain-1 crossover (the OS
+> loader's `do_an_mmu` switching live context mid-handler) finally forced
+> the discriminating case this section predicted M1b would need, and
+> `initmmutil`/`do_an_mmu`'s own source settles it in favor of the
+> CURRENT (active) domain -- see "OQ1 status" (near the end of this
+> document) for the full resolution and citations. The paragraphs below are
+> preserved as the historical M1b record (both-docs rule), not the current
+> answer.
+
+**Undetermined by the boot trace — remains OPEN for M1b (historical, see the
+status update above).** The current-domain
 model is *consistent with* everything the boot ROM does, but the boot path
 **cannot discriminate** current- from inactive-domain routing, so this is not
 evidence that the model is correct.
@@ -1055,7 +1068,13 @@ FE1D84: movep.l D1,($4,A0)        ; stage DRIV/HEAD/SEC/TRAK cells ($05/$07/$09/
 FE1D88: move.b D0,($C,A0)         ; drive-speed cell ($0D)
 FE1D8C: clr.b  ($2,A0)            ; DISKPARM ($03) = 0 = readdisk sub-command
 FE1D90: move.b #$81,(A0)          ; DISKCMD ($01) = excmd  -> FloppyController.performExCmd
-FE1D94: bsr $FE1E3E               ; WAIT COMPLETION: btst #$4,$FCDD81 / bne (VIA2 PB4 SET)
+FE1D94: bsr $FE1E3E               ; WAIT COMPLETION -- $FE1E3E: move.l D2,D3 (timeout counter
+                                   ;   setup) / $FE1E40: movea.l #$fcdd81,A3 / $FE1E46: btst
+                                   ;   #$4,(A3) / $FE1E4A: bne $fe1e54 (VIA2 PB4 SET; loops via
+                                   ;   $FE1E4C: subq.l #1,D3 / $FE1E4E: bne $fe1e46 on timeout).
+                                   ;   M3 Task 3 precision fix: the poll instruction itself is
+                                   ;   $FE1E46, not the $FE1E3E subroutine entry point (8 bytes
+                                   ;   earlier) -- see hardware-notes.md §9's mirrored note.
 FE1D9A: move.b ($10,A0),D0        ; read DISKERR ($11)
 FE1D9E: move.b #$CC,($2,A0)       ; DISKPARM = $CC
 FE1DA4: move.b #$85,(A0)          ; DISKCMD = clristat
@@ -1094,8 +1113,11 @@ The ready/handshake wait `$FE1E04` polls **VIA1 PORT B bit 6 at `$FCD901`**
 resolving the OS-source `$D901`/`$D801` contradiction in favor of `$D901`. **No
 new wiring was required:** VIA1's `portBInput` defaults to `0xFF` (unconnected
 input floating high), so PB6 already reads 1 = idle/ready, exactly what the
-handshake needs. The completion wait (`$FE1E3E`) likewise confirms the
-completion-line polarity: it spins until VIA2 PORTB2 bit 4 is SET, matching
+handshake needs. The completion wait (`bsr $FE1E3E`, polling at `$FE1E46` --
+M3 Task 3 precision fix: the poll instruction is 8 bytes past the
+subroutine's `$FE1E3E` entry, see "The read routine" above) likewise
+confirms the completion-line polarity: it spins until VIA2 PORTB2 bit 4 is
+SET, matching
 `FloppyController`'s idle=0/asserted=1 choice.
 
 ### The boot block: load address `$020000`, first instruction `4E FA` (JMP)
@@ -1365,7 +1387,9 @@ MMU reprogramming, and screen drawing on the loader path. Findings, all live:
   first observed *post-POST, live* SLIM/SORG programming of a fresh segment by
   running OS code — future work that gets past `trap #6` (into the Pascal
   segment loader, which maps many segments) is the natural place OQ1 will
-  finally be forced.
+  finally be forced. **(M3 Task 3 sweep note: this prediction came true --
+  see "Checkpoint D" and "OQ1 status" below, where the domain-1 crossover
+  forces exactly this and OQ1 is answered.)**
 - **The loader draws nothing pre-gate.** The framebuffer set-pixel count is
   identical (`78181`) at `$020000` entry and at the `trap #6` gate — the boot
   UI (menu + opened device-list window) stays on screen unchanged; the loader
@@ -1529,3 +1553,27 @@ multi-domain MMU task, gated on finding the hardware citation.
   frontier anchor**: `≥120` `do_an_mmu` (`trap #6`) calls, `mmuPortWrites`
   climbs past the gate value, the boot **crosses into domain 1** (OQ1), then
   **halts** at the multi-domain boundary, with `writeAttempts==0` (no-writes).
+
+## M3 Task 3 — deferrals re-recorded to M4 (parked-debt bundle)
+
+Two subsystems the M3 plan document's Global Constraints named as
+"consciously deferred to M4 unless evidence forces them" (Widget + Power
+menu) are re-recorded here, explicitly, as this milestone's ledger asked:
+nothing observed on the boot-to-menu path, the floppy-boot path
+(checkpoint C), or the OS-loader path through the current Checkpoint-D
+frontier (`do_an_mmu`'s domain-0 MMU build and the domain-1 crossover halt)
+has forced either into scope.
+
+| Deferred item | Evidence it wasn't forced | Where the hook already exists |
+|---|---|---|
+| **Widget hard-disk HLE** | `dev_type` (`$22E`) only ever observed `= 2` (`dev_sony`) on every traced boot (checkpoint C, Task 6's loader progression, Checkpoint D) — `dev_widget = 3` (docs/hardware-notes.md §9 "Boot Path") is never selected because no traced path chooses a Widget boot device. | None yet — no peripheral beyond the internal Sony/Twiggy floppy (`FloppyController`) exists in this emulator. |
+| **ProFile HLE** | Same low-core cell: `dev_type` never observed `= 1` (`dev_prof`) on any traced path. `docs/hardware-notes.md` §9's "ProFile interleave table" is transcribed as research only, never exercised. | None yet. |
+| **Soft power / Power menu** | No traced boot path (menu idle-wait, floppy boot, the OS loader through Checkpoint D) has been observed to issue a Power Command byte (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`, docs/hardware-notes.md §7). | `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`) already recognizes and logs every Power Command byte, regression-pinned by `COPSTests.powerCommandsAreLogged` — no shutdown/reboot/alarm semantics are modeled behind the log, by design, until M4 evidence demands them. |
+
+Wired the same way the plan's own precedent already established
+(`docs/hardware-notes.md` §7 "Soft Power Control" carries the mirrored
+note): these are conscious M4 deferrals, not gaps discovered by this
+sweep — re-recording them here just makes the M3 ledger's own claim
+("Widget + Power menu remain consciously deferred to M4 unless evidence
+forces them") checkable against live evidence, in the same place the rest
+of this document tracks what's forced vs. deferred.

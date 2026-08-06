@@ -426,3 +426,299 @@ extension LisaShellMusashiSuites {
         }
     }
 }
+
+// MARK: - M2 Task 7: insertFloppy/ejectFloppy through EmulationController's
+// public mailbox API (ROM-gated only -- these use a small hand-built
+// synthetic DC42 image written to a temp file, not a real Lisa disk image,
+// so LISAEMU_DISK_DIR is not required). The ROM+DISK-gated integration test
+// proving the full app-facing boot-into-loader path lives in
+// `EmulationControllerFloppyIntegrationTests`, below.
+
+extension LisaShellMusashiSuites {
+    @Suite(.enabled(if: romDir != nil, "Set LISAEMU_ROM_DIR to run floppy controller tests"))
+    struct EmulationControllerFloppyTests {
+        private func makeController() throws -> EmulationController {
+            try EmulationController(romDirectory: URL(fileURLWithPath: romDir!))
+        }
+
+        @discardableResult
+        private func waitForStatus(_ controller: EmulationController, timeout: TimeInterval = 15,
+                                    _ predicate: @escaping (EmuStatus) -> Bool) -> Bool {
+            let sem = DispatchSemaphore(value: 0)
+            controller.onStatus = { status in
+                if predicate(status) { sem.signal() }
+            }
+            let result = sem.wait(timeout: .now() + timeout)
+            controller.onStatus = nil
+            return result == .success
+        }
+
+        /// Hand-builds a minimal-but-valid DC42 container (small block
+        /// count -- no need for a full 800-block image just to exercise
+        /// insert/eject plumbing) and writes it to a fresh temp file, per
+        /// block, mirroring `FloppyControllerTests.makeSyntheticImage`'s
+        /// container-assembly shape one layer down (LisaCoreTests can't be
+        /// imported from here -- separate SwiftPM test target -- so this is
+        /// a deliberate small duplicate, not a shared helper).
+        private func makeSyntheticDC42File(blockCount: Int = 4) throws -> URL {
+            var dataPlane = [UInt8](repeating: 0, count: blockCount * 512)
+            var tagPlane = [UInt8](repeating: 0, count: blockCount * 12)
+            for block in 0..<blockCount {
+                for i in 0..<512 { dataPlane[block * 512 + i] = UInt8(truncatingIfNeeded: block &* 7 &+ i) }
+                for i in 0..<12 { tagPlane[block * 12 + i] = UInt8(truncatingIfNeeded: block &* 3 &+ i &+ 1) }
+            }
+            var container = Data()
+            let name = "TEST"
+            var pascalString = Data([UInt8(name.utf8.count)])
+            pascalString.append(contentsOf: Array(name.utf8))
+            container.append(pascalString)
+            container.append(Data(repeating: 0, count: 64 - pascalString.count))
+            var dataLen = UInt32(dataPlane.count).bigEndian
+            container.append(Data(bytes: &dataLen, count: 4))
+            var tagLen = UInt32(tagPlane.count).bigEndian
+            container.append(Data(bytes: &tagLen, count: 4))
+            container.append(Data(repeating: 0, count: 8))
+            container.append(Data(repeating: 0, count: 4))
+            container.append(Data(dataPlane))
+            container.append(Data(tagPlane))
+
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("EmulationControllerFloppyTests-\(UUID().uuidString).dc42")
+            try container.write(to: url)
+            return url
+        }
+
+        // MARK: insertFloppy -> Bus/FloppyController state + EmuStatus.diskInserted
+
+        @Test
+        func insertFloppyAttachesImageAndStatusReportsDiskInserted() throws {
+            let controller = try makeController()
+            let diskURL = try makeSyntheticDC42File()
+
+            controller.insertFloppy(url: diskURL)
+            let inserted = controller.debugSync { $0.bus.floppy.isInserted }
+            #expect(inserted, "insertFloppy(url:) should attach the image to the live Machine's FloppyController")
+
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller) { $0.diskInserted },
+                    "EmuStatus.diskInserted should reflect the attached image")
+        }
+
+        // MARK: ejectFloppy -> Bus/FloppyController state + EmuStatus.diskInserted
+
+        @Test
+        func ejectFloppyDetachesImageAndStatusReportsDiskNotInserted() throws {
+            let controller = try makeController()
+            let diskURL = try makeSyntheticDC42File()
+
+            controller.insertFloppy(url: diskURL)
+            #expect(controller.debugSync { $0.bus.floppy.isInserted })
+
+            controller.ejectFloppy()
+            let stillInserted = controller.debugSync { $0.bus.floppy.isInserted }
+            #expect(!stillInserted, "ejectFloppy() should detach the image")
+
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller) { !$0.diskInserted },
+                    "EmuStatus.diskInserted should reflect the ejection")
+        }
+
+        // MARK: media survives reset() -- Task 2's warm-reset design, proven
+        // end-to-end through the app-facing insertFloppy/reset() API (the
+        // ledger's explicit ask for this task)
+
+        @Test
+        func insertedMediaSurvivesReset() throws {
+            let controller = try makeController()
+            let diskURL = try makeSyntheticDC42File()
+
+            controller.insertFloppy(url: diskURL)
+            #expect(controller.debugSync { $0.bus.floppy.isInserted },
+                    "precondition: disk inserted before reset")
+
+            controller.reset()
+            var cyclesAfterReset: UInt64 = 0
+            var insertedAfterReset = false
+            for _ in 0..<200 {
+                cyclesAfterReset = controller.debugSync { $0.cycles }
+                insertedAfterReset = controller.debugSync { $0.bus.floppy.isInserted }
+                if cyclesAfterReset == 0 { break }
+                Thread.sleep(forTimeInterval: 0.01)
+            }
+            #expect(cyclesAfterReset == 0, "precondition: reset() completed")
+            #expect(insertedAfterReset,
+                    "media must survive reset() by construction (Task 2's warm-reset design; Bus/FloppyController identity never changes) -- proven here through the app-facing insertFloppy()/reset() API")
+        }
+
+        // MARK: insertFloppy load failure -> onDiskError, never a crash
+
+        @Test
+        func insertFloppyWithBadURLReportsErrorInsteadOfCrashing() throws {
+            let controller = try makeController()
+            let missingURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("does-not-exist-\(UUID().uuidString).dc42")
+
+            // Lock-guarded, mirroring `mouseAndClickDriveTheRealBootMenu`'s
+            // `framesLock` pattern above: `onDiskError` fires on the
+            // emulation thread, this closure reads back on the test thread.
+            let sem = DispatchSemaphore(value: 0)
+            let messageLock = NSLock()
+            var message: String?
+            controller.onDiskError = { msg in
+                messageLock.lock(); message = msg; messageLock.unlock()
+                sem.signal()
+            }
+
+            controller.insertFloppy(url: missingURL)
+            let received = sem.wait(timeout: .now() + 10) == .success
+            #expect(received, "onDiskError should fire for a load failure")
+            messageLock.lock(); let capturedMessage = message; messageLock.unlock()
+            #expect(capturedMessage?.contains(missingURL.lastPathComponent) == true,
+                    "the error message should reference the offending path; got \(capturedMessage ?? "nil")")
+
+            // Never a crash: the controller stays fully functional afterward.
+            let stillInserted = controller.debugSync { $0.bus.floppy.isInserted }
+            #expect(!stillInserted, "a failed insert must not leave a partial/inserted image")
+            let cycles = controller.debugSync { $0.cycles }
+            #expect(cycles == 0, "the emulation thread should still be alive and answering debugSync after a failed insert")
+        }
+
+        // MARK: EmuStatus.diskActivity -- flips true once the floppy
+        // processes a go-byte command, independent of a real disk image or
+        // ROM menu interaction: drives the memory-mapped protocol directly
+        // (docs/hardware-notes.md §9, DISKCMD offset $01 within the
+        // $FCC000-$FCC7FF window) through the public `Bus.write8` API.
+
+        @Test
+        func diskActivityFlipsTrueWhenFloppyProcessesACommand() throws {
+            let controller = try makeController()
+            controller.throttled = false
+            controller.start()
+            #expect(waitForStatus(controller) { $0.cycles > 0 })
+
+            // nulcmd ($80) go-byte at DISKCMD ($FCC001) -- a handshake-only
+            // command (no disk needed), processed `commandDelayCycles`
+            // later and counted by `FloppyController.commandsProcessed`.
+            controller.debugSync { m in m.bus.write8(0x00FC_C001, 0x80) }
+
+            let sawActivity = waitForStatus(controller) { $0.diskActivity }
+            #expect(sawActivity, "diskActivity should flip true once the floppy finishes processing the nulcmd go-byte")
+        }
+    }
+}
+
+// MARK: - M2 Task 7: ROM+DISK-gated integration test -- the M2 demo, made
+// automatic through the app-facing (EmulationController public) surface.
+
+private let floppyIntegrationDiskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
+
+extension LisaShellMusashiSuites {
+    @Suite(.enabled(if: romDir != nil && floppyIntegrationDiskDir != nil,
+                    "Set LISAEMU_ROM_DIR and LISAEMU_DISK_DIR to run the floppy-boot app-integration test"))
+    struct EmulationControllerFloppyIntegrationTests {
+        private func makeController() throws -> EmulationController {
+            try EmulationController(romDirectory: URL(fileURLWithPath: romDir!))
+        }
+
+        /// Same technique as `ROMFloppyBootTests.moveCursor`
+        /// (`Tests/LisaCoreTests/ROMFloppyBootTests.swift`), routed through
+        /// `EmulationController.post(_:)`/`debugSync(_:)` instead of a bare
+        /// `Machine` -- the app-facing path this task integrates.
+        private func moveCursor(_ controller: EmulationController, to tx: Int, _ ty: Int) {
+            for _ in 0..<24 {
+                let (cx, cy) = controller.debugSync { m in (Int(m.bus.read16(0x496)), Int(m.bus.read16(0x498))) }
+                if abs(cx - tx) <= 1 && abs(cy - ty) <= 1 { return }
+                controller.post(.mouseDelta(dx: Int8(max(-120, min(120, tx - cx))),
+                                             dy: Int8(max(-120, min(120, ty - cy)))))
+                controller.debugSync { m in m.run(until: m.cycles + 250_000) }
+            }
+        }
+
+        /// Same technique as `ROMFloppyBootTests.click`.
+        private func click(_ controller: EmulationController) {
+            controller.post(.mouseButton(down: true))
+            controller.debugSync { m in m.run(until: m.cycles + 300_000) }
+            controller.post(.mouseButton(down: false))
+            controller.debugSync { m in m.run(until: m.cycles + 300_000) }
+        }
+
+        /// Drives the identical scripted sequence as `ROMFloppyBootTests
+        /// .bootIntoLoader()` -- POST to the menu, click "STARTUP FROM…",
+        /// click the top device item, step into the boot block at
+        /// `$020000`, then step until the loader's TRAP #6 segment gate
+        /// (`$A84000`) is reached -- but entirely through
+        /// `EmulationController`'s PUBLIC surface: `insertFloppy(url:)`
+        /// (not `machine.bus.floppy.insert(_:)` directly), `post(_:)` for
+        /// input, and `debugSync(_:)` for the same test-observability/
+        /// cycle-driving seam every other `EmulationControllerTests` test in
+        /// this file already uses (see e.g. `mouseAndClickDriveTheRealBootMenu`,
+        /// above). This is "the M2 demo, made automatic" through the
+        /// app-facing path, per the task brief.
+        private func bootIntoLoader(_ controller: EmulationController, diskURL: URL) {
+            controller.insertFloppy(url: diskURL)
+            // FIFO mailbox ordering + debugSync's "drained up to and
+            // including this request" contract (its own doc comment)
+            // guarantees the insert above has already been applied by the
+            // time this closure runs.
+            controller.debugSync { m in m.run(until: 18_000_000) }
+            moveCursor(controller, to: 420, 182); click(controller)          // "STARTUP FROM…"
+            controller.debugSync { m in m.run(until: m.cycles + 3_000_000) }
+            moveCursor(controller, to: 88, 33); click(controller)            // top device item
+            controller.debugSync { m in
+                let lim0 = m.cycles + 40_000_000
+                while m.cycles < lim0 && !m.halted && m.cpu[.pc] != 0x0002_0000 { _ = m.step() }
+            }
+            controller.debugSync { m in
+                let lim1 = m.cycles + 5_000_000
+                while m.cycles < lim1 && !m.halted && m.cpu[.pc] != 0x00A8_4000 { _ = m.step() }
+            }
+        }
+
+        /// **M2 EXIT CRITERION, through the app-facing path.** Asserts the
+        /// same loader-execution markers `ROMFloppyBootTests
+        /// .osLoaderExecutesFromRAMAndReachesPascalSegmentGate` documents
+        /// (`Tests/LisaCoreTests/ROMFloppyBootTests.swift`; full narrative
+        /// in `docs/rom-trace-notes.md` "OS loader (Task 6)"): the loader
+        /// relocates to `$100000`, reads >=20 blocks off the floppy (exact
+        /// anchor 24: 23 code blocks + block 28 MDDF), writes `dev_type
+        /// ($22E)` = 2 (`dev_sony`), and installs its own TRAP #6 segment
+        /// gate at `$A84000` -- reached here via `insertFloppy(url:)` +
+        /// the proven scripted menu-selection sequence instead of reaching
+        /// into `Machine`/`Bus` directly.
+        @Test
+        func insertFloppyThenScriptedBootReachesTaskSixLoaderMarkers() throws {
+            let controller = try makeController()
+            let diskURL = URL(fileURLWithPath: floppyIntegrationDiskDir! + "/OS31_Install_1.dc42")
+
+            bootIntoLoader(controller, diskURL: diskURL)
+
+            let ldbaseptr = controller.debugSync { $0.bus.read32(0x21C) }
+            #expect(ldbaseptr == 0x0010_0000, "ldbaseptr ($21C) should be prom_realsize/2 = $100000")
+
+            let blocksRead = controller.debugSync { $0.bus.floppy.blocksRead }
+            #expect(blocksRead >= 20, "the loader should read many blocks off the floppy; got \(blocksRead)")
+            #expect(blocksRead == 24, "exact anchor: 23 loader code blocks + block 28 (MDDF) = 24")
+
+            let lastError = controller.debugSync { $0.bus.floppy.lastError }
+            #expect(lastError == 0, "every loader block read should succeed (DISKERR 0)")
+
+            let devType = controller.debugSync { $0.bus.read16(0x22E) }
+            #expect(devType == 2, "dev_type ($22E) should be dev_sony (2)")
+
+            let vec98 = controller.debugSync { $0.bus.read32(0x98) }
+            #expect(vec98 == 0x00A8_4000,
+                    "the loader should install its own TRAP #6 handler ($A84000) over the PROM's ($FE1D14)")
+
+            let halted = controller.debugSync { $0.halted }
+            #expect(!halted, "the loader run is a live progression, not a halt")
+
+            // App-facing surface: the disk this task's `insertFloppy(url:)`
+            // attached is still reported inserted through `Bus.floppy`
+            // directly (the same object `EmuStatus.diskInserted` samples).
+            let stillInserted = controller.debugSync { $0.bus.floppy.isInserted }
+            #expect(stillInserted, "the disk inserted via the public API should still be attached at the loader gate")
+        }
+    }
+}

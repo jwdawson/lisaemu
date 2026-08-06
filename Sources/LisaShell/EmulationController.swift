@@ -22,6 +22,20 @@ public struct EmuStatus: Sendable {
     public let halted: Bool
     public let throttled: Bool
     public let emulatedSeconds: Double
+    /// Whether a floppy image is currently attached (`FloppyController
+    /// .isInserted`), sampled fresh at every publish -- an instantaneous
+    /// snapshot, not a diffed/edge-triggered flag like `diskActivity`.
+    public let diskInserted: Bool
+    /// M2 Task 7: "the floppy processed a command within the last status
+    /// interval" -- computed by diffing `FloppyController.commandsProcessed`
+    /// against its value at the previous publish (see
+    /// `EmulationController.runEmulationThread`'s `lastCommandsProcessed`).
+    /// Deliberately simple: any go-byte the controller finished handling
+    /// since the last publish counts as "activity," whether it was a real
+    /// disk read or a housekeeping command (`seek`/`clristat`/...) -- this
+    /// is a UI liveness indicator (`ScreenView`'s status-strip flash), not a
+    /// precise "disk read in progress" signal.
+    public let diskActivity: Bool
 }
 
 /// Commands crossing from any external thread into the emulation thread's
@@ -35,6 +49,8 @@ private enum Command {
     case input(InputEvent)
     case screenshot(@Sendable (Frame) -> Void)
     case debug((Machine) -> Void)
+    case insertFloppy(URL)
+    case ejectFloppy
     case shutdown
 }
 
@@ -106,6 +122,17 @@ private final class Shared {
         set { lock.lock(); defer { lock.unlock() }; _onStatus = newValue }
     }
 
+    /// M2 Task 7's chosen error surface for `insertFloppy(url:)` load
+    /// failures -- see `EmulationController.onDiskError`'s doc comment for
+    /// why a dedicated callback was chosen over adding an error field to
+    /// `EmuStatus`. Same lock-protected get/set shape as `onStatus`, above,
+    /// for the identical cross-thread-reassignment reason.
+    private var _onDiskError: (@Sendable (String) -> Void)?
+    var onDiskError: (@Sendable (String) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onDiskError }
+        set { lock.lock(); defer { lock.unlock() }; _onDiskError = newValue }
+    }
+
     /// Set only from the emulation thread's startup failure path (before
     /// `startupGate.signal()`), read only from `EmulationController.init`
     /// after `startupGate.wait()` returns -- the semaphore itself is the
@@ -167,6 +194,28 @@ public final class EmulationController {
         set { shared.onStatus = newValue }
     }
 
+    /// Fires ON THE EMULATION THREAD (same contract as `onStatus`/`onFrame`
+    /// -- the app hops threads itself) exactly when `insertFloppy(url:)`'s
+    /// `DC42Image.load(url:)` throws, with a human-readable description.
+    /// Never fires for a successful insert.
+    ///
+    /// **Documented choice**: a dedicated callback, not an `EmuStatus`
+    /// field. `EmuStatus` is a periodic ~4Hz SNAPSHOT (its whole shape is
+    /// "what does the machine look like right now") -- a load failure is a
+    /// discrete EVENT that happens once, synchronously with the
+    /// `insertFloppy` call that caused it. Modeling it as a status field
+    /// would need its own sticky/clear lifecycle (when does the field go
+    /// back to `nil`? on the next successful insert? after N publishes?)
+    /// that has no natural answer, whereas a callback delivers the failure
+    /// exactly once, right when it happens, mirroring `onStatus`'s own
+    /// "fire and let the app decide what to do" shape. `AppModel` (LisaApp)
+    /// surfaces this as a dismissible alert, same pattern as `startupError`
+    /// but non-fatal.
+    public var onDiskError: (@Sendable (String) -> Void)? {
+        get { shared.onDiskError }
+        set { shared.onDiskError = newValue }
+    }
+
     /// Mailbox-set (see `Mailbox.throttledSnapshot`'s doc comment): the
     /// setter posts `.setThrottled` for the emulation loop to apply between
     /// slices; the getter answers from a lock-protected cache, not a
@@ -224,6 +273,24 @@ public final class EmulationController {
     public func pause() { shared.mailbox.post(.pause) }
     public func reset() { shared.mailbox.post(.reset) }
     public func post(_ event: InputEvent) { shared.mailbox.post(.input(event)) }
+
+    /// Posts a mailbox command that loads `url` as a `DC42Image` ON THE
+    /// EMULATION THREAD and attaches it via `Machine.bus.floppy.insert(_:)`
+    /// -- mirrors `Task 5`'s `bootedWithDisk()` test helper, but reachable
+    /// from any thread through the mailbox rather than requiring direct
+    /// `Machine` access. A load failure (bad path, malformed/truncated
+    /// DC42 container -- see `DC42Image.Error`) is caught on the emulation
+    /// thread and reported via `onDiskError`, never thrown across the
+    /// mailbox boundary and never left to crash the emulation thread.
+    /// Asynchronous, like every other mailbox command: the insert is not
+    /// guaranteed complete by the time this call returns (see `debugSync`'s
+    /// doc comment for the test-only seam that CAN block for that).
+    public func insertFloppy(url: URL) { shared.mailbox.post(.insertFloppy(url)) }
+
+    /// Symmetric with `insertFloppy(url:)`: posts a mailbox command that
+    /// calls `Machine.bus.floppy.eject()` on the emulation thread. A no-op
+    /// (per `FloppyController.eject()`) if nothing is currently inserted.
+    public func ejectFloppy() { shared.mailbox.post(.ejectFloppy) }
 
     /// Returns the raw 1bpp framebuffer snapshot + dimensions via `Frame`
     /// (PNG-encoding stays app-side, per the plan's Task 1 interfaces).
@@ -326,6 +393,24 @@ public final class EmulationController {
         // whenever the machine is not halted (including a fresh `.reset`)
         // so the next halt gets its own forced publish.
         var haltedPublished = false
+        // `FloppyController.commandsProcessed` as of the last published
+        // `EmuStatus` -- diffed against the live value at each publish site
+        // to compute `EmuStatus.diskActivity` (see that property's doc
+        // comment). Reset to 0 alongside the floppy controller's own
+        // counter whenever `.reset` fires, so a warm reset doesn't report
+        // stale "activity" from before it.
+        var lastCommandsProcessed = 0
+        func currentStatus(halted: Bool) -> EmuStatus {
+            let commandsProcessed = machine.bus.floppy.commandsProcessed
+            let activity = commandsProcessed != lastCommandsProcessed
+            lastCommandsProcessed = commandsProcessed
+            return EmuStatus(cycles: machine.cycles,
+                              halted: halted,
+                              throttled: shared.mailbox.throttledSnapshot,
+                              emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond,
+                              diskInserted: machine.bus.floppy.isInserted,
+                              diskActivity: activity)
+        }
 
         while true {
             for command in shared.mailbox.drain() {
@@ -343,6 +428,7 @@ public final class EmulationController {
                     running = false
                     throttleAnchor = nil
                     haltedPublished = false
+                    lastCommandsProcessed = 0
                 case .setThrottled:
                     throttleAnchor = nil
                 case .input(let event):
@@ -354,6 +440,15 @@ public final class EmulationController {
                                       sequence: shared.framePublisher.currentSequence))
                 case .debug(let body):
                     body(machine)
+                case .insertFloppy(let url):
+                    do {
+                        let image = try DC42Image.load(url: url)
+                        machine.bus.floppy.insert(image)
+                    } catch {
+                        shared.onDiskError?("Could not load disk image at \(url.path): \(error)")
+                    }
+                case .ejectFloppy:
+                    machine.bus.floppy.eject()
                 case .shutdown:
                     shutdownGate.signal()
                     return
@@ -388,10 +483,7 @@ public final class EmulationController {
                                                              alreadyPublished: haltedPublished) {
                     haltedPublished = true
                     lastStatusPublish = ProcessInfo.processInfo.systemUptime
-                    shared.onStatus?(EmuStatus(cycles: machine.cycles,
-                                                halted: true,
-                                                throttled: shared.mailbox.throttledSnapshot,
-                                                emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond))
+                    shared.onStatus?(currentStatus(halted: true))
                 }
                 Thread.sleep(forTimeInterval: 0.005)
                 continue
@@ -420,10 +512,7 @@ public final class EmulationController {
             let now = ProcessInfo.processInfo.systemUptime
             if now - lastStatusPublish >= 0.25 {
                 lastStatusPublish = now
-                shared.onStatus?(EmuStatus(cycles: machine.cycles,
-                                            halted: machine.halted,
-                                            throttled: shared.mailbox.throttledSnapshot,
-                                            emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond))
+                shared.onStatus?(currentStatus(halted: machine.halted))
             }
         }
     }

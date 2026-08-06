@@ -223,6 +223,18 @@ public final class FloppyController {
     public private(set) var writeAttempts = 0
     public private(set) var lastError: UInt8 = 0
 
+    /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
+    /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
+    /// `clristat`/`enabstat`/`clrmask`/`goaway` as well as `excmd`'s
+    /// readdisk/writedisk/unsupported sub-commands). M2 Task 7's app-layer
+    /// `EmuStatus.diskActivity` is defined directly off this: "the floppy
+    /// processed a command since the last status publish" -- a simple
+    /// monotonic counter, diffed by the caller (`EmulationController`)
+    /// across its own polling interval, rather than this type tracking any
+    /// notion of "time since" itself (which would duplicate the polling
+    /// cadence that already lives one layer up).
+    public private(set) var commandsProcessed = 0
+
     // MARK: - Media
 
     /// True once a disk image is inserted; DISKIN (`$41`) and DISKFLG
@@ -265,6 +277,7 @@ public final class FloppyController {
         blocksRead = 0
         writeAttempts = 0
         lastError = 0
+        commandsProcessed = 0
         dropCompletionLine()
         if let image {
             window[Cell.diskIn] = 1
@@ -322,6 +335,7 @@ public final class FloppyController {
     private func clearDiskCmd() {
         window[Cell.diskCmd] = 0
         commandInFlight = false
+        commandsProcessed += 1
     }
 
     private func performExCmd() {

@@ -24,3 +24,11 @@ unsigned int lisa_cpu_stopped(void) { return CPU_STOPPED; }
 unsigned int lisa_cpu_supervisor(void) { return m68ki_cpu.s_flag; }
 
 void lisa_cpu_force_halt(void) { m68ki_cpu.stopped |= STOP_LEVEL_HALT; }
+
+void lisa_set_bus_error_fault(unsigned int address, unsigned int is_write,
+                               unsigned int is_supervisor)
+{
+    m68ki_aerr_address = address;
+    m68ki_aerr_write_mode = is_write ? MODE_WRITE : MODE_READ;
+    m68ki_aerr_fc = (is_supervisor ? SFLAG_SET : 0) | FUNCTION_CODE_USER_DATA;
+}

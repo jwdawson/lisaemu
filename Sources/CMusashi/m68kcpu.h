@@ -1978,8 +1978,23 @@ static inline void m68ki_exception_bus_error(void)
 
 	uint sr = m68ki_init_exception();
 
-	/* Note: This is implemented for 68010 only! */
-	m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR);
+	/* LisaEmu fix: upstream's m68ki_exception_bus_error() unconditionally
+	 * built the 68010 format-8 (29-word) frame via m68ki_stack_frame_1000,
+	 * which also hardcodes the FAULT ADDRESS field to 0 -- wrong for a real
+	 * 68000, which pushes the compact 7-word group-0 frame built by
+	 * m68ki_stack_frame_buserr() (m68kcpu.h:1681), consuming
+	 * m68ki_aerr_address/m68ki_aerr_write_mode/m68ki_aerr_fc -- the same
+	 * three globals m68ki_exception_address_error() below already consumes
+	 * via the same builder (see the M68K_EMULATE_ADDRESS_ERROR block
+	 * above). Musashi's own 68000 address-error path already calls
+	 * m68ki_stack_frame_buserr(); this patch makes the 68000 bus-error path
+	 * match it. Callers (Swift's M68K.pulseBusError(address:isWrite:), via
+	 * the lisa_set_bus_error_fault shim -- see shim.h/shim.c) must set
+	 * those three globals before calling m68k_pulse_bus_error(). See
+	 * Scripts/vendor-musashi.sh, which re-applies this patch after
+	 * re-vendoring from upstream.
+	 */
+	m68ki_stack_frame_buserr(sr);
 
 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
 

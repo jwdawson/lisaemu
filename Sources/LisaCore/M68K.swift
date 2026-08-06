@@ -134,14 +134,23 @@ public final class M68K {
     /// so `Bus.access` calls this on every real (non-peek) translation
     /// failure while `setupMode == false`.
     ///
-    /// `address`/`isWrite` are accepted to match the `Bus.busErrorHandler`
-    /// shape but are otherwise unused: Musashi's `m68k_pulse_bus_error()`
-    /// takes no arguments, and in this vendored version
-    /// `m68ki_exception_bus_error()` pushes the stack frame via
-    /// `m68ki_stack_frame_1000` (m68kcpu.h:1698), which hardcodes the FAULT
-    /// ADDRESS field to 0 rather than reading `m68ki_aerr_address` -- so
-    /// there is nothing useful to stash into Musashi state first. No
-    /// `m68k_set_reg` or other setup is required before the call.
+    /// `address`/`isWrite` are load-bearing: `m68ki_exception_bus_error()`
+    /// now pushes the real 68000 group-0 (7-word) frame via
+    /// `m68ki_stack_frame_buserr()` (m68kcpu.h:1681, patched in at
+    /// m68kcpu.h:1956's `m68ki_exception_bus_error` -- see the LisaEmu-fix
+    /// comment there and `Scripts/vendor-musashi.sh`'s third patch block),
+    /// which reads `m68ki_aerr_address`/`m68ki_aerr_write_mode`/
+    /// `m68ki_aerr_fc`. Those are private-header C globals, not exposed by
+    /// the public `m68k.h` Swift sees, so this method stashes them first via
+    /// the `lisa_set_bus_error_fault` shim (shim.h/shim.c) -- mirroring how
+    /// Musashi's own `m68ki_check_address_error` macro sets the same three
+    /// globals before every *address*-error group-0 exception. The function
+    /// code passed is a documented approximation (always DATA space, since
+    /// `M68K_EMULATE_FC` is off in our vendored config and `Bus` does not
+    /// distinguish instruction-fetch vs. data access at the fault site --
+    /// see the shim doc comment for why this matches Musashi's own FC-off
+    /// fallback); `isSupervisor` still selects the correct supervisor/user
+    /// FC bit.
     ///
     /// ## The longjmp mechanism (read m68kcpu.c/.h before touching this)
     ///
@@ -192,6 +201,7 @@ public final class M68K {
     /// pulses Musashi.
     public func pulseBusError(address: UInt32, isWrite: Bool) {
         guard insideCpuCallback else { return }
+        lisa_set_bus_error_fault(address, isWrite ? 1 : 0, isSupervisor ? 1 : 0)
         m68k_pulse_bus_error()
     }
 

@@ -54,15 +54,105 @@ import Foundation
 /// 8. On EITHER timeout, `ori #1,CCR` sets the carry flag (caller-visible
 ///    error return via `bcs`); success returns with carry clear.
 ///
-/// This model reduces that whole dance to: writing ORA (index 1 OR 15)
+/// ~~This model reduces that whole dance to: writing ORA (index 1 OR 15)
 /// drops CRDY immediately (steps 2-3 always see 0 with zero/near-zero
 /// iterations, matching the ROM's own observed near-instant loop-2 exit),
 /// and a `Machine`-scheduled event some `commandAckDelayCycles` later
 /// decodes the command and raises CRDY back to 1 (satisfying step 5) --
 /// "plausible cycle delay", not instant, per the task brief, and
 /// comfortably inside the ROM's ~1562-iteration (tens of thousands of
-/// cycles) timeout either way.
+/// cycles) timeout either way.~~ SUPERSEDED by M4 Task 1 below -- the
+/// "drops immediately" half of this was the M2-era shortcut that the OS's
+/// own COPS driver cannot survive (see "M4 Task 1" below). The delayed-rise
+/// half (ack after `commandAckDelayCycles`) is unchanged.
 ///
+/// ## M4 Task 1 -- the OS's own `COPSCMD` needs a non-instant drop, cited
+///
+/// The loaded OS (`$520824`, LIBHW-DRIVERS:829-887 `COPSCMD`, byte-identical
+/// between the compiled 3.1 image and the source per a live disassembly at
+/// the frontier -- both sites match instruction-for-instruction) drives the
+/// SAME protocol as the ROM but adds an outer retry shell around it:
+///
+/// 1. **Phase A** (`$520842`-`$52084E`, source `@0`/`@1`): write D0 to IORA2
+///    (register 15, offset `$1E`, IDENTICAL to the ROM's step 1) while
+///    briefly re-enabling interrupts around each attempt; test CRDY
+///    (PORTB2 bit 6); if it reads 0, loop back and REWRITE the command byte,
+///    retrying. Falls through once a test reads CRDY==1 ("ready").
+/// 2. **Phase B** (`$520850`-`$520892`, source's 14 unrolled `BTST`/`BEQ`
+///    pairs): test CRDY again, up to 14 times back-to-back, waiting for it
+///    to drop to 0. If none of the 14 checks see 0, falls back to Phase A
+///    (rewrites the command byte again). Otherwise falls through to Phase C.
+/// 3. **Phase C** (`$520894`-`$5208A2`, source `@2`): DDRA2 = `$FF`, a fixed
+///    ~10-iteration delay, DDRA2 = `$00` -- NO further CRDY poll (unlike the
+///    ROM's step 5 ack-wait; `COPSCMD` just returns).
+///
+/// Critically, Phase A and Phase B BOTH run, and CRDY is expected to have
+/// ALREADY dropped, BEFORE Phase C's DDRA2 flip ever executes -- the same
+/// ordering the ROM's own routine uses (steps 2-3 before step 4). So for
+/// BOTH senders, cited: **the reg-15 write is the drop's trigger, not the
+/// DDRA2 flip** (an earlier hypothesis in hardware-notes.md/the M4 plan
+/// guessed the flip gates it -- refuted by this disassembly evidence, struck
+/// there per the both-docs rule). DDRA2 is not modeled by `COPS` at all: our
+/// HLE has no bit-level Port A bus simulation, so a data-direction change has
+/// no separately observable effect here.
+///
+/// The OLD instant-drop model breaks Phase A specifically: `handleCommandWrite`
+/// set `crdyHigh = false` synchronously, so the `MOVE.B`-then-`BTST` pair at
+/// `$520848`/`$52084C` (write immediately followed by test, zero intervening
+/// instructions) ALWAYS observed the just-self-inflicted drop and ALWAYS
+/// looped back to `$520842` -- forever (the M3 Task 4 frontier hang). Phase A
+/// can only ever succeed if a write-then-immediate-test pair sees the OLD
+/// (still-ready) state, which requires the drop to lag the write by more than
+/// one instruction's worth of cycles -- but Phase B's very next 14 checks (a
+/// few instructions later) must THEN see it dropped, or it loops back to
+/// Phase A and repeats forever with the identical problem (whatever the delay
+/// is, it must fit inside that ~14-check window measured from the write).
+///
+/// **The fix is a READ-COUNT gate, not a cycle-count delay**
+/// (`suppressCRDYDropForNextRead`): the write still drops `crdyHigh`
+/// synchronously (same instant as the pre-M4 model), but the VERY NEXT
+/// `portBInput` read after that specific drop is suppressed -- it reports
+/// the pre-drop (ready) state once, and every read after THAT reflects the
+/// real dropped state. Concretely: Phase A's own write-then-test pair IS
+/// that suppressed read (sees ready, exits Phase A on the first try, the
+/// common case); Phase B's very first check is the NEXT read after that
+/// (suppression already consumed), so it deterministically sees not-ready
+/// immediately. The ROM's loop 1 similarly takes its first check as the
+/// suppressed (still-ready) read and its second check as the real drop --
+/// two iterations, not one, but still comfortably inside its 1562-iteration
+/// timeout -- and loop 2 (which starts several reads further along) sees the
+/// already-dropped state on its own first check, exactly matching this type
+/// doc comment's pre-M4 "near-instant loop-2 exit" note above.
+///
+/// An earlier version of this fix used a short `scheduleEvent`-based cycle
+/// delay (`commandLatchDelayCycles`, ~64 cycles) instead of this read-count
+/// gate, and it broke under `Machine.run(until:)`'s BURST execution
+/// (confirmed by `ROMFloppyBootTests` regressing -- see task-1-report.md):
+/// `Bus`'s injected `scheduleEvent` closure computes a scheduled event's due
+/// cycle from `Machine.cycles`, which is only updated once an ENTIRE
+/// `cpu.run(cycles:)` burst finishes -- so a callback firing mid-burst (a
+/// VIA2 port-A write, synchronously invoked from inside Musashi's
+/// `m68k_execute`) sees a STALE "now", off by up to `Machine.irqPollQuantum`
+/// (1024) cycles. A 64-cycle delay scheduled against that stale baseline can
+/// already be overdue by the time `Machine.run(until:)` next drains its
+/// event queue, collapsing back to an effectively-synchronous drop --
+/// reproducing the exact bug this task exists to fix, but only under burst
+/// execution (single-`step()`-driven runs, whose "now" is far less stale,
+/// happened to still work, which is why this needed a live-boot
+/// re-validation to catch, not just the protocol-level unit tests). The
+/// read-count gate needs no cycle scheduling for the drop's visibility at
+/// all, so it is exact and execution-granularity-independent by
+/// construction. The rise still uses `scheduleEvent(commandAckDelayCycles)`
+/// as before -- its ~400-cycle target has thousands of cycles of slack
+/// against both senders' ~1562-iteration timeouts, so the same staleness is
+/// harmless there, exactly as it always was pre-M4 (when only the rise was
+/// scheduled at all). DDRA2 is not modeled by `COPS`: our HLE has no
+/// bit-level Port A bus simulation, so a data-direction change alone has no
+/// separately observable effect here. Reg-15 peeks (reads) never call
+/// `handleCommandWrite` at all (see `handlePortAAccess` below) -- no model,
+/// old, cycle-delay, or read-count, lets a peek perturb CRDY.
+///
+
 /// ## Command bytes (docs/hardware-notes.md §4 "Command Bytes")
 ///
 /// The ROM's own POST presence probe (`$FE093E-$FE0954`) sends `$00`,
@@ -116,8 +206,11 @@ public final class COPS {
     // doc comment). All comfortably inside the ROM's ~1562-iteration CRDY
     // poll timeouts (tens of thousands of cycles per loop).
 
-    /// Cycles from a command-byte write (ORA) until CRDY returns to 1 and
-    /// the command's decoded side effect (if any) takes place.
+    /// Cycles from a command-byte write (ORA, register 1 or 15) -- or more
+    /// precisely, from the drop becoming VISIBLE (`handleCommandWrite`'s doc
+    /// comment: the drop itself is a read-count gate, not cycle-scheduled)
+    /// -- until CRDY returns to 1 and the command's decoded side effect (if
+    /// any) takes place.
     static let commandAckDelayCycles: UInt64 = 400
     /// Cycles from a queued byte becoming eligible for delivery (FIFO was
     /// idle, or the previous byte was just consumed) until it actually
@@ -206,6 +299,13 @@ public final class COPS {
     // MARK: - CRDY / output (command) state
 
     private var crdyHigh = true
+    /// M4 Task 1: set for exactly one PORTB2 read after a write that just
+    /// transitioned `crdyHigh` true->false -- that ONE read (the sender's
+    /// own write-then-immediately-test instruction pair) still sees the
+    /// pre-drop (ready) state; every read after it sees the real dropped
+    /// state. See `handleCommandWrite`'s doc comment for why this is a
+    /// read-count gate, not a cycle-count delay.
+    private var suppressCRDYDropForNextRead = false
 
     // MARK: - Port A / input FIFO state
 
@@ -266,9 +366,17 @@ public final class COPS {
         guard let self else { return 0xFF }
         return self.byteReady ? self.pendingByte : 0xFF
     }
-    /// Assign directly to `via2.portBInput`.
+    /// Assign directly to `via2.portBInput`. M4 Task 1: the ONE read right
+    /// after a fresh drop-triggering write is suppressed (see
+    /// `suppressCRDYDropForNextRead`'s doc comment) -- every other read
+    /// reflects `crdyHigh` normally.
     public lazy var portBInput: () -> UInt8 = { [weak self] in
-        guard let self, !self.crdyHigh else { return 0xFF }
+        guard let self else { return 0xFF }
+        if self.suppressCRDYDropForNextRead {
+            self.suppressCRDYDropForNextRead = false
+            return 0xFF
+        }
+        guard !self.crdyHigh else { return 0xFF }
         return 0xFF & ~Self.crdyBit
     }
 
@@ -291,6 +399,7 @@ public final class COPS {
     /// reset alongside everything else at power-on/reset.
     public func reset() {
         crdyHigh = true
+        suppressCRDYDropForNextRead = false
         inputQueue.removeAll()
         byteReady = false
         pendingByte = 0xFF
@@ -319,8 +428,36 @@ public final class COPS {
 
     // MARK: - Output (command) path
 
+    /// M4 Task 1 (type doc comment "M4 Task 1"): the drop from a fresh write
+    /// is real and synchronous (`crdyHigh = false` happens immediately, same
+    /// as the pre-M4 model) -- but the VERY NEXT `portBInput` read after
+    /// THAT SPECIFIC write is suppressed, showing the pre-drop (ready) state
+    /// once, before reads start reflecting the real dropped state. This is a
+    /// READ-COUNT gate, not a cycle-count delay, DELIBERATELY: an earlier
+    /// version of this fix used a short `scheduleEvent` delay
+    /// (`commandLatchDelayCycles`) instead, and it broke under
+    /// `Machine.run(until:)`'s burst execution -- `Bus`'s `scheduleEvent`
+    /// closure computes a scheduled event's due cycle from `Machine.cycles`,
+    /// which is only updated AFTER a whole CPU burst completes (up to
+    /// `Machine.irqPollQuantum`, 1024 cycles, stale relative to the instant
+    /// a mid-burst VIA2 write callback actually fires) -- so a 64-cycle
+    /// delay scheduled mid-burst could already be overdue by the time
+    /// `Machine.run(until:)` next drains its event queue, collapsing back to
+    /// the same "drops the instant the write happens" bug this task exists
+    /// to fix (confirmed via `ROMFloppyBootTests` regressing under this
+    /// exact mechanism -- see task-1-report.md). The read-count gate needs
+    /// no cycle scheduling at all for the drop itself, so it is immune to
+    /// that staleness: it is exact under `step()`, `run(until:)`, and any
+    /// other execution granularity. The rise (`commandAckDelayCycles` later)
+    /// keeps using `scheduleEvent` as before -- its ~400-cycle target has
+    /// thousands of cycles of slack against both senders' ~1562-iteration
+    /// timeouts, so the same staleness is harmless there (as it always was
+    /// pre-M4, when only the rise was scheduled).
     private func handleCommandWrite(_ command: UInt8) {
-        crdyHigh = false
+        if crdyHigh {
+            crdyHigh = false
+            suppressCRDYDropForNextRead = true
+        }
         scheduleEvent(Self.commandAckDelayCycles) { [weak self] in
             self?.processCommand(command)
             self?.crdyHigh = true

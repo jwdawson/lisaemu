@@ -632,8 +632,17 @@ read (`$FE0B24`/`$FE0B2C`/`$FE119A`). The gating branch `tst.b $fcc031;
 bpl $fe0b3c` takes the **pre-Pepsi path** on `0x00` (bit7 clear) — it skips a
 Pepsi-only contrast/DAC adjustment and otherwise proceeds normally. `0x00` does
 **not** divert POST into any error, and the alternate `$80` path is equally
-benign. **The `0x00` default is correct and needs no change** (it selects the
-simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).
+benign. ~~**The `0x00` default is correct and needs no change** (it selects the
+simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).~~
+**(M4 Task 4 round 4 correction — same supersession as the twin claim
+above at "`$C031` board ID — read, and `0x00` does NOT divert POST":
+`0x00` is indeed benign for the ROM — both branches here are sane — but
+the OS decodes `$C031` as the MACHINE IDENTITY (STARTUP:1876-1890), and
+`0x00` made it configure a Twiggy Lisa 1 with a compiled-out floppy
+driver — the Checkpoint-F stall's root cause. `$C031` now returns `$88`
+(Lisa 2/10); the ROM re-takes the bit7-set Pepsi contrast branch, which
+is framebuffer-neutral — every ROM anchor re-verified green. See
+"Checkpoint G (round 4)".)**
 
 ## Bus-error frame spike + board-ID/memory-sizing validation (M1b Task 6)
 
@@ -1769,10 +1778,15 @@ answers:
 
 - **VIA1 T1 = the millisecond tick.** `DriverInit` picks the T1 reload from the
   board ID (LIBHW-DRIVERS:578-588): pre-Pepsi `$27CA`, post-Pepsi `$637B`.
-  `DiskROMId` bit 7 selects; our board reports pre-Pepsi (`$C031==0`, OQ3), so
+  `DiskROMId` bit 7 selects; ~~our board reports pre-Pepsi (`$C031==0`, OQ3), so
   the OS writes **`LCounterInit=$CA` / `HCounterInit=$27`** (the pre-Pepsi
-  values) — confirmed live. It sets `ACR1=$48`, enables T1 via `IER1=$C0`, and
-  installs `Level1` at vector `$0064`.
+  values) — confirmed live.~~ **Superseded (M4 round 4, 2026-08-07):** round
+  4's `DiskROMId` fix (commit 90d7cdf) set `$C031=$88` (bit7 set), so
+  `DriverInit` now selects the **post-Pepsi `$637B`** reload per
+  LIBHW-DRIVERS:578-588 — this was true of the pre-round-4 machine and
+  remains accurate history for Checkpoint E AS RUN THEN, but is not the
+  live board state after round 4. It sets `ACR1=$48`, enables T1 via
+  `IER1=$C0`, and installs `Level1` at vector `$0064`.
 - **Level-2 COPS.** `DDRA2=$00` (port A input), `PCR2=$C9`, `ACR2=$01`,
   `IER2=$82` (enable COPS), then `COPSCMD` sends **`$7C`** ("enable mouse
   interrupts", the very command M4 Task 1's handshake fix let complete), and
@@ -1891,8 +1905,12 @@ frontier.
 `minSR < $2700` (the unmasking, in fact to `$0000`), the `Level1` (`$5208A6`)
 AND `Level2` (`$520A52`) handlers both entered (first live level-1 + level-2
 delivery), user mode reached, the `$4C0270` event-wait loop reached, `!halted`,
-`busErrorPulseCount==0`, `writeAttempts==0`, `blocksRead==323`. Robust
+`busErrorPulseCount==0`, `writeAttempts==0`, ~~`blocksRead==323`~~. Robust
 invariants alongside the exact deterministic handler/loop anchors.
+**Superseded (M4 round 4, 2026-08-07):** the committed test now asserts
+`blocksRead==344` — re-anchored in round 4 (the +21 SYSTEM.CDD/CD loader
+reads that the real Sony driver fix causes before the unmasking); see
+"Checkpoint G (round 4)"'s "Checkpoint E re-anchor" note.
 
 
 ## Checkpoint F (M4 Task 4) — the init-time driver I/O-completion poll (CORRECTED)

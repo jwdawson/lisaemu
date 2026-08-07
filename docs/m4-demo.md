@@ -63,8 +63,9 @@ at `$520842`):
   CD driver, and the installer's own resources.
 - **First live interrupts delivered** to the OS's own `Level1`/`Level2`
   handlers; the scheduler runs across eleven-plus loaded code segments.
-- **User mode reached** (SR drops to `$0000`/domain-1 user processes); A5
-  changes as `SYS_PROC_INIT` creates the first processes.
+- **User mode reached** (SR drops to `$0000`/domain-1 user processes;
+  observed in trace — the committed tests pin `minSR < $2700` and the
+  S-bit); A5 changes as `SYS_PROC_INIT` creates the first processes.
 - **Floppy writes kept**: within the pinned window `writeAttempts == blocksWritten`
   (28/28 stored, none dropped).
 - **Recoverable gate faults** fire and recover by design (`busErrorPulseCount > 0`)
@@ -143,7 +144,10 @@ loader, runs 10 M instructions, and asserts the whole result: no halt;
 domain latch 1; gates fire and recover; floppy writes stored (nothing dropped);
 `blocksRead >= 600`; and the framebuffer equals the installer-dialog anchor
 (FNV `0x04a19e4eb59704f4`, 60,107 set pixels). `checkpointE` pins the unmasking
-+ first live interrupts; `checkpointF` pins the pre-fix I/O-completion boundary.
++ first live interrupts. `checkpointF` was a transitional anchor for the
+pre-fix I/O-completion stall state; it was superseded and removed once the
+round-4 fix landed, so `checkpointG` above is the standing pin for the
+post-fix boundary.
 
 ## Screenshots
 

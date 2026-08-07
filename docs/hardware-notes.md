@@ -1333,9 +1333,13 @@ zone/track/sector/side:
 - **Task 4 update:** `$C015` now returns `1` (was `0xFF` unknown-I/O), per
   the line above. The `$C000-$C7FF` window (`FloppyController`, this
   section's shared-RAM cells) is now live RAM served by that device;
-  `$C031` is UNCHANGED (still the Task-3-era `0` stub, checked before the
-  window range in `IODispatcher.currentValue` so it isn't shadowed by it).
-  Re-ran the full ROM-gated boot suite (`ROMBootTests`,
+  ~~`$C031` is UNCHANGED (still the Task-3-era `0` stub, checked before the
+  window range in `IODispatcher.currentValue` so it isn't shadowed by it).~~
+  **Superseded (M4 round 4, 2026-08-07):** per the round-4 bullet above
+  (`$C031` now returns `$88`, Pepsi-class/Lisa 2/10 identity, commit
+  90d7cdf), `$C031` is no longer the Task-3-era `0` stub as of round 4 —
+  this statement described the Task-4-era machine only. Re-ran the full
+  ROM-gated boot suite (`ROMBootTests`,
   `LISAEMU_ROM_DIR=... swift test`) after this change: the exact boot-menu
   anchor (`romCompletesPOSTAndReachesBootMenu`'s FNV hash
   `0xd09234d25516d0b8` / 78,100 set pixels) is UNCHANGED, because the

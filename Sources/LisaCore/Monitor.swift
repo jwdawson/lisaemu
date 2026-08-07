@@ -66,6 +66,18 @@ public struct Monitor {
         }
     }
 
+    /// The `r`/`s`/`t`/`g`/`bootdisk` status dump. `PC=` is routed through
+    /// `annotatedAddress` (M4 Task 2) -- unlike the other registers, PC is
+    /// an executable address a Linkmap symbol can actually resolve, so it
+    /// gets the same `[UNIT.PROC+0xNN]` annotation `d`/`t` show, when
+    /// `symbols` is loaded and it resolves. Note the differing digit
+    /// counts: `annotatedAddress` formats 6 hex digits (`%06X`, matching
+    /// `d`'s address column and the CPU's 24-bit address bus), while this
+    /// dump's other registers stay 8-digit `%08X` (full 32-bit D/A
+    /// register values) -- PC's field width changes here from its
+    /// pre-Task-2 8 digits to 6, which is correct (a PC value never
+    /// occupies the top byte) but is a visible format change downstream
+    /// consumers should note.
     public func registerDump() -> String {
         let c = machine.cpu
         func h(_ v: UInt32) -> String {
@@ -77,13 +89,14 @@ public struct Monitor {
         D4=\(h(c[.d4])) D5=\(h(c[.d5])) D6=\(h(c[.d6])) D7=\(h(c[.d7]))
         A0=\(h(c[.a0])) A1=\(h(c[.a1])) A2=\(h(c[.a2])) A3=\(h(c[.a3]))
         A4=\(h(c[.a4])) A5=\(h(c[.a5])) A6=\(h(c[.a6])) A7=\(h(c[.a7]))
-        PC=\(h(c[.pc])) SR=\(String(format: "%04X", Int(sr))) cycles=\(machine.cycles)
+        PC=\(annotatedAddress(c[.pc])) SR=\(String(format: "%04X", Int(sr))) cycles=\(machine.cycles)
         """
     }
 
     /// Formats `addr`'s hex + (when `symbols` is loaded and resolves it) a
     /// `[UNIT.PROC+0xNN]`-style annotation -- the shared "d"/"t"/status
-    /// address presentation (M4 Task 2).
+    /// address presentation (`registerDump`'s `PC=` field, `disassembly`'s
+    /// address column) (M4 Task 2).
     public func annotatedAddress(_ addr: UInt32) -> String {
         let addrStr = String(format: "%06X", Int(addr))
         guard let sym = symbols?.lookup(addr) else { return addrStr }

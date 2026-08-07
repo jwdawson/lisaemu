@@ -74,6 +74,27 @@ extension MusashiSuites {
             #expect(dump.contains("PC="))
         }
 
+        /// M4 Task 2 review fix: `registerDump`'s `PC=` field must carry the
+        /// same `[UNIT.PROC+0xNN]` annotation `disassembly` does when
+        /// symbols are loaded -- it wasn't wired up initially, so `r`/`s`/
+        /// `t`/`g`/`bootdisk`'s status output (all built on `registerDump`)
+        /// silently showed raw hex even with a Linkmap loaded.
+        @Test func registerDumpAnnotatesPCWithLoadedSymbols() {
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000); m.bus.write32(0x4, 0x400)
+            m.bus.load([0x70, 0x2A, 0x60, 0xFE], at: 0x400)   // MOVEQ #42,D0; spin (BRA.S $402)
+            m.reset()
+            m.run(until: 20)
+            #expect(m.cpu[.pc] == 0x402, "the spin loop parks at its own BRA.S target")
+
+            var monitor = Monitor(machine: m)
+            #expect(!monitor.registerDump().contains("["),
+                    "no symbols loaded -- PC shows plain hex, no annotation (unchanged from pre-fix)")
+
+            monitor.symbols = LinkmapSymbols(symbols: [.init(unit: "fakeUnit", proc: "SPIN", address: 0x402)])
+            #expect(monitor.registerDump().contains("PC=000402 [fakeUnit.SPIN]"))
+        }
+
         @Test func disassemblyWalksInstructionLengths() {
             let m = Machine(ramSize: 0x10000)
             m.bus.write32(0x0, 0x3000); m.bus.write32(0x4, 0x400)

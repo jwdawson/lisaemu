@@ -163,14 +163,18 @@ private func makeSymbols(_ entries: [(unit: String, proc: String, address: UInt3
 }
 
 // MARK: - Real Linkmaps 3.0 smoke (env-gated; never asserts on bundled data)
+//
+// Requires `LISAEMU_LINKMAP_DIR` explicitly, matching every other real-data
+// suite's convention (`ROMImageTests`' `RealLisaROMTests`,
+// `ROMFloppyBootTests`) -- the default-path fallback
+// (`LinkmapSymbols.defaultDirectory`) is a `lisadbg` runtime convenience
+// only, not a test gate: a test suite silently picking up whatever happens
+// to be checked out at a hardcoded path (rather than an explicit opt-in)
+// is exactly the surprise-at-CI-time failure mode env-gating exists to
+// avoid.
+private let realLinkmapDir = ProcessInfo.processInfo.environment["LISAEMU_LINKMAP_DIR"]
 
-private let realLinkmapDir: String? = {
-    if let env = ProcessInfo.processInfo.environment["LISAEMU_LINKMAP_DIR"] { return env }
-    let path = LinkmapSymbols.defaultDirectory.path
-    return FileManager.default.fileExists(atPath: path) ? path : nil
-}()
-
-@Suite(.enabled(if: realLinkmapDir != nil, "Set LISAEMU_LINKMAP_DIR (or check out Lisa_Source at the default path) to run real-linkmap tests"))
+@Suite(.enabled(if: realLinkmapDir != nil, "Set LISAEMU_LINKMAP_DIR to run real-linkmap tests"))
 struct RealLinkmapSmokeTests {
     /// `linkmap-btn.TEXT.unix.txt:120` (part 3): `BTNREAD  - BTNREAD  @
     /// : 020000` -- the blank-unit (main-program) entry point of the

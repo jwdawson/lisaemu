@@ -184,7 +184,10 @@ patched = (
     "\n"
     "\tm68ki_jump_vector(EXCEPTION_BUS_ERROR);\n"
 )
-if "m68ki_stack_frame_buserr(sr);\n\n\tm68ki_jump_vector(EXCEPTION_BUS_ERROR);" in text and "m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR)" not in text:
+if "m68ki_stack_frame_1000(REG_PPC, sr, EXCEPTION_BUS_ERROR)" not in text:
+    # Either this stage's plain m68ki_stack_frame_buserr(sr) form or the
+    # round-4 stage's frame_pc/frame_addr form (applied further below) --
+    # both mean the 68010 frame call is already gone.
     print("vendor-musashi: m68ki_exception_bus_error already patched to use m68ki_stack_frame_buserr")
 elif anchor in text:
     assert text.count(anchor) == 1, "anchor is not unique, refusing to guess which occurrence to patch"
@@ -197,6 +200,165 @@ else:
         "  hand -- see the comment above it (and M68K.swift's pulseBusError doc comment) for what upstream is\n"
         "  missing and why it matters (a real 68000 group-0 frame vs. upstream's fabricated 68010 one).\n"
     )
+PYEOF
+
+# LisaEmu fix (M4 Task 4 round 4): real-68000 jump-gate bus-error frame
+# semantics. The Lisa OS's recoverable-bus-error engine (SOURCE-EXCEPASM
+# BUS_ERR) decodes the group-0 frame's instruction register and re-runs
+# faulting JSR/JMP/RTS/RTE gates with instruction-specific frame-PC
+# adjustments (JSR.L -> PC-6, JSR d16(An) -> PC-4, JSR (An)/JMP/RTS -> PC-2),
+# expecting a faulting JSR's return address to be UN-pushed and a faulting
+# RTS's pop to be committed -- real 68000 microcode order (target prefetch
+# inside the jump instruction). Stock Musashi completes the jump and faults
+# at the next loop-top opcode fetch, which made the OS's gate re-runs push a
+# second return address into syscall parameter frames (fatal OS error 10201
+# observed live -- docs/rom-trace-notes.md "Checkpoint G (round 4)").
+# This stage: (a) instruments the execute loop to flag the opcode fetch and
+# record each instruction's start, (b) parameterizes the group-0 frame
+# builder on PC + access address (address-error path keeps legacy REG_PC /
+# m68ki_aerr_address for TomHarte conformance), (c) rewrites the bus-error
+# exception to push real-68000 jump-fault frames and undo a JSR's committed
+# push. Pinned by Tests/LisaCoreTests/BusErrorFrameTests.swift.
+python3 - "$DEST/m68kcpu.c" "$CPU_H" <<'PYEOF'
+import sys
+cpath, hpath = sys.argv[1], sys.argv[2]
+
+# --- m68kcpu.c: globals ---
+c = open(cpath).read()
+if 'm68ki_opcode_fetch_active' in c:
+    print("vendor-musashi: m68kcpu.c round-4 globals already present")
+else:
+    anchor = "uint    m68ki_aerr_fc;\n\njmp_buf m68ki_bus_error_jmp_buf;"
+    assert c.count(anchor) == 1, "m68kcpu.c globals anchor not unique/found"
+    c = c.replace(anchor, """uint    m68ki_aerr_fc;
+
+/* LisaEmu (M4 Task 4 round 4): set around the execute loop's opcode fetch
+ * so m68ki_exception_bus_error() (m68kcpu.h) can distinguish a
+ * next-instruction (jump-target) prefetch fault from a mid-instruction data
+ * fault, and recover the address of the jump instruction that caused it.
+ * The Lisa OS's recoverable-bus-error engine (its BUS_ERR handler) decodes
+ * the group-0 frame's IR + PC to re-run faulting JSR/JMP/RTS/RTE gates;
+ * see m68ki_exception_bus_error()'s LisaEmu comment for the full contract.
+ * Re-applied after re-vendoring by Scripts/vendor-musashi.sh. */
+uint    m68ki_opcode_fetch_active;
+uint    m68ki_ppc_prev;
+
+jmp_buf m68ki_bus_error_jmp_buf;""")
+    # --- m68kcpu.c: execute-loop instrumentation ---
+    anchor = ("\t\t\t/* Read an instruction and call its handler */\n"
+              "\t\t\tREG_IR = m68ki_read_imm_16();\n"
+              "\t\t\tm68ki_instruction_jump_table[REG_IR]();\n"
+              "\t\t\tUSE_CYCLES(CYC_INSTRUCTION[REG_IR]);")
+    assert c.count(anchor) == 1, "m68kcpu.c execute-loop anchor not unique/found"
+    c = c.replace(anchor, ("\t\t\t/* Read an instruction and call its handler */\n"
+              "\t\t\t/* LisaEmu (M4 Task 4 round 4): flag the opcode fetch so a bus\n"
+              "\t\t\t * error raised here is classified as a jump-target prefetch\n"
+              "\t\t\t * fault (real 68000: the fault happens DURING the jump\n"
+              "\t\t\t * instruction); record each instruction's start address so\n"
+              "\t\t\t * the exception builder can re-point the frame PC at it. */\n"
+              "\t\t\tm68ki_opcode_fetch_active = 1;\n"
+              "\t\t\tREG_IR = m68ki_read_imm_16();\n"
+              "\t\t\tm68ki_opcode_fetch_active = 0;\n"
+              "\t\t\tm68ki_instruction_jump_table[REG_IR]();\n"
+              "\t\t\tUSE_CYCLES(CYC_INSTRUCTION[REG_IR]);\n"
+              "\t\t\tm68ki_ppc_prev = REG_PPC;"))
+    open(cpath, 'w').write(c)
+    print("vendor-musashi: patched m68kcpu.c (round-4 globals + execute-loop instrumentation)")
+
+# --- m68kcpu.h ---
+h = open(hpath).read()
+if 'm68ki_stack_frame_buserr(uint sr, uint pc, uint address)' in h:
+    print("vendor-musashi: m68kcpu.h round-4 frame semantics already present")
+    sys.exit(0)
+
+anchor = ("extern uint           m68ki_aerr_address;\n"
+          "extern uint           m68ki_aerr_write_mode;\n"
+          "extern uint           m68ki_aerr_fc;")
+assert h.count(anchor) == 1, "m68kcpu.h extern anchor not unique/found"
+h = h.replace(anchor, anchor + "\n/* LisaEmu (M4 Task 4 round 4) -- see m68kcpu.c and\n * m68ki_exception_bus_error() below. */\nextern uint           m68ki_opcode_fetch_active;\nextern uint           m68ki_ppc_prev;")
+
+anchor = ("static inline void m68ki_stack_frame_buserr(uint sr)\n"
+          "{\n"
+          "\tm68ki_push_32(REG_PC);\n"
+          "\tm68ki_push_16(sr);\n"
+          "\tm68ki_push_16(REG_IR);\n"
+          "\tm68ki_push_32(m68ki_aerr_address);\t/* access address */")
+assert h.count(anchor) == 1, "m68kcpu.h frame-builder anchor not unique/found"
+h = h.replace(anchor, ("/* LisaEmu (M4 Task 4 round 4): parameterized on the pushed PC and access\n"
+          " * address so the 68000 bus-error path can push real-68000 jump-fault\n"
+          " * values while the address-error path keeps its historical REG_PC /\n"
+          " * m68ki_aerr_address behavior (TomHarte conformance). */\n"
+          "static inline void m68ki_stack_frame_buserr(uint sr, uint pc, uint address)\n"
+          "{\n"
+          "\tm68ki_push_32(pc);\n"
+          "\tm68ki_push_16(sr);\n"
+          "\tm68ki_push_16(REG_IR);\n"
+          "\tm68ki_push_32(address);\t/* access address */"))
+
+anchor = "\tm68ki_stack_frame_buserr(sr);\n\n\tm68ki_jump_vector(EXCEPTION_ADDRESS_ERROR);"
+assert h.count(anchor) == 1, "m68kcpu.h address-error call-site anchor not unique/found"
+h = h.replace(anchor, "\tm68ki_stack_frame_buserr(sr, REG_PC, m68ki_aerr_address);\n\n\tm68ki_jump_vector(EXCEPTION_ADDRESS_ERROR);")
+
+anchor = "\tm68ki_stack_frame_buserr(sr);\n\n\tm68ki_jump_vector(EXCEPTION_BUS_ERROR);"
+assert h.count(anchor) == 1, "m68kcpu.h bus-error call-site anchor not unique/found (run the group-0 frame patch first)"
+h = h.replace(anchor, """\t/* LisaEmu fix (M4 Task 4 round 4): real-68000 jump-gate frame
+\t * semantics. The Lisa OS's recoverable-bus-error engine
+\t * (SOURCE-EXCEPASM BUS_ERR) decodes the group-0 frame's instruction
+\t * register and applies instruction-specific PC adjustments to RE-RUN a
+\t * faulting jump after its target code segment is swapped in:
+\t * JSR.L -> PC-6, JSR d16(An) -> PC-4, JSR (An)/JMP/RTS/RTE -> PC-2,
+\t * and for RTS it additionally un-pops the return address. Those
+\t * constants encode real 68000 microcode order: the TARGET PREFETCH
+\t * happens inside the jump instruction, BEFORE a JSR pushes its return
+\t * (so a re-run pushes it exactly once) and AFTER an RTS pops it.
+\t * Musashi instead completes the jump and faults at the next loop-top
+\t * opcode fetch with PC = target+2 -- which made the OS's re-run push a
+\t * SECOND return address into a syscall parameter frame (observed live;
+\t * docs/rom-trace-notes.md "Checkpoint G (round 4)"). When the fault is
+\t * that loop-top fetch (m68ki_opcode_fetch_active) and the previous
+\t * instruction (still in REG_IR -- the aborted fetch never overwrote
+\t * it) is one of the OS-recoverable jump forms, push the frame the real
+\t * 68000 way: PC = jump address + the OS's expected offset, access
+\t * address = the full unmasked target (REG_PC-2, preserving the OS's
+\t * $A0xxxxxx gate tag bits, which the 24-bit bus mask strips before the
+\t * Swift Bus ever sees them), and undo a JSR's already-committed push.
+\t * Mid-instruction data faults push PC = instruction start + 2 (the
+\t * convention the OS's TST stack-probe case decodes with PC-2). */
+\t{
+\t\tuint frame_pc = REG_PC;
+\t\tuint frame_addr = m68ki_aerr_address;
+\t\tif(m68ki_opcode_fetch_active)
+\t\t{
+\t\t\tuint op = REG_IR;
+\t\t\tuint adj = 0, undo_push = 0, matched = 0;
+\t\t\tif(op == 0x4eb9)                 { adj = 6; undo_push = 1; matched = 1; } /* JSR (xxx).L */
+\t\t\telse if((op & 0xfff8) == 0x4ea8) { adj = 4; undo_push = 1; matched = 1; } /* JSR d16(An) */
+\t\t\telse if((op & 0xfff8) == 0x4e90) { adj = 2; undo_push = 1; matched = 1; } /* JSR (An)    */
+\t\t\telse if(op == 0x4ef9 || (op & 0xfff8) == 0x4ed0 ||
+\t\t\t        op == 0x4e75 || op == 0x4e73)
+\t\t\t                                 { adj = 2; matched = 1; }               /* JMP.L / JMP (An) / RTS / RTE */
+\t\t\tif(matched)
+\t\t\t{
+\t\t\t\tframe_pc = m68ki_ppc_prev + adj;
+\t\t\t\tframe_addr = REG_PC - 2;
+\t\t\t\tif(undo_push)
+\t\t\t\t{
+\t\t\t\t\tif(sr & 0x2000) REG_SP += 4;
+\t\t\t\t\telse            REG_USP += 4;
+\t\t\t\t}
+\t\t\t}
+\t\t\tm68ki_opcode_fetch_active = 0;
+\t\t}
+\t\telse
+\t\t{
+\t\t\tframe_pc = REG_PPC + 2;
+\t\t}
+\t\tm68ki_stack_frame_buserr(sr, frame_pc, frame_addr);
+\t}
+
+\tm68ki_jump_vector(EXCEPTION_BUS_ERROR);""")
+open(hpath, 'w').write(h)
+print("vendor-musashi: patched m68kcpu.h (round-4 jump-gate bus-error frame semantics)")
 PYEOF
 
 require "$TMP/musashi/m68kops.h"

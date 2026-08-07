@@ -92,6 +92,17 @@ uint    m68ki_aerr_address;
 uint    m68ki_aerr_write_mode;
 uint    m68ki_aerr_fc;
 
+/* LisaEmu (M4 Task 4 round 4): set around the execute loop's opcode fetch
+ * so m68ki_exception_bus_error() (m68kcpu.h) can distinguish a
+ * next-instruction (jump-target) prefetch fault from a mid-instruction data
+ * fault, and recover the address of the jump instruction that caused it.
+ * The Lisa OS's recoverable-bus-error engine (its BUS_ERR handler) decodes
+ * the group-0 frame's IR + PC to re-run faulting JSR/JMP/RTS/RTE gates;
+ * see m68ki_exception_bus_error()'s LisaEmu comment for the full contract.
+ * Re-applied after re-vendoring by Scripts/vendor-musashi.sh. */
+uint    m68ki_opcode_fetch_active;
+uint    m68ki_ppc_prev;
+
 jmp_buf m68ki_bus_error_jmp_buf;
 
 /* Used by shift & rotate instructions */
@@ -1003,9 +1014,17 @@ int m68k_execute(int num_cycles)
 			}
 
 			/* Read an instruction and call its handler */
+			/* LisaEmu (M4 Task 4 round 4): flag the opcode fetch so a bus
+			 * error raised here is classified as a jump-target prefetch
+			 * fault (real 68000: the fault happens DURING the jump
+			 * instruction); record each instruction's start address so
+			 * the exception builder can re-point the frame PC at it. */
+			m68ki_opcode_fetch_active = 1;
 			REG_IR = m68ki_read_imm_16();
+			m68ki_opcode_fetch_active = 0;
 			m68ki_instruction_jump_table[REG_IR]();
 			USE_CYCLES(CYC_INSTRUCTION[REG_IR]);
+			m68ki_ppc_prev = REG_PPC;
 
 			/* Trace m68k_exception, if necessary */
 			m68ki_exception_if_trace(); /* auto-disable (see m68kcpu.h) */

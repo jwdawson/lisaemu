@@ -1879,117 +1879,128 @@ delivery), user mode reached, the `$4C0270` event-wait loop reached, `!halted`,
 `busErrorPulseCount==0`, `writeAttempts==0`, `blocksRead==323`. Robust
 invariants alongside the exact deterministic handler/loop anchors.
 
-## Checkpoint F (M4 Task 4) — the event-wait DISSECTED: the OS blocks on an event no modeled source posts
 
-Checkpoint E left the OS alive but idle in a user-mode poll at `$4C0270`,
-waiting for an in-RAM byte to become `2`. M4 Task 4 dissected that wait
-end-to-end (a scratch trace harness, since deleted; every claim below is
-reproducible from `ROMFloppyBootTests.checkpointF_blockedOnAnUnpostedEvent`).
-The finding: the OS is **alive and correct, blocked on an event that, on real
-hardware, another process or a device would post — and nothing in our
-single-process model ever does.** No emulation divergence was found to fix;
-this is the honest M5 boundary, not a bug, and forcing the event would be
-faking progress the plan forbids.
+## Checkpoint F (M4 Task 4) — the init-time driver I/O-completion poll (CORRECTED)
 
-### The wait, decoded
+Checkpoint E left the OS idle in a poll at `$4C0270`, waiting for an in-RAM byte
+to become `2`. M4 Task 4 dissected that wait. **The first-round diagnosis below
+was WRONG and is struck; the corrected diagnosis, proven against the OS source
+(source-DRIVERDEFS/asynctr/clock/SOURCE-STARTUP), follows.**
 
-The resting loop (segment `$4C`, the process's own Pascal code):
+> ~~**(Struck — M4 Task 4 review.)** The polled cell is an "event object" and
+> the OS "blocks on an event that another process or a device would post";
+> hypothesis-4 "no second process" was read as confirmation of a
+> co-process/"multiprocess event-dispatch" boundary; the leading trigger was
+> guessed to be "a periodic COPS/RTC status interrupt our HLE doesn't emit."~~
+> Every one of those claims is refuted below. The empirical traces that fed
+> them (getter `$2E2BE4` reads obj+`$14`; the sole writer `$2E2BFC` sets it to
+> `2`; input does not post it; the OS Timer Manager is healthy; A5 never
+> changes; nothing else runs) are all correct — only their *interpretation* was
+> wrong.
 
-```
-$4C0270 tst.b   (-$55c,A5)        ; global "event pending" flag -- 0 here
-$4C0274 bne     $4c028c
-$4C0276 movea.l ($a,A6),A0        ; A0 <- &objptr
-$4C027A move.l  (A0),-(A7)        ; push the event OBJECT pointer (heap; $CC5FCC this boot)
-$4C027C pea     (-$2a,A6)         ; &result local
-$4C0280 jsr     ($7d4,A5)         ; A5 jump-table slot -> stub $CC4BDC `jmp $2E2BE4` (a getter)
-$4C0284 cmpi.b  #$2,(-$2a,A6)     ; wait for the object's state byte to become 2
-$4C028A bne     $4c0276
-```
+### What the poll actually is: a driver-request-block completion wait
 
-- **Getter `$2E2BE4`** (`link; movea.l ($c,A6),A0; movea.l ($8,A6),A1;
-  move.l ($14,A0),(A1); unlk; …`): returns the LONG at **object+`$14`**; the
-  caller compares its high byte to `2`. So the polled cell is **the state byte
-  at object+`$14`** (`$CC5FE0` this boot), currently `0`.
-- **The only writer is the sibling method `$2E2BFC`**
-  (`movea.l ($a,A6),A3; lea ($14,A3),A4; cmpi.b #$2,(A4); beq …;
-  move.b #$2,(A4); … move.b [$16] xor 1 -> [$15]; tst.l (A3); …`). It sets
-  **object+`$14` := 2**, toggles a companion byte (`[$15]:=[$16] xor 1` — a
-  blink/heartbeat pair), and, if object+`0` is non-nil, signals via
-  `($c54,A5)`. It is reachable only through two low-RAM jump-table stubs
-  (`$0087FA`/`$0096E6`, both `jmp $2E2BFC`). **This setter is NEVER executed in
-  any run** — the event is never posted.
+The polled object is a **driver I/O request block** (`reqblk`,
+source-DRIVERDEFS:182-204). Field offsets confirmed live: obj+`$4` =
+`pcb_chain.kind` = `reqblk_type(1)` (proves the record type); the polled cell
+obj+`$14` is `reqstatus.reqsrv_f`, enum `(active,in_service,complete)=0/1/2` —
+so the awaited value **`2` means `complete`**. The getter `$2E2BE4` returns that
+field; the loop spins until it is `complete`.
 
-### Why it is never posted (four hypotheses tested, all negative)
+The sole writer `$2E2BFC` is **`unblk_req`** (source-asynctr:209-245), matched
+instruction-for-instruction: `cmpi.b #$2,(A4)` = "if reqsrv_f <> complete";
+`move.b #$2,(A4)` = "reqsrv_f := complete"; the `[$15]:=[$16] xor 1` "toggle"
+(mis-read at first round as a blink pair) is literally
+`reqsuccess_f := not reqabt_f`; `tst.l (A3)` = "if pcb_chain.headr <> nil"; the
+`($c54,A5)` call = `ALARMRELATIVE(unblk_alarm,0)`. `unblk_req`/IODONE is called
+from **device-completion handlers** (floppy, ProFile, serial, console) and from
+the 10 ms clock ISR `CLK_Q_MGR` (source-clock:447). The poster is an
+**ISR/driver completion**, not a co-process.
 
-- **Not a keyboard/mouse wait.** Injected mouse motion, a mouse click, and
-  keystrokes all reach `Level2` (`$520A52`), which **fully decodes** the
-  keystroke (keyboard-ID gate at `$CC02CE`, layout tables `$CC05D2`, keymaps
-  `$521DC2`/`$521E62`, auto-repeat timer re-armed) and queues it into the
-  keyboard buffers at `$CC05xx`. The device layer works; the decoded key does
-  **not** set object+`$14`. `state` stays `0` throughout.
-- **Not a timer alarm.** The VIA1 T1 ms-tick service (`$52098A`, called from
-  `Level1`) drives two software-time accumulators in segment `$CC`
-  (`$CC001A += $4E20` µs, `$CC001E += $14` per tick) and, when `$CC001E`
-  crosses deadline `$CC0022`, calls the **OS Timer Manager** (`$5209C8`): it
-  walks a 20-slot active-timer bitmap (`$CC0026`), fires expired callbacks via
-  `$CC0090[i]`, and re-arms the next deadline (`$52261A`/`$5225CC`). This
-  machinery is **healthy and self-sustaining** — a periodic timer (callback
-  `$521360`) fires and re-schedules itself forever — but it **never calls the
-  setter**; the waited-on object is not one of its timers.
-- **Not a disk/driver completion.** `blocksRead` stays `323`, `writeAttempts`
-  `0`; `Level1` polls the floppy completion line (`VIA2 PB4`, `$FCDD81` bit 4)
-  every tick and finds nothing pending. The wait is not disk-bound.
-- **Not a co-process either — because there is no second process.** Over tens
-  of millions of instructions the running world is fixed: **A5 never changes**
-  (`$CC4408` throughout), no context switch ever occurs, and only four address
-  regions execute — `$2E` (the getter), `$4C` (the loop), `$CC` (its data),
-  and `$52` (the kernel Level1/Level2 handlers). The OS runs **exactly one
-  process** here and it busy-waits without yielding (no `TRAP #2` /
-  `Enter_Scheduler`). The event object is registered in a low-RAM pointer table
-  at `$0354xx` (a chain of frame/return-address pairs all pointing back into
-  this same wait), consistent with an event/waiter descriptor.
+### The boot phase: single-process STARTUP, before multiprocessing
 
-### The boundary (a documented STOP, not a bug)
+Per SOURCE-STARTUP:2174-2184, `INITSYS` runs `BOOT_IO_INIT` (= Checkpoint E's
+unmasking, "Init all devices, runs FS_INIT") → `SYS_PROC_INIT` (creates the
+system processes) → … → `ENTER_SCHEDULER`. Our observed "A5 never changes, no
+context switch" is **not** a co-process boundary — it means the boot is still in
+the **single outer STARTUP process, inside `BOOT_IO_INIT`, before
+`SYS_PROC_INIT` has created any other process.** At this phase a wait can only
+be satisfied by an ISR/driver completion.
 
-The producer that would set object+`$14` := 2 is an **OS event-dispatch /
-multiprocess post** — the raw keyboard/timer/disk layers all function, but the
-higher-level dispatch that turns a system condition into *this* process's event
-never runs, because the co-process (or interrupt-driven poster) that would run
-it is never scheduled in our one-process execution. Naming it precisely needs
-kernel symbols we do not have (all Linkmaps are Office-System *app* maps; every
-address here — `$4C0276`, `$2E2BE4`, `$CC5FCC` — stays anonymous, and none
-resolve, so no application has loaded). **This is M5's requirements:** the OS
-multiprocess/event-dispatch layer (the likeliest concrete trigger being a
-periodic COPS/RTC status interrupt our HLE does not emit, or a system process
-the boot should have launched). No device or core change is evidence-gated by
-this task — the correct action is to STOP here, documented, exactly as the plan
-directs.
+### The request, identified: an FS-mount READ to the OS's own Sony driver
 
-### OQ / writes / screen at Checkpoint F
+The reqblk fields (live): `operatn` (obj+`$18`) = `1` = **read**; `cfigptr`
+(obj+`$1A`) → a `devrec` at `$CC5CE0` whose driver `entry_pt` is a jump table
+into segments `$46/$48/$4A`; `req_extent` (obj+`$1E`) → a `disk_extend` reading
+**block `41`** = the volume's `fs_strt_blok` (`ext_diskconfig.fs_strt_blok`,
+`num_bloks=$694`=1684). Devices `"#14#1"`/`"#14#2"` share this driver. The
+driver code references **`$FCC000`/`$FCC180`** (the floppy shared-RAM window +
+parameter memory), so this **is the OS's own Sony floppy driver** for the two
+drive slots — issuing the boot-volume MDDF/catalog read that FS_INIT needs to
+mount the boot volume. (It is NOT an unimplemented device, and NOT the boot
+Sony we already serve via the ROM routine — see next.)
 
-- **OQ1″: still OPEN, still not forced.** The single process runs in user mode
-  but supervisor execution and data both stay in domain 0; A5/context never
-  change, so no supervisor DATA access to a non-zero user domain occurs.
-  `Bus.translationDomain` untouched. Revisit when a second process runs in
-  domain 1+ (M5).
-- **Floppy writes: still NONE** (`writeAttempts == 0`). Session write-through
-  stays armed but unbuilt — the OS has issued no write at any checkpoint.
-- **COPS `$02` clock read: not observed**; the OS has not set the clock either
-  (`clockSetNibbles == []`). The COPS traffic here is the `$7C` mouse-int
-  enable plus the decoded keystroke stream.
-- **Screen: unchanged from Checkpoint E and frozen.** One rest screen only —
-  the ROM "STARTUP FROM" device window plus the OS busy/hourglass cursor
-  (`~/Development/LisaEmu-artifacts/m4-checkpoint-f-rest.png`, identical content
-  to `m4-checkpoint-e.png`, 78,181 set px). Injected input does not change it.
+### Why it never completes — the precise, corrected frontier
+
+Counting across the whole boot-to-rest:
+
+- **`unblk_req` (`$2E2BFC`) executes 0 times** — no reqblk is ever completed.
+- **The OS Sony driver's hardware layer never runs** — its command-issue
+  (`$46027A`: `move.b #$88,($3,A2)` to `$FCC003`) and command-wait
+  (`$460160`: poll `$FCC001` + `$FCD801` bit 6) execute **0 times**. The request
+  is never dispatched to hardware (no `$FCC000` access occurs after the last
+  read).
+- **Every working read (248, blocks 75→323) used the *synchronous* ROM read
+  routine `$FE1E0E`** (`movea.l #$fcc001,A0`) — the loader-style path. The
+  boot loads itself synchronously via the ROM; the **first time it issues an
+  *async* `reqblk` read (the FS mount), it hangs.**
+
+The reviewer's suspect (a) — "the ms-tick never reaches `CLK_Q_MGR`'s
+alarm-expiry path" — is **refuted**: the alarm mechanism is alive and firing.
+The alarm-callback table `$CC0090[]` holds kernel alarms `$521360` and
+`$52123E`, both of which **fire** (9× / 10× over 40 M cycles) driven by the ms
+tick → Timer Manager. But the **Sony driver's own servicing alarms**
+(`$4612EC`, `$4611A0`, also registered in `$CC0090[]`) are **registered but
+never armed** (their `$CC0026` active bit stays clear), so the driver is never
+kicked to service the queued request. The gap is therefore **not** the clock
+ISR and **not** an unimplemented device: it is that the enqueued async disk
+request is **never dispatched to the Sony driver** (its servicing alarm is never
+armed) at this pre-multiprocessing stage, so no completion ISR ever calls
+`unblk_req`.
+
+**Corrected boundary (M5 frontier):** the OS's **async driver request-dispatch
+path** for the boot-volume FS-mount read does not function under our emulation
+during single-process `BOOT_IO_INIT` — the Sony driver's servicing alarm is
+never armed, the read is never issued to `$FCC000`, and `reqsrv_f` stays
+`active` forever. The synchronous ROM-routine read path works (248 reads); the
+async OS-driver path does not. Identifying *why* the driver's alarm is not armed
+when `DEV_IO` enqueues the request (a driver-model / request-dispatch divergence
+— e.g., a device/parameter-memory state the driver checks before arming, or the
+`(-$55c,A5)` "skip-wait" mode flag the loop tests at `$4C0270` that is `0` here)
+is the M5 fix target. No evidence-gated device/core fix was reached this task:
+the two first-round-plausible fixes (clock-ISR alarm expiry; an unimplemented
+device) are both refuted, and fabricating completion would be faking progress.
+
+### OQ / writes / screen at Checkpoint F (unchanged, re-confirmed)
+
+- **OQ1″: still OPEN.** Single-process STARTUP, supervisor stays domain 0;
+  A5/context never change; no supervisor DATA access to a non-zero domain.
+- **Floppy writes: still NONE** (`writeAttempts == 0`).
+- **COPS `$02` clock: not read** (`clockSetNibbles == []`). (Not implicated —
+  the wait is a disk-driver completion, not a COPS event.)
+- **Screen: one frozen rest screen** — the ROM "STARTUP FROM" window + the OS
+  busy/hourglass cursor (`~/Development/LisaEmu-artifacts/m4-checkpoint-f-rest.png`,
+  identical to `m4-checkpoint-e.png`, 78,181 set px). Unchanged by input.
 
 ### What the Checkpoint F test pins (`ROMFloppyBootTests`)
 
-`checkpointF_blockedOnAnUnpostedEvent` — reaches the `$4C0276` loop top, then:
-pins the getter identity (`($7d4,A5)` stub is `jmp $2E2BE4`; getter body reads
-obj+`$14`) and the setter identity (`$2E2C12` = `move.b #$2,(A4)`), **derives**
-the heap event object from A5/A6 at runtime (address-robust), and over an
-8M-instruction window asserts the diagnosis: the setter `$2E2BFC` never runs,
-the state byte never reaches `2`, **A5 never changes** (single process, no
-context switch), while the machine is provably ALIVE — `Level1` (`$5208A6`)
-keeps firing and the Timer Manager accumulator `$CC001E` advances — with no
-halt, no bus error, `writeAttempts == 0`, `blocksRead == 323`.
+`checkpointF_blockedOnDriverIOCompletion` — reaches the `$4C0276` init-time
+I/O-completion poll and pins the corrected diagnosis: the getter reads the
+reqblk's `reqstatus` field (obj+`$14`), the setter `$2E2BFC` (`unblk_req`) writes
+`complete`=2; the reqblk is derived at runtime and confirmed (`kind=reqblk_type`
+at +`$4`, `operatn=read`). Over an 8 M-instruction window it asserts the
+mechanism: `unblk_req` (`$2E2BFC`) never runs, the OS Sony driver's hardware
+command-issue (`$46027A`) never runs, the state stays `active` (≠ complete), A5
+never changes (single-process STARTUP), while the machine is provably alive —
+`Level1` (`$5208A6`) fires and the Timer Manager accumulator `$CC001E` advances
+— with no halt, no bus error, `writeAttempts == 0`, `blocksRead == 323`.

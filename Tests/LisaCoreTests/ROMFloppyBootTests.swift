@@ -424,37 +424,43 @@ extension MusashiSuites {
                     "the OS read its remaining boot blocks (75 -> 323) before unmasking; got \(m.bus.floppy.blocksRead)")
         }
 
-        /// **M4 Task 4 — Checkpoint F: the event-wait DISSECTED; the OS blocks on
-        /// an event no modeled source posts (the honest boundary).** Checkpoint E
-        /// found the OS resting in a user-mode poll at `$4C0270`. This test pins
-        /// the *diagnosis* of that stop (docs/rom-trace-notes.md "Checkpoint F"):
+        /// **M4 Task 4 — Checkpoint F: the init-time DRIVER I/O-COMPLETION poll
+        /// (corrected diagnosis).** Checkpoint E found the OS resting in a poll at
+        /// `$4C0270`. This test pins what that poll actually IS
+        /// (docs/rom-trace-notes.md "Checkpoint F (CORRECTED)"):
         ///
-        ///  - The loop polls an **event object** (heap) for its state byte to
-        ///    become `2`, read through a getter at `$2E2BE4` reached via the
-        ///    process's A5 jump table (`jsr ($7d4,A5)` -> stub `jmp $2E2BE4`).
-        ///  - The value `2` is written ONLY by the sibling setter method at
-        ///    `$2E2BFC` (`move.b #$2,($14,A3)`), which is **never executed** in
-        ///    any run: no timer alarm, no decoded input, and no co-process posts
-        ///    it. The OS runs **exactly one process** here — A5 never changes,
-        ///    the scheduler never context-switches.
-        ///  - The machine is provably ALIVE, not hung: the VIA1 T1 ms-tick keeps
-        ///    firing into `Level1` (`$5208A6`), driving the OS Timer Manager's
-        ///    software-timer accumulator at `$CC001E` upward every tick and
-        ///    re-arming its deadline `$CC0022` (a self-sustaining periodic timer).
-        ///    Injected keystrokes reach `Level2` (`$520A52`) and are fully decoded
-        ///    into the keyboard queue — the device layer works; the event simply
-        ///    never propagates to the waiting process.
+        ///  - The polled object is a **driver I/O request block** (`reqblk`,
+        ///    source-DRIVERDEFS:182-204): obj+`$4` = `pcb_chain.kind` =
+        ///    `reqblk_type(1)`, and the polled cell obj+`$14` is
+        ///    `reqstatus.reqsrv_f` (enum `active,in_service,complete = 0/1/2`), so
+        ///    the awaited `2` means **`complete`**. The getter `$2E2BE4` returns
+        ///    that field (reached via `jsr ($7d4,A5)` -> stub `jmp $2E2BE4`).
+        ///  - The sole writer `$2E2BFC` is **`unblk_req`** (source-asynctr:209-245:
+        ///    `reqsrv_f := complete; reqsuccess_f := not reqabt_f; …
+        ///    ALARMRELATIVE`), called from **device-completion ISRs**. It executes
+        ///    **0 times** anywhere in the boot — no reqblk is ever completed.
+        ///  - The request is an FS-mount **read** (`operatn`=1) of the boot
+        ///    volume's `fs_strt_blok` to the OS's own **Sony floppy driver**
+        ///    (segments `$46/$48`, code that pokes `$FCC000`/`$FCC180`). Its
+        ///    hardware layer (`$46027A`) never runs; the request is never
+        ///    dispatched. Every working read used the *synchronous* ROM routine
+        ///    `$FE1E0E` instead.
+        ///  - This is single-process `STARTUP`/`BOOT_IO_INIT` (SOURCE-STARTUP:
+        ///    2174-2184) BEFORE `SYS_PROC_INIT` — A5 never changes because no
+        ///    second process exists yet, not because of an event-dispatch
+        ///    boundary. The machine is provably ALIVE (`Level1` ms-tick fires; the
+        ///    Timer Manager accumulator `$CC001E` advances; kernel alarms fire).
         ///
-        /// The producer is an OS event-dispatch / multiprocess post our
-        /// single-process execution never generates — a genuinely-new subsystem
-        /// boundary (M5), NOT a device/core divergence. We do NOT force the event
-        /// (that would fake progress). Addresses are deterministic on this fixed
-        /// ROM+disk+input path; the heap object pointer is DERIVED at runtime from
-        /// A5/A6 rather than hard-coded, and only the loaded-image code addresses
-        /// are pinned literally.
-        @Test func checkpointF_blockedOnAnUnpostedEvent() throws {
+        /// Corrected frontier (M5): the OS's ASYNC driver request-dispatch path
+        /// does not function here — the Sony driver's servicing alarm is never
+        /// armed, so the async read is never issued/completed. NOT a co-process /
+        /// event-dispatch boundary, NOT an unimplemented device, NOT a clock-ISR
+        /// alarm-expiry gap (all refuted; see the doc). No evidence-gated fix was
+        /// reached; we do not fabricate completion. Heap addresses are DERIVED at
+        /// runtime; only loaded-image code addresses are pinned literally.
+        @Test func checkpointF_blockedOnDriverIOCompletion() throws {
             let m = try bootIntoLoader()
-            // Reach the resting loop top exactly ($4C0276), as Checkpoint E.
+            // Reach the init-time I/O-completion poll top exactly ($4C0276).
             let lim0 = m.cycles + 30_000_000
             while m.cycles < lim0 && !m.halted && !(0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]) { _ = m.step() }
             var reachedLoop = false
@@ -462,58 +468,66 @@ extension MusashiSuites {
                 if (0x004C_0270...0x004C_028F).contains(m.cpu[.pc]) { reachedLoop = true; break }
                 _ = m.step()
             }
-            #expect(reachedLoop, "reached the user-mode event-wait loop $4C0270")
+            #expect(reachedLoop, "reached the init-time driver I/O-completion poll $4C0270")
             for _ in 0..<4000 where m.cpu[.pc] != 0x004C_0276 { _ = m.step() }
-            #expect(m.cpu[.pc] == 0x004C_0276, "positioned at the loop top $4C0276")
+            #expect(m.cpu[.pc] == 0x004C_0276, "positioned at the poll top $4C0276")
 
-            // The getter is reached via ($7d4,A5); its stub is a JMP to the getter
-            // body $2E2BE4 -- pin that identity (proves the polled-field getter).
+            // The getter ($7d4,A5) stub is a JMP.L to the reqstatus getter $2E2BE4.
             let a5 = m.cpu[.a5]
             let getterStub = a5 &+ 0x7d4
             #expect(m.bus.read16(getterStub) == 0x4EF9, "getter stub is a JMP.L trampoline")
             #expect(m.bus.read32(getterStub &+ 2) == 0x002E_2BE4,
-                    "getter stub targets the polled-field getter $2E2BE4; got \(String(format:"$%08X", m.bus.read32(getterStub &+ 2)))")
-            // The getter body reads a LONG from ($14,obj) -- the state field lives
-            // at object+$14 (the caller then compares its high byte to 2); the
-            // setter writes #$2 to that same field. Pin both via the disassembler.
+                    "getter stub targets the reqstatus getter $2E2BE4; got \(String(format:"$%08X", m.bus.read32(getterStub &+ 2)))")
+            // Getter reads the LONG at reqblk+$14 (reqstatus.reqsrv_f); the writer
+            // $2E2BFC = unblk_req sets reqsrv_f := complete(2). Pin via disassembler.
             let dis = Monitor(machine: m)
             #expect(dis.disassembly(from: 0x002E_2BF0, count: 1).contains("move.l  ($14,A0), (A1)"),
-                    "getter body $2E2BF0 reads the state field at obj+$14")
+                    "getter body $2E2BF0 reads reqstatus at reqblk+$14")
             #expect(dis.disassembly(from: 0x002E_2C12, count: 1).contains("move.b  #$2, (A4)"),
-                    "setter body $2E2C12 writes #$2 into the state field -- the only writer of state:=2")
+                    "unblk_req body $2E2C12 writes reqsrv_f := complete(2)")
 
-            // Derive the event object + state byte at runtime (heap-address-robust).
+            // Derive the reqblk at runtime (heap-address-robust) and confirm its
+            // identity from the OS record layout: kind=reqblk_type(1) at +$4,
+            // operatn=read(1) at +$18, reqsrv_f=active(0) not complete at +$14.
             let objPtrCell = m.bus.read32(m.cpu[.a6] &+ 0x0a)   // = A0 after movea.l ($a,A6),A0
-            let obj = m.bus.read32(objPtrCell)                  // = the pushed object pointer
-            let stateAddr = obj &+ 0x14
-            #expect(m.bus.read8(stateAddr) != 2, "the event is UNposted at rest (state != 2)")
+            let reqblk = m.bus.read32(objPtrCell)               // = the pushed reqblk pointer
+            #expect(m.bus.read8(reqblk &+ 0x04) == 1,
+                    "reqblk pcb_chain.kind(+$4) == reqblk_type(1) -- confirms this is a request block")
+            #expect(m.bus.read8(reqblk &+ 0x18) == 1, "operatn(+$18) == read(1)")
+            let srvAddr = reqblk &+ 0x14
+            #expect(m.bus.read8(srvAddr) != 2, "reqsrv_f is not yet complete at rest (active)")
 
-            // Run a long window and prove: (1) the setter never runs, (2) the state
-            // never reaches 2, (3) A5 never changes (single process, no context
-            // switch), while (4) the machine is demonstrably alive -- the Level1
-            // ms-tick fires and the Timer Manager's accumulator $CC001E advances.
+            // Over a long window prove the corrected mechanism: (1) unblk_req never
+            // runs (no completion), (2) the OS Sony driver's hardware command-issue
+            // never runs (request never dispatched), (3) reqsrv_f never reaches
+            // complete, (4) A5 never changes (single-process STARTUP), while (5) the
+            // machine is alive -- Level1 fires and $CC001E advances.
             let a5Rest = m.cpu[.a5]
             let acc0 = m.bus.read32(0x00CC_001E)
-            var sawSetter = false, sawLevel1 = false, a5Changed = false, statePosted = false
+            var sawUnblkReq = false, sawDrvCmd = false, sawLevel1 = false
+            var a5Changed = false, becameComplete = false
             for _ in 0..<8_000_000 where !m.halted {
                 let pc = m.cpu[.pc]
-                if pc == 0x002E_2BFC { sawSetter = true }
+                if pc == 0x002E_2BFC { sawUnblkReq = true }         // unblk_req
+                if pc == 0x0046_027A { sawDrvCmd = true }           // Sony driver hardware command-issue
                 if pc == 0x0052_08A6 { sawLevel1 = true }
                 if m.cpu[.a5] != a5Rest { a5Changed = true }
-                if m.bus.read8(stateAddr) == 2 { statePosted = true }
+                if m.bus.read8(srvAddr) == 2 { becameComplete = true }
                 _ = m.step()
             }
             let acc1 = m.bus.read32(0x00CC_001E)
-            #expect(!sawSetter, "the setter $2E2BFC is NEVER executed -- nothing posts the event")
-            #expect(!statePosted, "the polled state byte never becomes 2 -- the event stays unposted")
-            #expect(!a5Changed, "the OS runs exactly one process -- A5 (its world) never changes, no context switch")
-            #expect(sawLevel1, "the machine is alive: the VIA1 T1 ms-tick keeps delivering to Level1 $5208A6")
+            #expect(!sawUnblkReq, "unblk_req ($2E2BFC) NEVER runs -- no reqblk is ever completed")
+            #expect(!sawDrvCmd, "the OS Sony driver hardware layer ($46027A) NEVER runs -- the async read is never dispatched")
+            #expect(!becameComplete, "reqsrv_f never reaches complete -- the request hangs")
+            #expect(!a5Changed, "single-process STARTUP: A5 never changes (before SYS_PROC_INIT)")
+            #expect(sawLevel1, "alive: the VIA1 T1 ms-tick keeps delivering to Level1 $5208A6")
             #expect(acc1 != acc0,
-                    "the OS Timer Manager is alive: the ms-tick accumulator $CC001E advances (\(String(format:"$%08X", acc0)) -> \(String(format:"$%08X", acc1)))")
+                    "alive: the ms-tick / Timer Manager accumulator $CC001E advances (\(String(format:"$%08X", acc0)) -> \(String(format:"$%08X", acc1)))")
             #expect(!m.halted, "no halt at the boundary")
             #expect(m.bus.busErrorPulseCount == 0, "no bus error at the boundary")
             #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE at Checkpoint F")
-            #expect(m.bus.floppy.blocksRead == 323, "no further floppy I/O -- the wait is not disk-bound; got \(m.bus.floppy.blocksRead)")
+            #expect(m.bus.floppy.blocksRead == 323,
+                    "all reads used the synchronous ROM routine (248); the async reqblk read never dispatches; got \(m.bus.floppy.blocksRead)")
         }
     }
 }

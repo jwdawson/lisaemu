@@ -1792,7 +1792,15 @@ Level1  MOVEM.L A0/D0,-(SP)
 
 `BNE` taken means bit 2 ≠ 0 ⇒ *not* retrace; so **bit 2 == 0 is the OS's
 "retrace pending" encoding** (active-LOW), and only then does it call
-`VertRetrace`, whose tail writes `$E018` (VertReset) to acknowledge. Our model
+`VertRetrace`, whose tail writes `$E018` (VertReset) to acknowledge.
+**`VertRetrace`'s own ack spin settles the polarity independently and even
+more decisively than the `Level1` gate above** (LIBHW-DRIVERS:958-960, the
+Task-3 reviewer's re-proof): after writing `$E018`, `VertRetrace` waits for the
+retrace to *pass* by spinning WHILE `$F801` bit 2 reads 0 (`btst #2` / branch
+back while zero) — i.e. bit 2 == 0 is unambiguously "retrace in progress /
+pending" and the routine loops until hardware raises it to 1 ("retrace over").
+A model exposing bit 2 active-HIGH would make this spin exit immediately (or
+never enter), the opposite of the hardware's intent. Our model
 exposed the bit **active-HIGH** (`pending ? 0x04 : 0`), so the handler read
 bit2=1 as "no retrace", never called `VertRetrace`, never acked — while
 `Machine.vsyncPending` (a real level-1 source) stayed asserted. The moment SR

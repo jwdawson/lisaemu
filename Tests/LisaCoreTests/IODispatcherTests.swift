@@ -124,9 +124,21 @@ import Testing
 
 // MARK: - Board ID ($C031)
 
-@Test func boardIdReturnsZero() {
+@Test func boardIdReturnsPepsiClassDiskROMId() {
+    // $FCC031 = DiskROMId (LIBHW-DRIVERS:135). M4 Task 4 round 4: the Task-3
+    // era 0x00 stub made the OS's BOOT_IO_INIT decode our machine as a Twiggy
+    // Lisa 1 (SOURCE-STARTUP:1876-1878: signed byte >= 0 -> iob_lisa), which
+    // installed the vestigial TWIGIO stub driver on the boot floppy devrec
+    // (SOURCE-CD:750; source-twiggy:1235+1237 -- body compiled out under
+    // (*$IFC TWIGGYBUILD*)) and orphaned the FS-mount read (Checkpoint F
+    // stall). The Lisa 2/10 machine we model must present a Pepsi-class ID:
+    // bit7 set (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), and NOT
+    // in [$A0,$DF] (SOURCE-STARTUP:1879-1885's iob_sony/iob_lite ranges) so
+    // the decode falls through to the $FCC015 internal-disk check ->
+    // iob_pepsi (STARTUP:1886-1890). $88 satisfies the decode and is the
+    // 2/10's community-documented disk-ROM version byte.
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_C031) == 0x00)
+    #expect(bus.read8(0xFC_C031) == 0x88)
 }
 
 // MARK: - VIA1 (stride 8, 16 regs at $D901) / VIA2 (stride 2, 16 regs at $DD81)
@@ -301,9 +313,12 @@ import Testing
 
 @Test func c031BoardIDUnchangedByTheFloppyWindow() {
     // $FCC031 falls inside the $C000-$C7FF window but must keep its own
-    // pre-existing (Task 3 era) behavior, not become a plain window byte.
+    // hardware-register behavior (DiskROMId, $88 -- see
+    // boardIdReturnsPepsiClassDiskROMId), not become a plain window byte.
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_C031) == 0x00)
+    #expect(bus.read8(0xFC_C031) == 0x88)
+    bus.write8(0xFC_C031, 0x42)   // hardware-driven; CPU writes have no effect
+    #expect(bus.read8(0xFC_C031) == 0x88)
 }
 
 @Test func floppyWindowRoutesPlainCellsAsRAMThroughTheBus() {

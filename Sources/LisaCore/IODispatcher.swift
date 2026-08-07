@@ -182,7 +182,22 @@ final class IODispatcher {
         // soft-fail either way -- docs/rom-trace-notes.md "Trace checkpoint B"),
         // so every ROM anchor is unmoved. See "Checkpoint E".
         case 0xF801: return (statusByte & ~0x04) | (videoTiming.pending ? 0 : 0x04)
-        case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
+        // $FCC031 = DiskROMId (LIBHW-DRIVERS:135), the I/O-board disk-ROM
+        // ident byte. M4 Task 4 round 4: was a 0x00 "pre-Pepsi" stub (benign
+        // for the ROM, whose only gate is the bit7 Pepsi contrast tweak at
+        // $FE0B24-$FE0B3C -- docs/rom-trace-notes.md "$C031 board ID"), but
+        // the OS's BOOT_IO_INIT decodes it as the MACHINE IDENTITY
+        // (SOURCE-STARTUP:1876-1890): signed >= 0 -> iob_lisa (Twiggy
+        // Lisa 1), which made STARTUP:1970-1972 install the vestigial TWIGIO
+        // stub driver (SOURCE-CD:750, body compiled out in OS 3.1 under
+        // (*$IFC TWIGGYBUILD*), source-twiggy:1235/1237) on the boot-floppy
+        // devrecs "#14#1"/"#14#2" -- the Checkpoint F orphaned-mount-read
+        // stall. The Lisa 2/10 we model presents a Pepsi-class ID: bit7 set
+        // (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside
+        // [$A0,$DF] (iob_sony/iob_lite, STARTUP:1879-1885) -> with
+        // $FCC015=1 below, iomodel = iob_pepsi (STARTUP:1886-1890). $88 is
+        // the 2/10's disk-ROM version byte.
+        case 0xC031: return 0x88
         // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"):
         // 0=twiggy, 1=single-sided Sony, 2=double-sided Sony. Task 4 moves
         // this from unknown-I/O (0xFF) to 1 -- matches the 400K install

@@ -192,10 +192,33 @@ Milestones (each a demo):
    overlay is real and works (verified against a real, cited symbol), it
    just has no data for the address range M3/M4's trace needs yet — see
    `task-2-report.md`.)*
+   *(Project-history note, 2026-08-07: the "kernel starts" clause is now closed
+   far beyond "starts". The project's own M4 (`docs/m4-demo.md`) carried the
+   loaded OS from M3's COPS-handshake stop all the way to the **Lisa 7/7 Office
+   System 3.0 installer dialog live on screen** — the OS takes live interrupts
+   into its own `Level1`/`Level2` handlers, runs its multi-domain scheduler,
+   reaches user mode, and draws the installer UI. It idles there awaiting mouse
+   input; an Install attempt correctly reports "can't find a suitable disk"
+   because no hard disk is modeled yet [deferred to the project's M5 = Widget/
+   ProFile HLE]. See `docs/rom-trace-notes.md` "Checkpoint E/F/G" and
+   `task-4-report.md`.)*
 4. **M3 Widget** — install OS 3.1 onto Widget image in-emulator; boot from HD.
    *(Project-history note, 2026-08-06: not yet reached by the project's own
    milestone numbering — see the M2/M3 note above for how this spec's
    numbering diverged from the actual build order.)*
 5. **M4 Desktop ⭐** — mouse/keyboard/clock live; Office System desktop.
+   *(Project-history note, 2026-08-07: substantially reached, one honest step
+   short of the desktop itself. The project's own M4 (`docs/m4-demo.md`)
+   delivered live interrupts (mouse/COPS level 2, ms-tick/vsync level 1 into the
+   OS's own handlers) and the running multi-domain scheduler, and drove the boot
+   to the **Office System 3.0 installer UI on screen** (screenshot
+   `~/Development/LisaEmu-artifacts/m4-checkpoint-g-installer-ui.png`). The
+   **Office System desktop** proper is the POST-install boot, which is still
+   ahead: it needs a hard disk to install onto first — the installer reports
+   "can't find a suitable disk" because none is modeled. So the desktop ⭐ waits
+   on the project's M5 (Widget/ProFile HLE), after which installing the OS and
+   booting from HD yields the desktop. Also carried to M5: driving the installer
+   UI (mouse input at its event-wait), the soft-power/Power menu, `$C015` vs.
+   800K double-sided, and the parked 1 MB-POST divergence `$FE099C`.)*
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

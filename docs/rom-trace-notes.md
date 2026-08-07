@@ -1674,11 +1674,17 @@ ever occurs (`writeAttempts==0`). Framebuffer unchanged (menu still present,
   calls, `mmuPortWrites` climbs past 4638, `blocksRead==75`, `lastError==0`,
   the PC reaches the OS COPS driver `$520800-$5208FF`, `writeAttempts==0`.
 
-**Reproduction.** This frontier is reachable **only through the integration
-test** — `lisadbg` cannot get here on its own: it has no menu-harness (the
-cursor-walk + click that selects a boot device), so it cannot drive the ROM
-past the boot menu into the loader. `bootIntoLoader` (the `ROMFloppyBootTests`
-harness) is the sole reproduction vehicle for the `$520000` state.
+**Reproduction.** ~~This frontier is reachable **only through the
+integration test** — `lisadbg` cannot get here on its own: it has no
+menu-harness (the cursor-walk + click that selects a boot device), so it
+cannot drive the ROM past the boot menu into the loader. `bootIntoLoader`
+(the `ROMFloppyBootTests` harness) is the sole reproduction vehicle for the
+`$520000` state.~~ **Superseded (M4 Task 2):** `lisadbg` now has its own
+menu-boot harness (the `bootdisk` command, `Sources/lisadbg/main.swift`,
+porting this exact cursor-walk + click mechanism) and reaches this state —
+and well past it — on its own; the integration test is no longer the sole
+reproduction vehicle. See `task-2-report.md` for a live transcript reaching
+`$520712`+ (the current, Task-1-advanced frontier) standalone.
 
 ## M3 Task 3 — deferrals re-recorded to M4 (parked-debt bundle)
 

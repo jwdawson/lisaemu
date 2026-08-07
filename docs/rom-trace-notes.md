@@ -2294,3 +2294,71 @@ changes (processes exist); user-mode execution with domain latch 1 (OQ1″);
 `blocksWritten == writeAttempts` (session write-through, nothing dropped);
 `blocksRead >= 600`; and the framebuffer equals the installer-dialog anchor
 (FNV `0x04a19e4eb59704f4`, 60,107 set px).
+
+## Checkpoint H prep (M5 Task 1) — the installer's disk scan finds no hard disk
+
+Goal: confirm, live, the ProFile/Widget **attach-path conditional** derived in
+docs/hardware-notes.md §10.9 — does the OS ever build a hard-disk devrec or
+probe the parallel/Widget VIA on our machine today? Method: a scratch harness
+(reusing `checkpointG`'s boot-to-installer mechanism) single-stepped the
+boot-to-installer window (10 M instructions after the loader gate) and drained
+`Bus.ioTrace` per step, histogramming every I/O-space offset the CPU touched
+with the PC that touched it. The harness and its two throwaway instrumentation
+hooks (`Bus.clearIOTraceScratch`) were reverted before commit; the numbers
+below are reproduced from that run.
+
+**Scope caveat (honest boundary).** This window reaches the installer **dialog**
+(idle, waiting for a click), the same anchor `checkpointG` pins. Scripted
+mouse-clicking "Install" is Task 3 (not built yet), so the *post-click* scan
+is not itself driven here. But the **attach decision** — whether a hard-disk
+devrec exists to be found — is made at BOOT_IO_INIT/config time, inside this
+window. That is what is observed.
+
+### OBSERVED (instruction-level trace)
+
+- **Machine-identity reads.** `$FCC031` read 5× and `$FCC015` read 1× during
+  the OS phase (e.g. PC `$520688`/`$52067E` and `$2628D8`). These are
+  BOOT_IO_INIT + MACH_INFO reading the identity bytes (hardware-notes §10.9,
+  STARTUP:1876-1891, CD:644-648). Values served: `$FCC031 = $88`,
+  `$FCC015 = 1` ⇒ the OS decodes `iomodel = iob_pepsi` (Lisa 2/10).
+- **Expansion-slot probe (CARDS_EQUIPPED).** The low-select slot-ident windows
+  `$FC0001`, `$FC4001`, `$FC8001` were each read from PC `$2618D6`/`$2618F6`
+  (EXISTS_CARD then GET_ID_FIELD over slots 0/1/2, CD:563-571). All returned
+  the unmapped-I/O `0xFF` ⇒ no expansion cards, so no slot-based ProFile.
+- **The built-in ProFile driver window is NEVER touched.** `$FCD801`
+  (PROFASM `HWBASE`) and `$FCDC01`/`$FCDC05` (`HWSTATUS`/`hwddrb`) — the exact
+  addresses PROFILE hdinit computes for the built-in port (hardware-notes
+  §10.1, PROFILE:253-256) — recorded **zero** accesses across the whole
+  window (`anyBuiltinCtl = false`). **PROF_INIT / PROFASM never execute.**
+  This is the decisive confirmation: no hard-disk handshake is ever issued.
+- **VIA1 (`$FCD901` mirror) *is* accessed — but not as ProFile.** Offset
+  `$D901`+ saw heavy traffic, dominated by `IFR` (`$D969`, ~9 k reads at PC
+  `$5208B8`) and `IER` (`$D971`, PC `$5208CA/$5208F4`) — the signature of the
+  OS's **level-1 interrupt servicing** on VIA1 (§5), *not* the ProFile
+  handshake. The handshake's distinguishing register pattern — `DDRA`
+  (`$D919`) direction flips, `PORTA` (`$D979`) byte exchanges, `T2CH`
+  (`$D949`) disconnect timer — is essentially absent (`$D919` 4×, `$D979` 1×,
+  `$D949` 0×). The other `$D901` traffic is the ROM/loader **floppy** boot
+  handshake reading PB6 (PC `$FE1E24`, `$1000BE`), already documented in §9
+  (`disk_control` idle bit) — likewise not ProFile.
+
+### INFERRED (source reading, hardware-notes §10.9)
+
+- No `PROF_INIT` runs because **no `cd_intdisk` (or `cd_paraport`) hard-disk
+  devrec is built**: on `iob_pepsi` the external parallel port is refused
+  (`cdnoparaport`, CD:1006-1013), and the internal-disk devrec is created only
+  from a parameter-memory `cd_intdisk` entry (CD:1030) that the install disk's
+  PM does not carry — the BOOT_IO_INIT builtin loop creates only Twiggy floppy
+  devrecs, never a hard disk (STARTUP:1950-2006).
+- Therefore the installer's "can't find a suitable disk" (user-confirmed on a
+  live Install click) is the app scanning `configinfo` for a `diskdev` target
+  and finding only the boot floppy — no hard-disk `via1` devrec exists to
+  enumerate.
+
+### Bottom line
+
+The live branch matches the derived conditional exactly: **identity `$88`/`1`
+→ `iob_pepsi` → no ProFile devrec → no `$FCD801` probe → no suitable disk.**
+Closing this (Checkpoint H proper) needs a Widget device model answering the
+§10.1-10.7 protocol at `$FCD801` **and** a `cd_intdisk` devrec to come into
+existence (via the install flow writing PM/CDD) — the work of M5 Tasks 2-3.

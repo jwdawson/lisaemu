@@ -1988,10 +1988,10 @@ refuted, and fabricating completion would be faking progress.
 M4 Task 4 fix round 2 traced the reqblk's life directly (live, from OS start to
 the poll) and SHARPENS the frontier, resolving both round-1 candidates:
 
-- **The OS Sony driver DOES run and BUILDS the reqblk.** Creation traced to
-  `$460472` (segment `$46`, the OS Sony driver). So "the driver segments never
-  execute" is too strong — the request-BUILD code runs; it is specifically the
-  **hardware go-byte issue (`$46027A`, `START_RWTS`) that never runs.**
+- **The reqblk IS built here.** Creation traced to `$460472`. ~~(segment `$46`,
+  the OS Sony driver)~~ **(Struck — round 3: segment `$46` here is FS/mount code,
+  NOT the Sony driver; see round-3 section.)** The request-BUILD code runs; the
+  **hardware go-byte issue (`$46027A`) never runs.**
 - **`dskio` returns SUCCESS — `disk_present`=`gooddisk`, NOT `nodiskpres`.** The
   caller's post-driver check `$4C026C: tst.w (A0); bgt $4C02E2` falls THROUGH to
   the wait (returned status `0`, not the positive `nodiskpres`=614=`$266`; a
@@ -2008,21 +2008,64 @@ the poll) and SHARPENS the frontier, resolving both round-1 candidates:
   direct evidence — the OS never even mis-reads presence.**
 - **The `(-$55c,A5)` "skip-wait" flag is `0`, so the wait is CORRECTLY taken**
   (`$4C0270: tst.b (-$55c,A5)`). Refutes round-1 candidate (b).
-- **The true gap: the queued reqblk never transitions `active`→`in_service`.**
-  Verified live: over a 12 M-instruction window at rest, `reqsrv_f` (`reqblk`+
-  `$14`) never exceeds `active(0)` — it never reaches `in_service(1)`, let alone
-  `complete(2)`. Per SOURCE-HDISK:675-679 `ADD_REQUEST` starts a request only via
-  `if cur_num_requests = 1 then START_NEW_REQUEST`, and `START_NEW_REQUEST`
-  (SOURCE-HDISK:414-485) is what flips `reqsrv_f := in_service` (line 443) and
-  calls `START_DISK`→`CALLDRIVER` (line 386-410) to issue the go-byte. Because
-  the request never leaves `active`, `START_NEW_REQUEST`/`START_DISK` never
-  effectively start it, `$46027A` never runs, and no completion ISR ever calls
-  `unblk_req`. **The M5 fix target is thus the async request-START mechanism
-  (`ADD_REQUEST`/`START_NEW_REQUEST` and the driver's device-busy/`cur_num_requests`
-  accounting), not a device-register HLE answer.** No evidence-gated fix was
-  reached: the boundary is genuine OS driver-model dispatch logic reached during
-  pre-multiprocessing `BOOT_IO_INIT`, and no single device-HLE query is answered
-  wrongly (the one that mattered — disk-presence — is answered right).
+- **`reqsrv_f` never leaves `active`.** Verified live: over a 12 M-instruction
+  window at rest, `reqsrv_f` (`reqblk`+`$14`) never reaches `in_service(1)`, let
+  alone `complete(2)`. ~~Per SOURCE-HDISK:675-679 `ADD_REQUEST` starts a request
+  only via `if cur_num_requests = 1 then START_NEW_REQUEST`, and
+  `START_NEW_REQUEST` (SOURCE-HDISK:414-485) … The M5 fix target is thus the async
+  request-START mechanism (`ADD_REQUEST`/`START_NEW_REQUEST` and the driver's
+  device-busy/`cur_num_requests` accounting).~~ **(Struck — round 3. Source-
+  attribution error: HDISK is the shared queue helper, `ADD_REQUEST` is not a
+  real procedure (the enclosing proc is `dskio`), and the reviewer correctly
+  noted the analogous SONY code is SOURCE-SONY:251/333/336. But the deeper round-3
+  finding supersedes ALL of this: that queue code — `cur_num_requests`,
+  `START_NEW_REQUEST`, `dskio` — NEVER RUNS for this reqblk. See round-3 below.)**
+
+### Checkpoint F (round-3) — the reqblk is dispatched to a stub driver (nil control block), never queued
+
+Round 3 traced the reqblk **instruction-by-instruction** from its creation
+(`$460472`) to the poll (`$4C0270`) — 532 instructions, the entire path. The
+decisive facts (all live-verified, `ROMFloppyBootTests.checkpointF`):
+
+- **No queue code runs.** Nowhere in the 532-instruction enqueue→poll path is
+  there a `cur_num_requests += 1`, an `if cur_num_requests = 1` gate, a `START`/
+  `reqsrv_f := in_service` write, a go-byte to `$FCC000`, or any SONYASM/Sony-
+  driver code. **This refutes the round-2 "never reaches in_service via
+  START_NEW_REQUEST" framing AND the reviewer's stale-`cur_num_requests`
+  hypothesis: that accounting simply never executes for this request.**
+- **The dispatch target is a stub.** The path builds the reqblk (FS/mount code in
+  segment `$46`, using the `$221xxx` runtime multiply/divide routines) then calls
+  the target device's `entry_pt` (`$460210` loads `(devrec)` = `entry_pt` and
+  `jsr`s it). The boot-volume FS devrec is **"#14#1"** at `$CC5CE0` (= the
+  reqblk's `cfigptr`, `reqblk`+`$1A`). Its `entry_pt` (`devrec`+`$0`) is a `JMP.L`
+  trampoline `$CC50C2 → $46124E`, and `$46124E` is a **3-instruction driver body**
+  — `link A6,#-$32; clr.w ($c,A6); unlk; move.l (A7)+,(A7); rts` — i.e. it sets
+  its function result to `0` and returns, **doing no I/O**.
+- **Nil control block.** `devrec` "#14#1" has `cb_addr` (`devrec`+`$4`) = **`$0`**
+  (nil). Both floppy slots share this: "#14#1" (`$CC5CE0`) and "#14#2"
+  (`$CC5D3C`) both have `cb_addr=nil` and the SAME stub `entry_pt` `$CC50C2→
+  $46124E`. (For contrast, a real block driver needs a control block; and dskio
+  itself, SOURCE-SONY:664-675, dereferences `cb_addr→drivecb→ext_ptr`.)
+- **Consequence.** The async read is "accepted" (the stub returns status `0`,
+  which the caller at `$4C026C tst.w/bgt` reads as success and falls through to
+  the wait) but **orphaned**: it is never enqueued onto any device queue (the
+  reqblk's chain links stay nil), never started, never issued, never completed.
+  `reqsrv_f` stays `active` forever.
+
+**Refuted this round:** stale `cur_num_requests` counter (that code never runs);
+the round-2 `START_NEW_REQUEST` framing; (still, from prior rounds) co-process
+boundary, unimplemented device, clock-ISR gap, disk-present gap.
+
+**Open M5 question (the true next target):** WHY do the boot-volume floppy
+devrecs "#14#1"/"#14#2" carry a **stub `entry_pt` + nil `cb_addr`** at this point
+— i.e. why is the real Sony driver not installed/attached (no control block
+allocated) for these devices when the FS issues the mount read? This is a
+device-configuration / driver-attach path question (genio/CONFIG/`USE_HDISK`/
+`dinit` during `BOOT_IO_INIT`), not a device-register HLE answer. Whether it is
+an emulation divergence (an earlier config/driver-load path taking a different
+branch on our machine) or an OS ordering we have not yet satisfied is UNRESOLVED;
+no evidence-gated fix was reached, and fabricating completion would fake
+progress.
 
 ### OQ / writes / screen at Checkpoint F (unchanged, re-confirmed)
 

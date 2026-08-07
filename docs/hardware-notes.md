@@ -1151,10 +1151,14 @@ zone/track/sector/side:
   (`disk_present`=`gooddisk`, verified: the caller's `$4C026C tst.w/bgt` falls
   through to the wait, not the `nodiskpres`=614 error path). The OS's boot-time
   I/O-completion hang (Checkpoint F) is therefore **NOT** a disk-presence HLE
-  gap — it is the OS's own async request-START path (SOURCE-HDISK
+  gap. ~~It is the OS's own async request-START path (SOURCE-HDISK
   `ADD_REQUEST`/`START_NEW_REQUEST`) never flipping the queued reqblk
-  `active`→`in_service`. See docs/rom-trace-notes.md "Checkpoint F (round-2
-  sharpening)".
+  `active`→`in_service`.~~ **(Struck — round 3, both the citation and the
+  mechanism were wrong: that HDISK queue code never runs. Round-3 instruction
+  trace shows the mount reqblk is dispatched to the boot-volume FS devrec
+  "#14#1", which has a NIL `cb_addr` and an `entry_pt` stub (`$46124E`) that
+  returns 0 without doing I/O, so the request is orphaned.)** See
+  docs/rom-trace-notes.md "Checkpoint F (round-3)".
 - **disk_control idle bit — AMBIGUITY (b) — SETTLED (Task 5, boot-ROM
   disassembly).** The Rev H boot ROM polls **bit 6 of `$FCD901`**, ~~not
   `$FCD801`~~. Its handshake/ready wait (`$FE1E04`, called after every go-byte)

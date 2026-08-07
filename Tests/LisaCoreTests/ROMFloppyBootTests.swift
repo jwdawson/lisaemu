@@ -451,26 +451,30 @@ extension MusashiSuites {
         ///    boundary. The machine is provably ALIVE (`Level1` ms-tick fires; the
         ///    Timer Manager accumulator `$CC001E` advances; kernel alarms fire).
         ///
-        /// Corrected frontier (M5), SHARPENED in round 2: the OS's ASYNC driver
-        /// request-dispatch path does not function here. Round 2 established
-        /// (docs/rom-trace-notes.md "Checkpoint F (round-2 sharpening)"): the OS
-        /// Sony driver DOES run and BUILDS this reqblk (creation traced to
-        /// $460472, segment $46); its `dskio` returns SUCCESS (the caller at
-        /// $4C026C `tst.w (A0); bgt` falls THROUGH to the wait — status 0, not
-        /// the positive `nodiskpres`=614), i.e. `disk_present`=`gooddisk`, so our
-        /// FloppyController correctly answers disk-presence (DISKIN $FCC041 reads
-        /// 1). The two prior round-1 candidates are thus REFUTED: it is NOT a
-        /// disk-present precondition and NOT the `(-$55c,A5)` skip-wait flag
-        /// (which is 0 here, so the wait is correctly taken). The real gap: the
-        /// queued reqblk never transitions `active`→`in_service`
-        /// (SOURCE-HDISK:414/443 `START_NEW_REQUEST`; SOURCE-HDISK:675-679
-        /// `ADD_REQUEST`), so `START_DISK`/`CALLDRIVER` never issue the go-byte
-        /// ($46027A never runs) and no completion ISR ever calls `unblk_req`.
-        /// NOT a co-process / event-dispatch boundary, NOT an unimplemented
-        /// device, NOT a clock-ISR alarm-expiry gap (all refuted; see the doc).
-        /// No evidence-gated fix was reached; we do not fabricate completion.
-        /// Heap addresses are DERIVED at runtime; only loaded-image code
-        /// addresses are pinned literally.
+        /// Frontier, ROUND-3 (traced instruction-by-instruction from reqblk
+        /// creation to the poll; docs/rom-trace-notes.md "Checkpoint F
+        /// (round-3)"). Still confirmed/true: our FloppyController answers
+        /// disk-presence CORRECTLY (DISKIN $FCC041 reads 1); the `(-$55c,A5)`
+        /// skip-wait flag is 0 so the wait is correctly taken; the machine is
+        /// alive. What round 3 CORRECTS (strike-not-erase): the earlier claim
+        /// that "the queued reqblk never transitions active->in_service via
+        /// SOURCE-HDISK START_NEW_REQUEST" is wrong -- that HDISK queue code
+        /// (cur_num_requests / START_NEW_REQUEST) never runs at all here, and
+        /// there is no `ADD_REQUEST` procedure in the source. The full linear
+        /// trace shows the reqblk is built (FS/mount code) then dispatched to its
+        /// device's `entry_pt`: the boot-volume FS devrec "#14#1" (cfigptr =
+        /// reqblk+$1A) has a NIL `cb_addr` and an `entry_pt` trampoline to a
+        /// 3-instruction driver body that just `clr.w`s its result and returns 0
+        /// WITHOUT queuing or issuing any I/O. So the async read is "accepted"
+        /// (status 0) and orphaned: no cur_num_requests, no START, no go-byte
+        /// ($46027A never runs), no completion ISR (unblk_req never runs);
+        /// reqsrv_f stays `active` forever. Refuted: co-process boundary,
+        /// unimplemented device, clock-ISR gap, disk-present gap, stale
+        /// cur_num_requests counter. Open M5 question: WHY device "#14#1" carries
+        /// a stub driver + nil control block here (a device-config / driver-attach
+        /// divergence). No evidence-gated fix reached; we do not fabricate
+        /// completion. Heap addresses are DERIVED at runtime; only loaded-image
+        /// code addresses are pinned literally.
         @Test func checkpointF_blockedOnDriverIOCompletion() throws {
             let m = try bootIntoLoader()
             // Reach the init-time I/O-completion poll top exactly ($4C0276).
@@ -510,11 +514,34 @@ extension MusashiSuites {
             let srvAddr = reqblk &+ 0x14
             #expect(m.bus.read8(srvAddr) != 2, "reqsrv_f is not yet complete at rest (active)")
 
-            // Over a long window prove the corrected mechanism: (1) unblk_req never
-            // runs (no completion), (2) the OS Sony driver's hardware command-issue
-            // never runs (request never dispatched), (3) reqsrv_f never reaches
-            // complete, (4) A5 never changes (single-process STARTUP), while (5) the
-            // machine is alive -- Level1 fires and $CC001E advances.
+            // ROUND-3 anchor (the real frontier, traced instruction-by-instruction
+            // from reqblk creation to the poll, docs/rom-trace-notes.md "Checkpoint
+            // F (round-3)"): the reqblk targets the boot-volume FS device
+            // (cfigptr = reqblk+$1A, devname "#14#1"), and that devrec has a NIL
+            // control block (cb_addr, devrec+$4 == 0) while its entry_pt
+            // (devrec+$0) is a JMP.L trampoline to a driver body that just returns
+            // 0 -- `clr.w (result)` -- WITHOUT queuing or issuing any I/O. So the
+            // async read is "accepted" (status 0) and then orphaned: no
+            // cur_num_requests accounting, no START, no go-byte, no completion ISR
+            // ever run for it. (Refutes the earlier "never reaches in_service via
+            // START_NEW_REQUEST" framing: that HDISK code never runs at all here.)
+            let cfigptr = m.bus.read32(reqblk &+ 0x1a)
+            #expect(m.bus.read32(cfigptr &+ 0x04) == 0,
+                    "the reqblk's target devrec has a NIL cb_addr (no control block) -- got \(String(format:"$%08X", m.bus.read32(cfigptr &+ 0x04)))")
+            let entryPt = m.bus.read32(cfigptr &+ 0x00)
+            #expect(m.bus.read16(entryPt) == 0x4EF9, "devrec.entry_pt is a JMP.L trampoline")
+            let driverBody = m.bus.read32(entryPt &+ 2)
+            let dis2 = Monitor(machine: m)
+            let bodyLine = dis2.disassembly(from: driverBody &+ 4, count: 1)
+            #expect(bodyLine.contains("clr.w") && bodyLine.contains("($c,A6)"),
+                    "the dispatched driver body just clears its result to 0 (returns without servicing); body+4 @ \(String(format:"$%08X", driverBody &+ 4)) = \(bodyLine)")
+
+            // Over a long window prove the mechanism: (1) unblk_req never runs (no
+            // completion), (2) the Sony driver's hardware command-issue never runs
+            // (request never issued), (3) reqsrv_f never even reaches in_service let
+            // alone complete (the request is never started), (4) A5 never changes
+            // (single-process STARTUP), while (5) the machine is alive -- Level1
+            // fires and $CC001E advances.
             let a5Rest = m.cpu[.a5]
             let acc0 = m.bus.read32(0x00CC_001E)
             var sawUnblkReq = false, sawDrvCmd = false, sawLevel1 = false
@@ -533,11 +560,11 @@ extension MusashiSuites {
             let acc1 = m.bus.read32(0x00CC_001E)
             #expect(!sawUnblkReq, "unblk_req ($2E2BFC) NEVER runs -- no reqblk is ever completed")
             #expect(!sawDrvCmd, "the OS Sony driver hardware layer ($46027A) NEVER runs -- the async read is never dispatched")
-            // Round-2 sharpening: the request is never even STARTED. It is queued
-            // (dskio returned success, disk_present=gooddisk) but never transitions
-            // active->in_service (SOURCE-HDISK START_NEW_REQUEST never runs it), so
-            // it certainly never completes.
-            #expect(!wentInService, "reqsrv_f never even reaches in_service -- the queued request is never started (START_NEW_REQUEST never runs)")
+            // The request is never even STARTED: reqsrv_f never leaves active. The
+            // reqblk is dispatched to the FS device's stub driver (above) which
+            // returns 0 without ever enqueuing it onto a real device queue, so no
+            // cur_num_requests / START / in_service transition ever happens.
+            #expect(!wentInService, "reqsrv_f never even reaches in_service -- the reqblk is dispatched to a stub driver that returns 0 without servicing it")
             #expect(!becameComplete, "reqsrv_f never reaches complete -- the request hangs")
             #expect(!a5Changed, "single-process STARTUP: A5 never changes (before SYS_PROC_INIT)")
             #expect(sawLevel1, "alive: the VIA1 T1 ms-tick keeps delivering to Level1 $5208A6")

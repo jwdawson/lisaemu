@@ -423,5 +423,97 @@ extension MusashiSuites {
             #expect(m.bus.floppy.blocksRead == 323,
                     "the OS read its remaining boot blocks (75 -> 323) before unmasking; got \(m.bus.floppy.blocksRead)")
         }
+
+        /// **M4 Task 4 — Checkpoint F: the event-wait DISSECTED; the OS blocks on
+        /// an event no modeled source posts (the honest boundary).** Checkpoint E
+        /// found the OS resting in a user-mode poll at `$4C0270`. This test pins
+        /// the *diagnosis* of that stop (docs/rom-trace-notes.md "Checkpoint F"):
+        ///
+        ///  - The loop polls an **event object** (heap) for its state byte to
+        ///    become `2`, read through a getter at `$2E2BE4` reached via the
+        ///    process's A5 jump table (`jsr ($7d4,A5)` -> stub `jmp $2E2BE4`).
+        ///  - The value `2` is written ONLY by the sibling setter method at
+        ///    `$2E2BFC` (`move.b #$2,($14,A3)`), which is **never executed** in
+        ///    any run: no timer alarm, no decoded input, and no co-process posts
+        ///    it. The OS runs **exactly one process** here — A5 never changes,
+        ///    the scheduler never context-switches.
+        ///  - The machine is provably ALIVE, not hung: the VIA1 T1 ms-tick keeps
+        ///    firing into `Level1` (`$5208A6`), driving the OS Timer Manager's
+        ///    software-timer accumulator at `$CC001E` upward every tick and
+        ///    re-arming its deadline `$CC0022` (a self-sustaining periodic timer).
+        ///    Injected keystrokes reach `Level2` (`$520A52`) and are fully decoded
+        ///    into the keyboard queue — the device layer works; the event simply
+        ///    never propagates to the waiting process.
+        ///
+        /// The producer is an OS event-dispatch / multiprocess post our
+        /// single-process execution never generates — a genuinely-new subsystem
+        /// boundary (M5), NOT a device/core divergence. We do NOT force the event
+        /// (that would fake progress). Addresses are deterministic on this fixed
+        /// ROM+disk+input path; the heap object pointer is DERIVED at runtime from
+        /// A5/A6 rather than hard-coded, and only the loaded-image code addresses
+        /// are pinned literally.
+        @Test func checkpointF_blockedOnAnUnpostedEvent() throws {
+            let m = try bootIntoLoader()
+            // Reach the resting loop top exactly ($4C0276), as Checkpoint E.
+            let lim0 = m.cycles + 30_000_000
+            while m.cycles < lim0 && !m.halted && !(0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]) { _ = m.step() }
+            var reachedLoop = false
+            for _ in 0..<6_000_000 where !m.halted {
+                if (0x004C_0270...0x004C_028F).contains(m.cpu[.pc]) { reachedLoop = true; break }
+                _ = m.step()
+            }
+            #expect(reachedLoop, "reached the user-mode event-wait loop $4C0270")
+            for _ in 0..<4000 where m.cpu[.pc] != 0x004C_0276 { _ = m.step() }
+            #expect(m.cpu[.pc] == 0x004C_0276, "positioned at the loop top $4C0276")
+
+            // The getter is reached via ($7d4,A5); its stub is a JMP to the getter
+            // body $2E2BE4 -- pin that identity (proves the polled-field getter).
+            let a5 = m.cpu[.a5]
+            let getterStub = a5 &+ 0x7d4
+            #expect(m.bus.read16(getterStub) == 0x4EF9, "getter stub is a JMP.L trampoline")
+            #expect(m.bus.read32(getterStub &+ 2) == 0x002E_2BE4,
+                    "getter stub targets the polled-field getter $2E2BE4; got \(String(format:"$%08X", m.bus.read32(getterStub &+ 2)))")
+            // The getter body reads a LONG from ($14,obj) -- the state field lives
+            // at object+$14 (the caller then compares its high byte to 2); the
+            // setter writes #$2 to that same field. Pin both via the disassembler.
+            let dis = Monitor(machine: m)
+            #expect(dis.disassembly(from: 0x002E_2BF0, count: 1).contains("move.l  ($14,A0), (A1)"),
+                    "getter body $2E2BF0 reads the state field at obj+$14")
+            #expect(dis.disassembly(from: 0x002E_2C12, count: 1).contains("move.b  #$2, (A4)"),
+                    "setter body $2E2C12 writes #$2 into the state field -- the only writer of state:=2")
+
+            // Derive the event object + state byte at runtime (heap-address-robust).
+            let objPtrCell = m.bus.read32(m.cpu[.a6] &+ 0x0a)   // = A0 after movea.l ($a,A6),A0
+            let obj = m.bus.read32(objPtrCell)                  // = the pushed object pointer
+            let stateAddr = obj &+ 0x14
+            #expect(m.bus.read8(stateAddr) != 2, "the event is UNposted at rest (state != 2)")
+
+            // Run a long window and prove: (1) the setter never runs, (2) the state
+            // never reaches 2, (3) A5 never changes (single process, no context
+            // switch), while (4) the machine is demonstrably alive -- the Level1
+            // ms-tick fires and the Timer Manager's accumulator $CC001E advances.
+            let a5Rest = m.cpu[.a5]
+            let acc0 = m.bus.read32(0x00CC_001E)
+            var sawSetter = false, sawLevel1 = false, a5Changed = false, statePosted = false
+            for _ in 0..<8_000_000 where !m.halted {
+                let pc = m.cpu[.pc]
+                if pc == 0x002E_2BFC { sawSetter = true }
+                if pc == 0x0052_08A6 { sawLevel1 = true }
+                if m.cpu[.a5] != a5Rest { a5Changed = true }
+                if m.bus.read8(stateAddr) == 2 { statePosted = true }
+                _ = m.step()
+            }
+            let acc1 = m.bus.read32(0x00CC_001E)
+            #expect(!sawSetter, "the setter $2E2BFC is NEVER executed -- nothing posts the event")
+            #expect(!statePosted, "the polled state byte never becomes 2 -- the event stays unposted")
+            #expect(!a5Changed, "the OS runs exactly one process -- A5 (its world) never changes, no context switch")
+            #expect(sawLevel1, "the machine is alive: the VIA1 T1 ms-tick keeps delivering to Level1 $5208A6")
+            #expect(acc1 != acc0,
+                    "the OS Timer Manager is alive: the ms-tick accumulator $CC001E advances (\(String(format:"$%08X", acc0)) -> \(String(format:"$%08X", acc1)))")
+            #expect(!m.halted, "no halt at the boundary")
+            #expect(m.bus.busErrorPulseCount == 0, "no bus error at the boundary")
+            #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE at Checkpoint F")
+            #expect(m.bus.floppy.blocksRead == 323, "no further floppy I/O -- the wait is not disk-bound; got \(m.bus.floppy.blocksRead)")
+        }
     }
 }

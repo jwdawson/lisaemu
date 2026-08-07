@@ -1878,3 +1878,118 @@ AND `Level2` (`$520A52`) handlers both entered (first live level-1 + level-2
 delivery), user mode reached, the `$4C0270` event-wait loop reached, `!halted`,
 `busErrorPulseCount==0`, `writeAttempts==0`, `blocksRead==323`. Robust
 invariants alongside the exact deterministic handler/loop anchors.
+
+## Checkpoint F (M4 Task 4) — the event-wait DISSECTED: the OS blocks on an event no modeled source posts
+
+Checkpoint E left the OS alive but idle in a user-mode poll at `$4C0270`,
+waiting for an in-RAM byte to become `2`. M4 Task 4 dissected that wait
+end-to-end (a scratch trace harness, since deleted; every claim below is
+reproducible from `ROMFloppyBootTests.checkpointF_blockedOnAnUnpostedEvent`).
+The finding: the OS is **alive and correct, blocked on an event that, on real
+hardware, another process or a device would post — and nothing in our
+single-process model ever does.** No emulation divergence was found to fix;
+this is the honest M5 boundary, not a bug, and forcing the event would be
+faking progress the plan forbids.
+
+### The wait, decoded
+
+The resting loop (segment `$4C`, the process's own Pascal code):
+
+```
+$4C0270 tst.b   (-$55c,A5)        ; global "event pending" flag -- 0 here
+$4C0274 bne     $4c028c
+$4C0276 movea.l ($a,A6),A0        ; A0 <- &objptr
+$4C027A move.l  (A0),-(A7)        ; push the event OBJECT pointer (heap; $CC5FCC this boot)
+$4C027C pea     (-$2a,A6)         ; &result local
+$4C0280 jsr     ($7d4,A5)         ; A5 jump-table slot -> stub $CC4BDC `jmp $2E2BE4` (a getter)
+$4C0284 cmpi.b  #$2,(-$2a,A6)     ; wait for the object's state byte to become 2
+$4C028A bne     $4c0276
+```
+
+- **Getter `$2E2BE4`** (`link; movea.l ($c,A6),A0; movea.l ($8,A6),A1;
+  move.l ($14,A0),(A1); unlk; …`): returns the LONG at **object+`$14`**; the
+  caller compares its high byte to `2`. So the polled cell is **the state byte
+  at object+`$14`** (`$CC5FE0` this boot), currently `0`.
+- **The only writer is the sibling method `$2E2BFC`**
+  (`movea.l ($a,A6),A3; lea ($14,A3),A4; cmpi.b #$2,(A4); beq …;
+  move.b #$2,(A4); … move.b [$16] xor 1 -> [$15]; tst.l (A3); …`). It sets
+  **object+`$14` := 2**, toggles a companion byte (`[$15]:=[$16] xor 1` — a
+  blink/heartbeat pair), and, if object+`0` is non-nil, signals via
+  `($c54,A5)`. It is reachable only through two low-RAM jump-table stubs
+  (`$0087FA`/`$0096E6`, both `jmp $2E2BFC`). **This setter is NEVER executed in
+  any run** — the event is never posted.
+
+### Why it is never posted (four hypotheses tested, all negative)
+
+- **Not a keyboard/mouse wait.** Injected mouse motion, a mouse click, and
+  keystrokes all reach `Level2` (`$520A52`), which **fully decodes** the
+  keystroke (keyboard-ID gate at `$CC02CE`, layout tables `$CC05D2`, keymaps
+  `$521DC2`/`$521E62`, auto-repeat timer re-armed) and queues it into the
+  keyboard buffers at `$CC05xx`. The device layer works; the decoded key does
+  **not** set object+`$14`. `state` stays `0` throughout.
+- **Not a timer alarm.** The VIA1 T1 ms-tick service (`$52098A`, called from
+  `Level1`) drives two software-time accumulators in segment `$CC`
+  (`$CC001A += $4E20` µs, `$CC001E += $14` per tick) and, when `$CC001E`
+  crosses deadline `$CC0022`, calls the **OS Timer Manager** (`$5209C8`): it
+  walks a 20-slot active-timer bitmap (`$CC0026`), fires expired callbacks via
+  `$CC0090[i]`, and re-arms the next deadline (`$52261A`/`$5225CC`). This
+  machinery is **healthy and self-sustaining** — a periodic timer (callback
+  `$521360`) fires and re-schedules itself forever — but it **never calls the
+  setter**; the waited-on object is not one of its timers.
+- **Not a disk/driver completion.** `blocksRead` stays `323`, `writeAttempts`
+  `0`; `Level1` polls the floppy completion line (`VIA2 PB4`, `$FCDD81` bit 4)
+  every tick and finds nothing pending. The wait is not disk-bound.
+- **Not a co-process either — because there is no second process.** Over tens
+  of millions of instructions the running world is fixed: **A5 never changes**
+  (`$CC4408` throughout), no context switch ever occurs, and only four address
+  regions execute — `$2E` (the getter), `$4C` (the loop), `$CC` (its data),
+  and `$52` (the kernel Level1/Level2 handlers). The OS runs **exactly one
+  process** here and it busy-waits without yielding (no `TRAP #2` /
+  `Enter_Scheduler`). The event object is registered in a low-RAM pointer table
+  at `$0354xx` (a chain of frame/return-address pairs all pointing back into
+  this same wait), consistent with an event/waiter descriptor.
+
+### The boundary (a documented STOP, not a bug)
+
+The producer that would set object+`$14` := 2 is an **OS event-dispatch /
+multiprocess post** — the raw keyboard/timer/disk layers all function, but the
+higher-level dispatch that turns a system condition into *this* process's event
+never runs, because the co-process (or interrupt-driven poster) that would run
+it is never scheduled in our one-process execution. Naming it precisely needs
+kernel symbols we do not have (all Linkmaps are Office-System *app* maps; every
+address here — `$4C0276`, `$2E2BE4`, `$CC5FCC` — stays anonymous, and none
+resolve, so no application has loaded). **This is M5's requirements:** the OS
+multiprocess/event-dispatch layer (the likeliest concrete trigger being a
+periodic COPS/RTC status interrupt our HLE does not emit, or a system process
+the boot should have launched). No device or core change is evidence-gated by
+this task — the correct action is to STOP here, documented, exactly as the plan
+directs.
+
+### OQ / writes / screen at Checkpoint F
+
+- **OQ1″: still OPEN, still not forced.** The single process runs in user mode
+  but supervisor execution and data both stay in domain 0; A5/context never
+  change, so no supervisor DATA access to a non-zero user domain occurs.
+  `Bus.translationDomain` untouched. Revisit when a second process runs in
+  domain 1+ (M5).
+- **Floppy writes: still NONE** (`writeAttempts == 0`). Session write-through
+  stays armed but unbuilt — the OS has issued no write at any checkpoint.
+- **COPS `$02` clock read: not observed**; the OS has not set the clock either
+  (`clockSetNibbles == []`). The COPS traffic here is the `$7C` mouse-int
+  enable plus the decoded keystroke stream.
+- **Screen: unchanged from Checkpoint E and frozen.** One rest screen only —
+  the ROM "STARTUP FROM" device window plus the OS busy/hourglass cursor
+  (`~/Development/LisaEmu-artifacts/m4-checkpoint-f-rest.png`, identical content
+  to `m4-checkpoint-e.png`, 78,181 set px). Injected input does not change it.
+
+### What the Checkpoint F test pins (`ROMFloppyBootTests`)
+
+`checkpointF_blockedOnAnUnpostedEvent` — reaches the `$4C0276` loop top, then:
+pins the getter identity (`($7d4,A5)` stub is `jmp $2E2BE4`; getter body reads
+obj+`$14`) and the setter identity (`$2E2C12` = `move.b #$2,(A4)`), **derives**
+the heap event object from A5/A6 at runtime (address-robust), and over an
+8M-instruction window asserts the diagnosis: the setter `$2E2BFC` never runs,
+the state byte never reaches `2`, **A5 never changes** (single process, no
+context switch), while the machine is provably ALIVE — `Level1` (`$5208A6`)
+keeps firing and the Timer Manager accumulator `$CC001E` advances — with no
+halt, no bus error, `writeAttempts == 0`, `blocksRead == 323`.

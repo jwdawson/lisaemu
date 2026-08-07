@@ -1622,10 +1622,12 @@ mechanism:**
   run: EXCEPASM saves `domvalue` ("*user's domain on sys call entry*") so the
   OS can act on the user's domain on syscall entry, hinting the kernel may
   read/write user buffers in domain N while supervisor (LDSN mechanism, or a
-  data-reference mode that DOES follow the latch). **OQ1″ (open, flagged for
+  data-reference mode that DOES follow the latch). ~~**OQ1″ (open, flagged for
   the first user-process milestone, M4/M5):** *does supervisor DATA access to a
   user domain follow the context latch?* No traced path exercises it; revisit
-  `translationDomain` then. (See the open-questions table below.)
+  `translationDomain` then.~~ **(ANSWERED — M4 Task 4 round 5: it forces
+  domain 0, captured live; see "Checkpoint G … OQ1″ — ANSWERED (round 5)" and
+  the updated open-questions table below.)**
 
 ### What the fix reveals — the loader loads the OS image; the OS's COPS driver
 
@@ -1708,7 +1710,7 @@ has forced either into scope.
 | **ProFile HLE** | Same low-core cell: `dev_type` never observed `= 1` (`dev_prof`) on any traced path. `docs/hardware-notes.md` §9's "ProFile interleave table" is transcribed as research only, never exercised. | None yet. |
 | **Soft power / Power menu** | No traced boot path (menu idle-wait, floppy boot, the OS loader through Checkpoint D) has been observed to issue a Power Command byte (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`, docs/hardware-notes.md §7). | `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`) already recognizes and logs every Power Command byte, regression-pinned by `COPSTests.powerCommandsAreLogged` — no shutdown/reboot/alarm semantics are modeled behind the log, by design, until M4 evidence demands them. |
 | **OS COPS command-send driver** (M3 Task 4 STOP) | The boot now reaches the OS's own COPS driver at `$520824` (sends `$7C`) and spins: our simplified COPS model drops CRDY on *every* register-15 write, but this driver re-writes register 15 each poll iteration (real hw: register 15 is *no-handshake* — stages without strobing the COPS; the `DDRA2 $00→$FF` transition is the real send). See "Kernel push (M3 Task 4)". | `Sources/LisaCore/COPS.swift` (`handleCommandWrite`) — needs a **DDRA2-gated CRDY handshake** + re-validation of the pinned ROM COPS path (menu FNV, POST presence probe, `COPSTests`, M1c input) before it can advance. |
-| **OQ1″ — supervisor DATA access to a user domain** (open) | `Bus.translationDomain` models `supervisor ⇒ domain 0` as unconditional, but only supervisor *execution* is proven (§1). EXCEPASM saves `domvalue` so the OS can act on the user's domain on syscall entry — the kernel may read/write user buffers in domain N while supervisor once processes run. No traced path exercises it. | `Sources/LisaCore/Bus.swift` `translationDomain` — revisit at the first user-process milestone (M4/M5). |
+| **OQ1″ — supervisor DATA access to a user domain** ~~(open)~~ **ANSWERED (M4 Task 4 round 5)** | ~~No traced path exercises it.~~ Captured live: ~1.02 M supervisor data accesses (kernel-stack writes, SYSGLOBAL/vector reads from ISRs) while the latch was 1, to segments domain 1 maps ABSENT — all resolved through domain 0, boot healthy to the installer UI. Syscall VAR write-backs happen in USER mode (Read_PMem trace), so supervisor stores into user-domain private memory do not arise. See "Checkpoint G … OQ1″ — ANSWERED (round 5)". | `Sources/LisaCore/Bus.swift` `translationDomain` — model CONFIRMED unconditional; residual falsifier (both-present-differing supervisor data access) documented there and in the OQ1″ section. |
 
 Wired the same way the plan's own precedent already established
 (`docs/hardware-notes.md` §7 "Soft Power Control" carries the mirrored
@@ -1741,7 +1743,7 @@ above (evidence + citations).
 |---|---|---|
 | **OQ1** | Does SLIM/SORG register programming target the CURRENT (active) domain, or an "inactive domain" per the original M1a hardware-notes transcription? | **ANSWERED** (M3 Task 2) — the CURRENT (active) domain, source-established (`initmmutil`/`do_an_mmu` both establish-then-program). The "inactive domain" reading is refuted; hardware-notes.md §1 carries the strike-through. See "OQ1 status" above. |
 | **OQ1′** | Checkpoint D's domain-1 crossover: how does `do_an_mmu`'s own code stay reachable the instant it switches the live context into an empty domain? | **RESOLVED** (M3 Task 4) — supervisor-mode code EXECUTION always translates through domain 0, regardless of the context latch; the latch only gates user-mode accesses. Implemented as `Bus.translationDomain`. Supersedes the Task 2 "per-domain vs. global segment presence" framing — it is neither, it is supervisor-vs-user. See "Kernel push (M3 Task 4)" above. |
-| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | **OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet (min SR stays `$2700`, no user processes run in M3). Flagged for the first user-process milestone (M4/M5); revisit `Bus.translationDomain` then. |
+| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | ~~**OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet.~~ **ANSWERED (M4 Task 4 round 5)** — forces domain 0, same as execution. Captured live at Checkpoint G: ~1.02 M supervisor data accesses (kernel-stack pushes, SYSGLOBAL + autovector reads inside ISRs) with the latch at 1 to segments domain 1 maps ABSENT, every one resolved via domain 0; a latch-following model could not survive the first interrupt during user execution (fatal-on-supervisor-fault rule, SOURCE-EXCEPRES:227-232). Residual falsifier (a both-present-differing supervisor data access) documented in "Checkpoint G … OQ1″ — ANSWERED (round 5)". |
 | **OQ2** | How does the ROM reach ROM/special space (segments 125-127) in translated mode — exact SLIM/SORG values? | **ANSWERED** (M1b Task 5) — seg 127 (prom) SLIM `$F00`/nibble `$F`; seg 126 (iospace) SLIM `$901`/nibble `$9`; seg 125 (screen) left absent at setup-drop. See "Answers to the Task 5 open questions" above. Unrelated to M3's MMU work; listed here only for a complete OQ roster at milestone close. |
 | **OQ3** | Does board-ID `$C031 == 0x00` send POST down a sane (non-error) path? | **ANSWERED** (M1b Task 5) — yes, the pre-Pepsi path, benign. See "Answers to the Task 5 open questions" above; unrelated to M3, listed for completeness. |
 
@@ -1865,11 +1867,10 @@ frontier.
 
 ### OQ statuses at Checkpoint E
 
-- **OQ1″ (supervisor DATA access to a user domain): still OPEN, not yet
-  forced.** User processes run (SR `$0000`) but `Bus.domain` stays **0**
-  throughout — no supervisor access to a non-zero domain has occurred yet.
-  `Bus.translationDomain` is untouched. Revisit when a process runs in domain
-  1+ and the kernel copies its buffers (M4 Task 4 / M5).
+- ~~**OQ1″ (supervisor DATA access to a user domain): still OPEN, not yet
+  forced.**~~ **(ANSWERED — M4 Task 4 round 5, see "Checkpoint G … OQ1″".)**
+  At Checkpoint E it was true that `Bus.domain` stayed **0** throughout and
+  no supervisor access to a non-zero domain had occurred yet.
 - **Floppy writes: still none observed** (`writeAttempts==0` everywhere through
   Checkpoint E). Session write-through stays armed but unbuilt, exactly as the
   plan's contingency prescribes — nothing to implement until the OS writes.
@@ -2209,20 +2210,54 @@ none dropped); `busErrorPulseCount` > 0 by design (re-anchoring the old
 "no bus error" pins — recoverable gate faults ARE the OS's normal operation
 from SYS_PROC_INIT onward).
 
-### OQ1″ — resolved by evidence (no Bus change needed)
+### OQ1″ — ANSWERED (round 5): supervisor DATA access captured, forced domain 0 confirmed
 
-The capture protocol armed since M3 fired this round: the boot now performs
-real context switches (first A5 change at the loader hand-off `$101D5A`;
-first user-mode domain-1 execution during SYS_PROC_INIT-spawned processes;
-supervisor code observed running with the latch at BOTH 0 and 1 — e.g. the
-syscall dispatch chain `$3C02xx → $2E01xx → $2E02xx` supervisor/latch-0, and
-`do_an_mmu` pivots latch 0↔1 under `SR=$27xx`). Under the M3 Task 4 model —
-`Bus.translationDomain` = **domain 0 whenever supervisor, latched domain
-otherwise** — the OS boots through multi-domain scheduling, syscalls,
-segment swap-ins, and the installer UI with zero anomalies. No
-`Bus.translationDomain` semantic change was needed; OQ1″ is ANSWERED by the
-live multi-domain boot (pinned by `checkpointG`'s `sawUserDomain1` +
-Level1/2 assertions).
+~~Round-4 wording: "OQ1″ is ANSWERED by the live multi-domain boot" (zero
+anomalies through the installer).~~ **(Round-5 review: overbroad as worded —
+that was no-counterexample evidence, not a captured access. The round-5
+bounded probe captured the events themselves; the strong form follows.)**
+
+A temporary (reverted) `Bus.access` hook logged every **supervisor-mode,
+translated (setup-OFF), non-fetch** access made **while the domain latch was
+non-zero** to a segment whose latched-domain register DIFFERS from domain
+0's, across the 10 M-instruction boot-to-installer window (the known
+do_an_mmu seg-84 window — OQ1′'s own already-documented case — and SLIM/SORG
+register-port traffic excluded). Captured, with one example each
+(PC/SR/latch/register pair):
+
+| seg | count | example | dom0 map | dom1 map |
+|---|---|---|---|---|
+| 101 (kernel supervisor STACK) | 792,987 | WRITE `$CBFF74`, PC `$A84066`, SR `$2104`, latch 1 | sorg `$E52` slim `$603` (stack) | **ABSENT** (`$C00`) |
+| 102 (SYSGLOBAL) | 175,265 | READ `$CC02A4`, PC `$520916` (Level1 ISR), SR `$2100`, latch 1 | sorg `$01E` slim `$7A0` (RW) | **ABSENT** |
+| 0 (vectors/low mem) | 28,572 | READ `$000064` (level-1 autovector), PC `$A84066`, SR `$2104`, latch 1 | sorg `$000` slim `$7FC` (RW) | **ABSENT** |
+| 103 (syslocal region) | 25,069 | READ `$CE004C`, PC `$2E01F4` (syscall dispatcher), SR `$2004`, latch 1 | sorg `$1A8` slim `$7FA` (RW) | **ABSENT** |
+| 41 (kernel code seg `$52xxxx`) | 2,138 | READ `$5204EC`, PC `$520460`, SR `$2000`, latch 1 | sorg `$009` slim `$5EB` (RO) | **ABSENT** |
+
+Plus 147,282 supervisor data accesses (latch ≠ 0) to segments mapped
+IDENTICALLY in both domains (domain-agnostic either way). **Every one of the
+~1.02 M differing-segment accesses — kernel-stack pushes, SYSGLOBAL reads
+from live ISRs, and the exception-VECTOR fetches themselves — hit a segment
+the latched domain maps ABSENT; under the forced-domain-0 model they all
+resolved to domain 0's mapping, and the OS runs to the installer.** If
+supervisor data access followed the latch, each would bus-error into an
+absent segment — and the OS treats any supervisor-context hardware exception
+as fatal (`superstack` → `e_hardsyscode`, SOURCE-EXCEPRES:227-232), so a
+latch-following machine could not survive its first interrupt during
+user-mode execution. OS-source expectation matches: kernel structures live
+only in domain 0's map (`initmmutil` LDASM:215 "domain 0, the OS domain");
+the `domvalue` save (SYSGLOBAL:137) serves the kernel's *bookkeeping* of the
+caller's domain, and syscall VAR write-backs into caller memory happen in
+**USER mode** (round-4 trace: the `Read_PMem` body executes with SR `$0004`),
+not via supervisor stores into user domains.
+
+**Residual falsifier (the one event class never observed):** a supervisor
+DATA access to a segment that BOTH domain 0 and the latched domain map as
+PRESENT but with DIFFERENT origins/limits — where forced-domain-0 silently
+picks one physical target over the other rather than faulting. No such
+access occurred in the probe window (the only both-present-differing traffic
+was SLIM/SORG register-port writes, which bypass translation by design). If
+one is ever observed misbehaving, `Bus.translationDomain` is the revisit
+point. Roster rows updated in place below (OQ1′ precedent).
 
 ### What the Checkpoint G test pins (`ROMFloppyBootTests`)
 

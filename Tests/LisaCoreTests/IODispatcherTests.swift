@@ -135,8 +135,10 @@ import Testing
     // bit7 set (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), and NOT
     // in [$A0,$DF] (SOURCE-STARTUP:1879-1885's iob_sony/iob_lite ranges) so
     // the decode falls through to the $FCC015 internal-disk check ->
-    // iob_pepsi (STARTUP:1886-1890). $88 satisfies the decode and is the
-    // 2/10's community-documented disk-ROM version byte.
+    // iob_pepsi (STARTUP:1886-1890). The specific byte $88 is derived from
+    // the decode (any bit7-set value outside [$A0,$DF] with bit5 clear
+    // works; the 6504 disk ROM itself is not in the source tree) -- see
+    // docs/hardware-notes.md "Board IDs".
     let bus = Bus(ramSize: 0x1000)
     #expect(bus.read8(0xFC_C031) == 0x88)
 }

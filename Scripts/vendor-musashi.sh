@@ -224,6 +224,15 @@ import sys
 cpath, hpath = sys.argv[1], sys.argv[2]
 
 # --- m68kcpu.c: globals ---
+# Idempotence note: 'm68ki_opcode_fetch_active' is the key for BOTH
+# m68kcpu.c sub-patches (the globals AND the execute-loop instrumentation)
+# -- a hypothetical half-applied file (globals present, loop untouched)
+# would be skipped wholesale here. That state is near-impossible in
+# practice: both sub-patches run in one pass below and each asserts its
+# anchor is unique before writing, so a failure aborts before the file is
+# written at all. Documented rather than defended (per M4 Task 4 round-5
+# review); if it ever occurs, delete the LisaEmu globals block from
+# m68kcpu.c and re-run this script.
 c = open(cpath).read()
 if 'm68ki_opcode_fetch_active' in c:
     print("vendor-musashi: m68kcpu.c round-4 globals already present")
@@ -329,6 +338,17 @@ h = h.replace(anchor, """\t/* LisaEmu fix (M4 Task 4 round 4): real-68000 jump-g
 \t\tuint frame_addr = m68ki_aerr_address;
 \t\tif(m68ki_opcode_fetch_active)
 \t\t{
+\t\t\t/* Edge (documented, accepted): REG_IR still holds the LAST
+\t\t\t * EXECUTED instruction. If an exception/interrupt dispatched
+\t\t\t * right after a completed jump form and the FIRST opcode fetch
+\t\t\t * of its handler faulted, that fetch would be misclassified as
+\t\t\t * the jump's own target prefetch (PC re-pointed at the old jump
+\t\t\t * site, a JSR's push wrongly undone). Unreachable on traced
+\t\t\t * Lisa paths: every exception/interrupt vector points into
+\t\t\t * resident kernel segments (vec dump at Checkpoint G --
+\t\t\t * $2E2xxx/$5208xx/$F80018/$4602xx), whose fetches cannot
+\t\t\t * fault; only the deliberate $A0xxxxxx gate targets do, and
+\t\t\t * those are always reached by the jump itself. */
 \t\t\tuint op = REG_IR;
 \t\t\tuint adj = 0, undo_push = 0, matched = 0;
 \t\t\tif(op == 0x4eb9)                 { adj = 6; undo_push = 1; matched = 1; } /* JSR (xxx).L */

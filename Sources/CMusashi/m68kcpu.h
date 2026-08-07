@@ -2030,6 +2030,17 @@ static inline void m68ki_exception_bus_error(void)
 		uint frame_addr = m68ki_aerr_address;
 		if(m68ki_opcode_fetch_active)
 		{
+			/* Edge (documented, accepted): REG_IR still holds the LAST
+			 * EXECUTED instruction. If an exception/interrupt dispatched
+			 * right after a completed jump form and the FIRST opcode fetch
+			 * of its handler faulted, that fetch would be misclassified as
+			 * the jump's own target prefetch (PC re-pointed at the old jump
+			 * site, a JSR's push wrongly undone). Unreachable on traced
+			 * Lisa paths: every exception/interrupt vector points into
+			 * resident kernel segments (vec dump at Checkpoint G --
+			 * $2E2xxx/$5208xx/$F80018/$4602xx), whose fetches cannot
+			 * fault; only the deliberate $A0xxxxxx gate targets do, and
+			 * those are always reached by the jump itself. */
 			uint op = REG_IR;
 			uint adj = 0, undo_push = 0, matched = 0;
 			if(op == 0x4eb9)                 { adj = 6; undo_push = 1; matched = 1; } /* JSR (xxx).L */

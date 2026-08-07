@@ -1317,9 +1317,19 @@ zone/track/sector/side:
   LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside `[$A0,$DF]`
   (iob_sony/iob_lite, STARTUP:1879-1885) — so with `$C015`=1 the decode
   falls through to the internal-disk check and lands `iomodel = iob_pepsi`
-  (Lisa 2/10, STARTUP:1886-1890). $88 is the 2/10's disk-ROM version byte.
-  With that identity, INIT_BOOT_CDS installs the REAL Sony CD driver from
-  the boot disk (see docs/rom-trace-notes.md "Checkpoint G (round 4)").)**
+  (Lisa 2/10, STARTUP:1886-1890). **Source for the specific `$88` byte
+  (round-5 precision): the decode derivation itself, not an external ident
+  table** — the 6504 disk ROM is not in this source tree ("Could Not Find"
+  #1 below), so no first-party citation for the exact real-hardware byte
+  exists here. Any value with bit7 SET (`BTST #7,DiskROMId`,
+  LIBHW-DRIVERS:581), bit5 CLEAR (`BTST #5`, LIBHW-DRIVERS:583 — not
+  LisaLite), and outside `[$A0,$DF]` (STARTUP:1879-1885) satisfies every
+  decode the ROM and the OS perform; `$88` is the chosen representative of
+  that class. If the real 2/10 ident byte is ever established from the 6504
+  firmware, swapping it in is a no-op as long as it stays in the same
+  decode class. With that identity, INIT_BOOT_CDS installs the REAL Sony CD
+  driver from the boot disk (see docs/rom-trace-notes.md "Checkpoint G
+  (round 4)").)**
 - **Task 4 update:** `$C015` now returns `1` (was `0xFF` unknown-I/O), per
   the line above. The `$C000-$C7FF` window (`FloppyController`, this
   section's shared-RAM cells) is now live RAM served by that device;

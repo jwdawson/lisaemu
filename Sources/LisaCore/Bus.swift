@@ -58,6 +58,20 @@ public final class Bus {
     /// affected: `slimSorgPortAccess` keeps writing to the raw latched
     /// `domain`, so the loader still builds domain 1's registers (for later
     /// user-mode execution) while running in domain-0 supervisor code.
+    ///
+    /// **OQ1″ ANSWERED (M4 Task 4 round 5): supervisor DATA access also
+    /// forces domain 0** -- no longer just inferred for execution. Captured
+    /// live on the boot-to-installer run: ~1.02 M supervisor data accesses
+    /// (kernel-stack pushes to seg 101, SYSGLOBAL/seg-102 and autovector/
+    /// seg-0 reads inside live ISRs) made while the latch was 1, to segments
+    /// domain 1 maps ABSENT -- all resolved through domain 0 and the OS runs;
+    /// a latch-following model would fault them, and any supervisor-context
+    /// fault is fatal to the OS (SOURCE-EXCEPRES:227-232). Residual
+    /// falsifier, never observed: a supervisor data access to a segment BOTH
+    /// domains map PRESENT but differently (forced domain 0 would silently
+    /// pick domain 0's physical target instead of faulting). If one is ever
+    /// caught misbehaving, this property is the revisit point. Full capture
+    /// table: docs/rom-trace-notes.md "Checkpoint G ... OQ1″ -- ANSWERED".
     private var translationDomain: Int {
         supervisorProvider() ? 0 : domain
     }

@@ -215,6 +215,56 @@ extension MusashiSuites {
             #expect(machine.bus.read32(sp &+ 2) == 0xA002_0000, "frame fault address = the popped tagged target")
         }
 
+        @Test func jmpIndirectGateFaultPushesJumpSitePlus2() {
+            // MOVEA.L #$A0020000,A0; JMP (A0) at $406 -- the OS decodes
+            // JMP (An) via its masked $D0 subcode (SOURCE-EXCEPASM:467-469)
+            // with the same PC-2 re-run adjustment as JMP.L.
+            let m = gateMachine(program: [0x20, 0x7C, 0xA0, 0x02, 0x00, 0x00,   // MOVEA.L #$A0020000,A0
+                                          0x4E, 0xD0])                          // JMP (A0)
+            let sp = m.cpu[.a7]
+            #expect(sp == 0x3000 - 14, "JMP has no stack side effect")
+            #expect(m.bus.read16(sp &+ 6) == 0x4ED0, "frame IR = JMP (An)")
+            #expect(m.bus.read32(sp &+ 10) == 0x408, "frame PC = JMP (An) address + 2")
+            #expect(m.bus.read32(sp &+ 2) == 0xA002_0000, "frame fault address = the full tagged target")
+        }
+
+        @Test func rteGateFaultPopsCommittedAndPushesRteSitePlus2() {
+            // RTE popping a seeded [user SR $0700][tagged PC $A0020000]
+            // frame -- the OS's "return into a swapped-out segment" path:
+            // its RTE case sets PCX := BADADDR (SOURCE-EXCEPASM:457-460),
+            // relying on the frame's fault address carrying the full popped
+            // target. The pop must be COMMITTED (mode switched to user, SSP
+            // risen past the popped frame) before the target fetch faults.
+            let machine = Machine(ramSize: 0x10000)
+            machine.bus.mmu.domains[0][0] = .make(originPage: 0, limitPages: 128, access: .readWrite)
+            machine.bus.write32(0x0, 0x2FFA)      // initial SSP -> the seeded RTE frame
+            machine.bus.write32(0x4, 0x400)
+            machine.bus.write32(0x8, 0x600)
+            machine.bus.write16(0x2FFA, 0x0700)        // popped SR: user mode, IRQs masked
+            machine.bus.write32(0x2FFC, 0xA002_0000)   // popped PC: the tagged gate target
+            machine.bus.load([
+                0x20, 0x7C, 0x00, 0x00, 0x28, 0x00,   // MOVEA.L #$2800,A0
+                0x4E, 0x60,                           // MOVE A0,USP
+                0x4E, 0x73,                           // RTE            (at $408)
+            ], at: 0x400)
+            machine.bus.load([0x60, 0xFE], at: 0x600)
+            machine.reset()
+            machine.bus._setSetupModeForTesting(false)
+            var steps = 0
+            while machine.cpu[.pc] != 0x600 && steps < 2000 && !machine.halted {
+                _ = machine.step(); steps += 1
+            }
+            let sp = machine.cpu[.a7]
+            // Pop committed: SSP rose to $3000 before the fault re-entered
+            // supervisor; the group-0 frame sits directly below it.
+            #expect(sp == 0x3000 - 14, "RTE pop committed -- frame below the popped SSP; sp=\(String(format:"$%04X", sp))")
+            #expect(machine.bus.read16(sp &+ 6) == 0x4E73, "frame IR = RTE")
+            #expect(machine.bus.read32(sp &+ 10) == 0x40A, "frame PC = RTE address + 2")
+            #expect(machine.bus.read32(sp &+ 2) == 0xA002_0000, "frame fault address = the popped tagged target (what the OS's PCX := BADADDR consumes)")
+            #expect(machine.bus.read16(sp &+ 8) & 0x2000 == 0, "frame SR = the POPPED (user) SR -- the fault happened after the mode switch")
+            #expect(machine.cpu[.usp] == 0x2800, "user SP untouched by the RTE gate fault")
+        }
+
         @Test func userModeJsrGateFaultLeavesUspUnpushed() {
             // Supervisor prologue drops to user mode (masked), then the
             // user-mode JSR gate faults -- the OS's actual syscall-gate shape.

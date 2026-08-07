@@ -195,8 +195,12 @@ final class IODispatcher {
         // stall. The Lisa 2/10 we model presents a Pepsi-class ID: bit7 set
         // (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside
         // [$A0,$DF] (iob_sony/iob_lite, STARTUP:1879-1885) -> with
-        // $FCC015=1 below, iomodel = iob_pepsi (STARTUP:1886-1890). $88 is
-        // the 2/10's disk-ROM version byte.
+        // $FCC015=1 below, iomodel = iob_pepsi (STARTUP:1886-1890). The
+        // specific byte $88 is derived from the decode, not an external
+        // ident table (the 6504 disk ROM is not in the source tree): any
+        // bit7-set value outside [$A0,$DF] with bit5 clear satisfies every
+        // decode the ROM and OS perform -- see docs/hardware-notes.md
+        // "Board IDs" for the full derivation statement.
         case 0xC031: return 0x88
         // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"):
         // 0=twiggy, 1=single-sided Sony, 2=double-sided Sony. Task 4 moves

@@ -645,6 +645,46 @@ docs/rom-trace-notes.md "POST completion (Task 7)").
 
 ## 5. Interrupts
 
+### 68000 group-0 bus-error frames — the OS's recoverable-fault engine (M4 Task 4 round 4)
+
+The Lisa OS's bus-error handler `BUS_ERR` (SOURCE-EXCEPASM:434-505) is a
+RECOVERY engine, not just an error trap: user-space code reaches swapped-out
+code segments and OS entry points through `$A0xxxxxx`-tagged jump-table
+gates whose fetch deliberately faults; `BUS_ERR` decodes the group-0
+frame's **instruction register** (frame+6, its `B1`/`B2` equates) and
+**fault address** (frame+2, `BADADDR`), then backs the frame **PC** up by
+an instruction-specific constant so the jump RE-RUNS after `CODE_CHK`/the
+memory manager swaps the target segment in:
+
+| frame IR | form | PC fix | side-effect expectation |
+|----------|------|--------|--------------------------|
+| `$4EB9` | JSR (xxx).L | PC−6 | return NOT yet pushed (re-run pushes once) |
+| `$4EA8`+reg | JSR d16(An) | PC−4 | return NOT yet pushed |
+| `$4E90`+reg | JSR (An) | PC−2 | return NOT yet pushed |
+| `$4EF9` / `$4ED0`+reg | JMP.L / JMP (An) | PC−2 | none |
+| `$4E75` | RTS | PC−2 | pop COMMITTED — handler un-pops (USP−4) |
+| `$4E73` | RTE | PC := BADADDR | pops committed |
+| `$4A`xx | TST (stack probe / `gentrap`'s `TST.W stkspace(A7)`) | PC−2 | stack growth via `Check_Stack` |
+| `$2211` | MOVE.L (A1),D1 | — | intrinsic-library data fault |
+
+Those constants encode real 68000 microcode order: a jump's **target
+prefetch happens inside the jump instruction**, before a JSR writes its
+return address and after an RTS pops it, and the pushed frame PC is the
+jump-site-relative value above (mid-instruction data faults push
+`instruction start + 2`). Stock Musashi diverges (it completes the jump
+and faults at the next loop-top opcode fetch with PC = target+2), which
+made every OS gate re-run push a SECOND return address — corrupting
+syscall parameter frames (observed live as fatal OS error 10201
+`e_hardsyscode`, source-EXCEPRIM:70). The vendored core is patched to push
+real-68000 frames for these cases (`m68ki_exception_bus_error`,
+Sources/CMusashi/m68kcpu.h; re-applied by Scripts/vendor-musashi.sh;
+pinned by Tests/LisaCoreTests/BusErrorFrameTests.swift). The frame's
+fault-address field carries the full unmasked 32-bit target for
+fetch faults — the `$A0` tag bits survive there (and in registers) even
+though the 24-bit address bus strips them before memory decode, which is
+exactly how the OS's gate scheme works on real hardware. See
+docs/rom-trace-notes.md "Checkpoint G (round 4)".
+
 ### Autovector Addresses
 
 Source: OS/SOURCE-INITRAP.TEXT.unix.txt:11-37
@@ -1077,6 +1117,22 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
 - **Sub-commands** (to `$03`, paired with excmd) — SONY.TEXT:51-59:
   readdisk=0, writedisk=1, unclamp=2, format=3, verify=4, formattrk=5,
   verifytrk=6, read_bf=7, write_bf=8 (Twiggy adds clampcmd=9 — twiggy:83).
+- **`writedisk` — session-scoped write-through (M4 Task 4 round 4;
+  supersedes the M2 "accepted and discarded" model).** The OS writes the
+  boot floppy during startup (the parameter-memory snapshot rewrite when PM
+  is bad but the MDDF snapshot is good — SOURCE-STARTUP:1140-1151
+  `INIT_WRITE_PM`/`rewrite_pm` — plus FS metadata), and its driver stages
+  the write exactly where reads land: `START_WRITE` (SOURCE-SONYASM:
+  300-380) packs the 12-byte tag onto DISKHDR's odd lane and the 512 data
+  bytes onto DISKHDR+24 = DISKDATA (`$400`) odd lane via `movep` stride 2 —
+  the mirror of FINISH_READ. `FloppyController.performWrite` captures that
+  block into an in-memory session overlay (keyed by DC42 block number)
+  which `performRead` consults before the backing image; the `.dc42`
+  image object and file are NEVER mutated, and `insert(_:)` clears the
+  overlay (fresh insertion = fresh session; `reset()` deliberately keeps it
+  — a warm reboot does not un-write real media). Counters: `writeAttempts`
+  (every issued writedisk) and `blocksWritten` (stored ones). Pinned by
+  `FloppyControllerTests` (`writedisk*`/`insertingAnImageClears*`).
 - **Completion:** interrupt-generating commands return immediately
   (`response := waitint`); completion arrives as a hardware interrupt
   (SONYASM:136-157).
@@ -1242,10 +1298,28 @@ zone/track/sector/side:
   iob_sony; `[$C0,$DF]` → iob_lite; else check `$FCC015` (adr_intdisk):
   0=twiggy, 1=single-sided Sony, 2=double-sided Sony (STARTUP:1747-1748)
   → iob_twiggy/iob_pepsi.
-- **Current emulator stubs:** `$C031`=0 (validated benign through the menu
+- ~~**Current emulator stubs:** `$C031`=0 (validated benign through the menu
   in M1b), `$C015` currently unknown-I/O `0xFF` → Task 4 sets `$C015`=1
   (single-sided, matches 400K install disks), Task 5 validates against the
-  boot path with trace evidence.
+  boot path with trace evidence.~~ **(Struck — M4 Task 4 round 4.
+  `$C031`=0 was benign FOR THE ROM (whose only gate is the bit-7 Pepsi
+  contrast tweak, framebuffer-neutral — menu FNV anchor unchanged), but the
+  OS decodes `$C031` as the MACHINE IDENTITY: `0x00` ≥ 0 signed →
+  `iomodel := iob_lisa` (Twiggy Lisa 1, STARTUP:1876-1878), which made
+  BOOT_IO_INIT skip the Lisa-2 config path and instead run
+  `MAKE_DISK_INFO(cd_twiggy,…)` for builtin positions 1/2 (STARTUP:
+  1970-1972) — installing devrecs "#14#1"/"#14#2" with `cb_addr := nil`
+  (SOURCE-CD:736) and `entry_pt := @TWIGIO` (SOURCE-CD:750), whose entire
+  I/O body is compiled out in OS 3.1 under `(*$IFC TWIGGYBUILD*)`
+  (source-twiggy:1235/1237 — the observed 3-instruction return-0 stub).
+  That was the entire Checkpoint-F orphaned-mount-read stall.
+  **`$C031` now returns `$88`** — bit7 set (Pepsi-class,
+  LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside `[$A0,$DF]`
+  (iob_sony/iob_lite, STARTUP:1879-1885) — so with `$C015`=1 the decode
+  falls through to the internal-disk check and lands `iomodel = iob_pepsi`
+  (Lisa 2/10, STARTUP:1886-1890). $88 is the 2/10's disk-ROM version byte.
+  With that identity, INIT_BOOT_CDS installs the REAL Sony CD driver from
+  the boot disk (see docs/rom-trace-notes.md "Checkpoint G (round 4)").)**
 - **Task 4 update:** `$C015` now returns `1` (was `0xFF` unknown-I/O), per
   the line above. The `$C000-$C7FF` window (`FloppyController`, this
   section's shared-RAM cells) is now live RAM served by that device;

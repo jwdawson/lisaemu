@@ -420,161 +420,99 @@ extension MusashiSuites {
             #expect(!m.halted, "the OS runs live -- no halt")
             #expect(m.bus.busErrorPulseCount == 0, "no bus error across the unmasking")
             #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE observed at Checkpoint E")
-            #expect(m.bus.floppy.blocksRead == 323,
-                    "the OS read its remaining boot blocks (75 -> 323) before unmasking; got \(m.bus.floppy.blocksRead)")
+            // M4 Task 4 round 4 re-anchor: 323 -> 344. With $FCC031 now
+            // presenting the Pepsi-class DiskROMId ($88), BOOT_IO_INIT's
+            // INIT_BOOT_CDS takes the real Lisa-2 config path BEFORE the
+            // unmasking: INIT_CONFIG reads the boot volume's MDDF PM-snapshot
+            // and FIND_CDDS/LOADEM read 'SYSTEM.CDD' + the Sony boot CD
+            // 'SYSTEM.CD_*' off the disk via the loader's synchronous reads
+            // (SOURCE-STARTUP:1103-1154, 1613-1663) -- 21 additional blocks.
+            #expect(m.bus.floppy.blocksRead == 344,
+                    "boot blocks (75 -> 323) + INIT_BOOT_CDS's SYSTEM.CDD/CD reads before unmasking; got \(m.bus.floppy.blocksRead)")
         }
 
-        /// **M4 Task 4 — Checkpoint F: the init-time DRIVER I/O-COMPLETION poll
-        /// (corrected diagnosis).** Checkpoint E found the OS resting in a poll at
-        /// `$4C0270`. This test pins what that poll actually IS
-        /// (docs/rom-trace-notes.md "Checkpoint F (CORRECTED)"):
+        /// **M4 Task 4 (round 4) — Checkpoint G: the Office System installer UI
+        /// draws.** Supersedes `checkpointF_blockedOnDriverIOCompletion`
+        /// (rounds 1-3), whose frontier -- the FS-mount read orphaned on a stub
+        /// driver devrec "#14#1" (nil `cb_addr`, `entry_pt` -> the compiled-out
+        /// TWIGIO body) -- is now ROOT-CAUSED and FIXED
+        /// (docs/rom-trace-notes.md "Checkpoint G (round 4)"):
         ///
-        ///  - The polled object is a **driver I/O request block** (`reqblk`,
-        ///    source-DRIVERDEFS:182-204): obj+`$4` = `pcb_chain.kind` =
-        ///    `reqblk_type(1)`, and the polled cell obj+`$14` is
-        ///    `reqstatus.reqsrv_f` (enum `active,in_service,complete = 0/1/2`), so
-        ///    the awaited `2` means **`complete`**. The getter `$2E2BE4` returns
-        ///    that field (reached via `jsr ($7d4,A5)` -> stub `jmp $2E2BE4`).
-        ///  - The sole writer `$2E2BFC` is **`unblk_req`** (source-asynctr:209-245:
-        ///    `reqsrv_f := complete; reqsuccess_f := not reqabt_f; …
-        ///    ALARMRELATIVE`), called from **device-completion ISRs**. It executes
-        ///    **0 times** anywhere in the boot — no reqblk is ever completed.
-        ///  - The request is an FS-mount **read** (`operatn`=1) of the boot
-        ///    volume's `fs_strt_blok` to the OS's own **Sony floppy driver**
-        ///    (segments `$46/$48`, code that pokes `$FCC000`/`$FCC180`). Its
-        ///    hardware layer (`$46027A`) never runs; the request is never
-        ///    dispatched. Every working read used the *synchronous* ROM routine
-        ///    `$FE1E0E` instead.
-        ///  - This is single-process `STARTUP`/`BOOT_IO_INIT` (SOURCE-STARTUP:
-        ///    2174-2184) BEFORE `SYS_PROC_INIT` — A5 never changes because no
-        ///    second process exists yet, not because of an event-dispatch
-        ///    boundary. The machine is provably ALIVE (`Level1` ms-tick fires; the
-        ///    Timer Manager accumulator `$CC001E` advances; kernel alarms fire).
+        ///  1. `$FCC031` (DiskROMId, LIBHW-DRIVERS:135) was a `0x00` stub, so
+        ///     BOOT_IO_INIT decoded our machine as a Twiggy Lisa 1
+        ///     (SOURCE-STARTUP:1876-1878) and installed the vestigial TWIGIO
+        ///     stub (SOURCE-CD:750; source-twiggy:1235/1237 -- body compiled
+        ///     out under `(*$IFC TWIGGYBUILD*)`) on the boot floppy devrecs.
+        ///     Fixed: `$C031` = `$88` (Pepsi-class) -> iomodel = iob_pepsi ->
+        ///     INIT_BOOT_CDS installs the REAL Sony CD driver from the disk.
+        ///  2. Floppy writes now happen (PM-snapshot rewrite, FS metadata):
+        ///     `FloppyController` stores them in a session-scoped in-memory
+        ///     overlay (never mutating the .dc42).
+        ///  3. The OS's recoverable-bus-error machinery (SOURCE-EXCEPASM
+        ///     :434-505 `BUS_ERR`) re-runs faulting JSR/JMP/RTS syscall and
+        ///     segment-swap gates by decoding the group-0 frame's IR + PC;
+        ///     Musashi's stock jump semantics (complete the jump, fault at the
+        ///     next fetch) corrupted a syscall parameter frame with a second
+        ///     return address (the fatal 10201 `e_hardsyscode`,
+        ///     source-EXCEPRIM:70). Fixed in the vendored core: target-prefetch
+        ///     faults now push real-68000 frames (see BusErrorFrameTests).
         ///
-        /// Frontier, ROUND-3 (traced instruction-by-instruction from reqblk
-        /// creation to the poll; docs/rom-trace-notes.md "Checkpoint F
-        /// (round-3)"). Still confirmed/true: our FloppyController answers
-        /// disk-presence CORRECTLY (DISKIN $FCC041 reads 1); the `(-$55c,A5)`
-        /// skip-wait flag is 0 so the wait is correctly taken; the machine is
-        /// alive. What round 3 CORRECTS (strike-not-erase): the earlier claim
-        /// that "the queued reqblk never transitions active->in_service via
-        /// SOURCE-HDISK START_NEW_REQUEST" is wrong -- that HDISK queue code
-        /// (cur_num_requests / START_NEW_REQUEST) never runs at all here, and
-        /// there is no `ADD_REQUEST` procedure in the source. The full linear
-        /// trace shows the reqblk is built (FS/mount code) then dispatched to its
-        /// device's `entry_pt`: the boot-volume FS devrec "#14#1" (cfigptr =
-        /// reqblk+$1A) has a NIL `cb_addr` and an `entry_pt` trampoline to a
-        /// 3-instruction driver body that just `clr.w`s its result and returns 0
-        /// WITHOUT queuing or issuing any I/O. So the async read is "accepted"
-        /// (status 0) and orphaned: no cur_num_requests, no START, no go-byte
-        /// ($46027A never runs), no completion ISR (unblk_req never runs);
-        /// reqsrv_f stays `active` forever. Refuted: co-process boundary,
-        /// unimplemented device, clock-ISR gap, disk-present gap, stale
-        /// cur_num_requests counter. Open M5 question: WHY device "#14#1" carries
-        /// a stub driver + nil control block here (a device-config / driver-attach
-        /// divergence). No evidence-gated fix reached; we do not fabricate
-        /// completion. Heap addresses are DERIVED at runtime; only loaded-image
-        /// code addresses are pinned literally.
-        @Test func checkpointF_blockedOnDriverIOCompletion() throws {
+        /// With all three in place the boot now runs: mount read COMPLETES
+        /// (`unblk_req` executes), SYS_PROC_INIT creates processes (A5
+        /// changes), the scheduler dispatches user-mode code in domain 1 (the
+        /// first non-zero-domain execution -- OQ1'' evidence: the forced
+        /// supervisor->domain-0 translation model HOLDS through live
+        /// multi-domain scheduling), dozens of $A0xxxxxx-tagged gate faults
+        /// are taken and recovered by design, and the **Lisa 7/7 Office
+        /// System 3.0 installer dialog draws** (Finished/Repair/Install/
+        /// Restore) -- the machine idles in the installer's event-wait loop
+        /// awaiting input. Screenshots:
+        /// ~/Development/LisaEmu-artifacts/m4-checkpoint-g-desktop-background.png
+        /// and m4-checkpoint-g-installer-ui.png.
+        @Test func checkpointG_officeSystemInstallerUIDraws() throws {
             let m = try bootIntoLoader()
-            // Reach the init-time I/O-completion poll top exactly ($4C0276).
-            let lim0 = m.cycles + 30_000_000
-            while m.cycles < lim0 && !m.halted && !(0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]) { _ = m.step() }
-            var reachedLoop = false
-            for _ in 0..<6_000_000 where !m.halted {
-                if (0x004C_0270...0x004C_028F).contains(m.cpu[.pc]) { reachedLoop = true; break }
-                _ = m.step()
-            }
-            #expect(reachedLoop, "reached the init-time driver I/O-completion poll $4C0270")
-            for _ in 0..<4000 where m.cpu[.pc] != 0x004C_0276 { _ = m.step() }
-            #expect(m.cpu[.pc] == 0x004C_0276, "positioned at the poll top $4C0276")
-
-            // The getter ($7d4,A5) stub is a JMP.L to the reqstatus getter $2E2BE4.
-            let a5 = m.cpu[.a5]
-            let getterStub = a5 &+ 0x7d4
-            #expect(m.bus.read16(getterStub) == 0x4EF9, "getter stub is a JMP.L trampoline")
-            #expect(m.bus.read32(getterStub &+ 2) == 0x002E_2BE4,
-                    "getter stub targets the reqstatus getter $2E2BE4; got \(String(format:"$%08X", m.bus.read32(getterStub &+ 2)))")
-            // Getter reads the LONG at reqblk+$14 (reqstatus.reqsrv_f); the writer
-            // $2E2BFC = unblk_req sets reqsrv_f := complete(2). Pin via disassembler.
-            let dis = Monitor(machine: m)
-            #expect(dis.disassembly(from: 0x002E_2BF0, count: 1).contains("move.l  ($14,A0), (A1)"),
-                    "getter body $2E2BF0 reads reqstatus at reqblk+$14")
-            #expect(dis.disassembly(from: 0x002E_2C12, count: 1).contains("move.b  #$2, (A4)"),
-                    "unblk_req body $2E2C12 writes reqsrv_f := complete(2)")
-
-            // Derive the reqblk at runtime (heap-address-robust) and confirm its
-            // identity from the OS record layout: kind=reqblk_type(1) at +$4,
-            // operatn=read(1) at +$18, reqsrv_f=active(0) not complete at +$14.
-            let objPtrCell = m.bus.read32(m.cpu[.a6] &+ 0x0a)   // = A0 after movea.l ($a,A6),A0
-            let reqblk = m.bus.read32(objPtrCell)               // = the pushed reqblk pointer
-            #expect(m.bus.read8(reqblk &+ 0x04) == 1,
-                    "reqblk pcb_chain.kind(+$4) == reqblk_type(1) -- confirms this is a request block")
-            #expect(m.bus.read8(reqblk &+ 0x18) == 1, "operatn(+$18) == read(1)")
-            let srvAddr = reqblk &+ 0x14
-            #expect(m.bus.read8(srvAddr) != 2, "reqsrv_f is not yet complete at rest (active)")
-
-            // ROUND-3 anchor (the real frontier, traced instruction-by-instruction
-            // from reqblk creation to the poll, docs/rom-trace-notes.md "Checkpoint
-            // F (round-3)"): the reqblk targets the boot-volume FS device
-            // (cfigptr = reqblk+$1A, devname "#14#1"), and that devrec has a NIL
-            // control block (cb_addr, devrec+$4 == 0) while its entry_pt
-            // (devrec+$0) is a JMP.L trampoline to a driver body that just returns
-            // 0 -- `clr.w (result)` -- WITHOUT queuing or issuing any I/O. So the
-            // async read is "accepted" (status 0) and then orphaned: no
-            // cur_num_requests accounting, no START, no go-byte, no completion ISR
-            // ever run for it. (Refutes the earlier "never reaches in_service via
-            // START_NEW_REQUEST" framing: that HDISK code never runs at all here.)
-            let cfigptr = m.bus.read32(reqblk &+ 0x1a)
-            #expect(m.bus.read32(cfigptr &+ 0x04) == 0,
-                    "the reqblk's target devrec has a NIL cb_addr (no control block) -- got \(String(format:"$%08X", m.bus.read32(cfigptr &+ 0x04)))")
-            let entryPt = m.bus.read32(cfigptr &+ 0x00)
-            #expect(m.bus.read16(entryPt) == 0x4EF9, "devrec.entry_pt is a JMP.L trampoline")
-            let driverBody = m.bus.read32(entryPt &+ 2)
-            let dis2 = Monitor(machine: m)
-            let bodyLine = dis2.disassembly(from: driverBody &+ 4, count: 1)
-            #expect(bodyLine.contains("clr.w") && bodyLine.contains("($c,A6)"),
-                    "the dispatched driver body just clears its result to 0 (returns without servicing); body+4 @ \(String(format:"$%08X", driverBody &+ 4)) = \(bodyLine)")
-
-            // Over a long window prove the mechanism: (1) unblk_req never runs (no
-            // completion), (2) the Sony driver's hardware command-issue never runs
-            // (request never issued), (3) reqsrv_f never even reaches in_service let
-            // alone complete (the request is never started), (4) A5 never changes
-            // (single-process STARTUP), while (5) the machine is alive -- Level1
-            // fires and $CC001E advances.
-            let a5Rest = m.cpu[.a5]
-            let acc0 = m.bus.read32(0x00CC_001E)
-            var sawUnblkReq = false, sawDrvCmd = false, sawLevel1 = false
-            var a5Changed = false, becameComplete = false, wentInService = false
-            for _ in 0..<8_000_000 where !m.halted {
+            let a5Boot = m.cpu[.a5]
+            var sawUnblkReq = false, a5Changed = false, sawUserDomain1 = false
+            var steps = 0
+            while steps < 10_000_000 && !m.halted {
                 let pc = m.cpu[.pc]
-                if pc == 0x002E_2BFC { sawUnblkReq = true }         // unblk_req
-                if pc == 0x0046_027A { sawDrvCmd = true }           // Sony driver hardware command-issue
-                if pc == 0x0052_08A6 { sawLevel1 = true }
-                if m.cpu[.a5] != a5Rest { a5Changed = true }
-                let srv = m.bus.read8(srvAddr)
-                if srv >= 1 { wentInService = true }                // active(0) -> in_service(1)/complete(2)
-                if srv == 2 { becameComplete = true }
-                _ = m.step()
+                if pc == 0x002E_2BFC { sawUnblkReq = true }
+                if m.cpu[.a5] != a5Boot { a5Changed = true }
+                if (UInt16(m.cpu[.sr]) & 0x2000) == 0 && m.bus.domain == 1 { sawUserDomain1 = true }
+                _ = m.step(); steps += 1
             }
-            let acc1 = m.bus.read32(0x00CC_001E)
-            #expect(!sawUnblkReq, "unblk_req ($2E2BFC) NEVER runs -- no reqblk is ever completed")
-            #expect(!sawDrvCmd, "the OS Sony driver hardware layer ($46027A) NEVER runs -- the async read is never dispatched")
-            // The request is never even STARTED: reqsrv_f never leaves active. The
-            // reqblk is dispatched to the FS device's stub driver (above) which
-            // returns 0 without ever enqueuing it onto a real device queue, so no
-            // cur_num_requests / START / in_service transition ever happens.
-            #expect(!wentInService, "reqsrv_f never even reaches in_service -- the reqblk is dispatched to a stub driver that returns 0 without servicing it")
-            #expect(!becameComplete, "reqsrv_f never reaches complete -- the request hangs")
-            #expect(!a5Changed, "single-process STARTUP: A5 never changes (before SYS_PROC_INIT)")
-            #expect(sawLevel1, "alive: the VIA1 T1 ms-tick keeps delivering to Level1 $5208A6")
-            #expect(acc1 != acc0,
-                    "alive: the ms-tick / Timer Manager accumulator $CC001E advances (\(String(format:"$%08X", acc0)) -> \(String(format:"$%08X", acc1)))")
-            #expect(!m.halted, "no halt at the boundary")
-            #expect(m.bus.busErrorPulseCount == 0, "no bus error at the boundary")
-            #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE at Checkpoint F")
-            #expect(m.bus.floppy.blocksRead == 323,
-                    "all reads used the synchronous ROM routine (248); the async reqblk read never dispatches; got \(m.bus.floppy.blocksRead)")
+
+            #expect(!m.halted, "the OS runs live through the whole window -- no halt, no double fault")
+            // The round-1/2/3 stall mechanism is gone: driver I/O completions run.
+            #expect(sawUnblkReq, "unblk_req ($2E2BFC) EXECUTES -- the FS-mount reqblk completes (rounds 1-3: it never ran)")
+            // Single-process STARTUP is over: SYS_PROC_INIT ran, processes exist.
+            #expect(a5Changed, "A5 changes -- SYS_PROC_INIT created processes and the scheduler dispatched them")
+            // OQ1'' -- first context switch into a non-zero domain, observed:
+            // user-mode execution with the domain latch = 1 (the supervisor->
+            // domain-0 forced translation model survives real multi-domain
+            // scheduling; docs/rom-trace-notes.md "Checkpoint G (round 4)").
+            #expect(sawUserDomain1, "user-mode code executes in domain 1 -- live multi-domain scheduling")
+            // Recoverable bus errors are the OS's DESIGN at this stage
+            // (SOURCE-EXCEPASM:434-505 gate re-runs) -- the old "no bus error"
+            // pin is re-anchored: pulses now occur and are all RECOVERED.
+            #expect(m.bus.busErrorPulseCount > 0, "the $A0xxxxxx segment/syscall gate faults fire and are recovered by design")
+            // Session write-through: the OS writes the boot floppy (PM
+            // snapshot, FS metadata) and every write is stored in the
+            // in-memory overlay -- none dropped, the .dc42 never mutated.
+            #expect(m.bus.floppy.writeAttempts > 0, "the OS writes the boot floppy at Checkpoint G")
+            #expect(m.bus.floppy.blocksWritten == m.bus.floppy.writeAttempts,
+                    "every writedisk stored in the session overlay; \(m.bus.floppy.blocksWritten)/\(m.bus.floppy.writeAttempts)")
+            #expect(m.bus.floppy.blocksRead >= 600,
+                    "the OS keeps reading (segment swap-ins, installer resources); got \(m.bus.floppy.blocksRead)")
+
+            // THE ANCHOR: the Lisa 7/7 Office System 3.0 installer dialog is
+            // on screen (Finished/Repair/Install/Restore), stable across the
+            // idle event-wait loop.
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fnv1a(fb) == 0x04a1_9e4e_b597_04f4,
+                    "installer-dialog framebuffer FNV; got \(String(format: "0x%016llx", fnv1a(fb)))")
+            #expect(fb.reduce(0) { $0 + $1.nonzeroBitCount } == 60107,
+                    "installer-dialog set-pixel count; got \(fb.reduce(0) { $0 + $1.nonzeroBitCount })")
         }
     }
 }

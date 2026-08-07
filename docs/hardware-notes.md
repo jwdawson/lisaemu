@@ -1142,6 +1142,19 @@ zone/track/sector/side:
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
 - **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
+  **Round-2 (M4 Task 4) live confirmation — our HLE answers this correctly.**
+  ISDISKIN does `MOVE.B DISKIN(A2),D0; MOVE D0,RESPONSE(A3)` (read window `$41`,
+  return it); hdinit sets `disk_present:=gooddisk` when `response<>0`
+  (SONY.TEXT:629-636). `FloppyController.insert()` sets `window[$41]=1` and
+  `$FCC041` routes to `floppy.read(0x41)` (IODispatcher `$C000…$C7FF`), so a
+  live boot reads `1`, and the OS's `dskio` returns SUCCESS
+  (`disk_present`=`gooddisk`, verified: the caller's `$4C026C tst.w/bgt` falls
+  through to the wait, not the `nodiskpres`=614 error path). The OS's boot-time
+  I/O-completion hang (Checkpoint F) is therefore **NOT** a disk-presence HLE
+  gap — it is the OS's own async request-START path (SOURCE-HDISK
+  `ADD_REQUEST`/`START_NEW_REQUEST`) never flipping the queued reqblk
+  `active`→`in_service`. See docs/rom-trace-notes.md "Checkpoint F (round-2
+  sharpening)".
 - **disk_control idle bit — AMBIGUITY (b) — SETTLED (Task 5, boot-ROM
   disassembly).** The Rev H boot ROM polls **bit 6 of `$FCD901`**, ~~not
   `$FCD801`~~. Its handshake/ready wait (`$FE1E04`, called after every go-byte)

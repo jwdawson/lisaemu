@@ -1970,16 +1970,59 @@ armed) at this pre-multiprocessing stage, so no completion ISR ever calls
 
 **Corrected boundary (M5 frontier):** the OS's **async driver request-dispatch
 path** for the boot-volume FS-mount read does not function under our emulation
-during single-process `BOOT_IO_INIT` — the Sony driver's servicing alarm is
-never armed, the read is never issued to `$FCC000`, and `reqsrv_f` stays
+during single-process `BOOT_IO_INIT` — ~~the Sony driver's servicing alarm is
+never armed,~~ the read is never issued to `$FCC000`, and `reqsrv_f` stays
 `active` forever. The synchronous ROM-routine read path works (248 reads); the
-async OS-driver path does not. Identifying *why* the driver's alarm is not armed
-when `DEV_IO` enqueues the request (a driver-model / request-dispatch divergence
-— e.g., a device/parameter-memory state the driver checks before arming, or the
-`(-$55c,A5)` "skip-wait" mode flag the loop tests at `$4C0270` that is `0` here)
-is the M5 fix target. No evidence-gated device/core fix was reached this task:
-the two first-round-plausible fixes (clock-ISR alarm expiry; an unimplemented
-device) are both refuted, and fabricating completion would be faking progress.
+async OS-driver path does not. ~~Identifying *why* the driver's alarm is not
+armed when `DEV_IO` enqueues the request (a driver-model / request-dispatch
+divergence — e.g., a device/parameter-memory state the driver checks before
+arming, or the `(-$55c,A5)` "skip-wait" mode flag the loop tests at `$4C0270`
+that is `0` here) is the M5 fix target.~~ **(Struck — the two candidates in that
+clause are RESOLVED in round-2 sharpening below; both are refuted.)** No
+evidence-gated device/core fix was reached this task: the two first-round-
+plausible fixes (clock-ISR alarm expiry; an unimplemented device) are both
+refuted, and fabricating completion would be faking progress.
+
+### Checkpoint F (round-2 sharpening) — the request is never STARTED, and disk-presence is answered correctly
+
+M4 Task 4 fix round 2 traced the reqblk's life directly (live, from OS start to
+the poll) and SHARPENS the frontier, resolving both round-1 candidates:
+
+- **The OS Sony driver DOES run and BUILDS the reqblk.** Creation traced to
+  `$460472` (segment `$46`, the OS Sony driver). So "the driver segments never
+  execute" is too strong — the request-BUILD code runs; it is specifically the
+  **hardware go-byte issue (`$46027A`, `START_RWTS`) that never runs.**
+- **`dskio` returns SUCCESS — `disk_present`=`gooddisk`, NOT `nodiskpres`.** The
+  caller's post-driver check `$4C026C: tst.w (A0); bgt $4C02E2` falls THROUGH to
+  the wait (returned status `0`, not the positive `nodiskpres`=614=`$266`; a
+  `>0` error would branch to `$4C02E2`). Per SOURCE-SONY:664-675 `dskio` returns
+  `nodiskpres` only `if disk_present = nodisk`; since it returned success,
+  `disk_present`=`gooddisk`.
+- **Our FloppyController HLE answers disk-presence CORRECTLY.** The OS learns
+  presence via `isdiskin` (SOURCE-SONYASM:437-440: `MOVE.B DISKIN(A2),D0` =
+  read window `$41`, `MOVE D0,RESPONSE(A3)`); hdinit sets `disk_present:=gooddisk`
+  when `response<>0` (SOURCE-SONY:629-636). `insert()` sets `window[$41]=1` and
+  `$FCC041` routes to `floppy.read(0x41)` (IODispatcher `0xC000...0xC7FF`), and
+  the one live DISKIN read in the whole boot returns `1`. **So round-1
+  candidate (a) "our HLE answers the disk-present query wrongly" is REFUTED by
+  direct evidence — the OS never even mis-reads presence.**
+- **The `(-$55c,A5)` "skip-wait" flag is `0`, so the wait is CORRECTLY taken**
+  (`$4C0270: tst.b (-$55c,A5)`). Refutes round-1 candidate (b).
+- **The true gap: the queued reqblk never transitions `active`→`in_service`.**
+  Verified live: over a 12 M-instruction window at rest, `reqsrv_f` (`reqblk`+
+  `$14`) never exceeds `active(0)` — it never reaches `in_service(1)`, let alone
+  `complete(2)`. Per SOURCE-HDISK:675-679 `ADD_REQUEST` starts a request only via
+  `if cur_num_requests = 1 then START_NEW_REQUEST`, and `START_NEW_REQUEST`
+  (SOURCE-HDISK:414-485) is what flips `reqsrv_f := in_service` (line 443) and
+  calls `START_DISK`→`CALLDRIVER` (line 386-410) to issue the go-byte. Because
+  the request never leaves `active`, `START_NEW_REQUEST`/`START_DISK` never
+  effectively start it, `$46027A` never runs, and no completion ISR ever calls
+  `unblk_req`. **The M5 fix target is thus the async request-START mechanism
+  (`ADD_REQUEST`/`START_NEW_REQUEST` and the driver's device-busy/`cur_num_requests`
+  accounting), not a device-register HLE answer.** No evidence-gated fix was
+  reached: the boundary is genuine OS driver-model dispatch logic reached during
+  pre-multiprocessing `BOOT_IO_INIT`, and no single device-HLE query is answered
+  wrongly (the one that mattered — disk-presence — is answered right).
 
 ### OQ / writes / screen at Checkpoint F (unchanged, re-confirmed)
 
@@ -2000,7 +2043,10 @@ reqblk's `reqstatus` field (obj+`$14`), the setter `$2E2BFC` (`unblk_req`) write
 `complete`=2; the reqblk is derived at runtime and confirmed (`kind=reqblk_type`
 at +`$4`, `operatn=read`). Over an 8 M-instruction window it asserts the
 mechanism: `unblk_req` (`$2E2BFC`) never runs, the OS Sony driver's hardware
-command-issue (`$46027A`) never runs, the state stays `active` (≠ complete), A5
-never changes (single-process STARTUP), while the machine is provably alive —
-`Level1` (`$5208A6`) fires and the Timer Manager accumulator `$CC001E` advances
-— with no halt, no bus error, `writeAttempts == 0`, `blocksRead == 323`.
+command-issue (`$46027A`) never runs, the state **never even reaches
+`in_service`** (round-2 sharpening: `reqsrv_f` never leaves `active` — the
+request is never STARTED, not merely never completed) and so never reaches
+`complete`, A5 never changes (single-process STARTUP), while the machine is
+provably alive — `Level1` (`$5208A6`) fires and the Timer Manager accumulator
+`$CC001E` advances — with no halt, no bus error, `writeAttempts == 0`,
+`blocksRead == 323`.

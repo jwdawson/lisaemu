@@ -149,12 +149,24 @@ The same `--insert-disk`/`--auto-screenshot` launch arguments from M2 still
 work exactly the same way (`docs/m2-demo.md` §4 has the full walkthrough —
 inserting via ⌘I / drag-and-drop, clicking "STARTUP FROM…", the disk-activity
 indicator flashing as blocks are read). Nothing about the app's UI changed
-this milestone: `--insert-disk` only attaches the floppy image, it does not
-also drive the "STARTUP FROM…" menu click, and even when that click *is*
-driven (by the test harness, not the app), the OS frontier reached this
-milestone still draws nothing new to the screen — the boot menu is the only
-thing ever on the glass. The screenshot captured for this milestone
-(`~/Development/LisaEmu-artifacts/m3-boot-progress.png`, captured via):
+this milestone. The integration test is the automated reproduction vehicle for
+the M3 frontier; in the app itself, you reach it by clicking through the boot
+menu (File > Insert Disk, then click the on-screen STARTUP FROM button, then
+click a device). When you do, the real boot sequence drives: the ROM's Sony
+loader reads block 0, the OS loader runs from RAM, and the disk indicator
+flashes repeatedly (~51 more blocks read) as the loader fills the OS image
+into memory. Then control enters the loaded OS code itself at `$520000`, and
+the OS's own COPS driver sends a command to the keyboard controller — and
+spins there forever, unresponsive, the status bar showing "running" (not a
+hang, not a crash; the OS is at `$520842-$52084E` in its own COPS driver,
+waiting for a handshake our simplified model doesn't provide the same way).
+The screen stays frozen on the boot menu the entire time — nothing in the
+loader or the OS's COPS driver draws before hitting that gate, so there are
+no new pixels to see. This frozen state is the M3/M4 documented boundary, not
+a bug; closing it for M4 means modeling the real COPS handshake more
+faithfully and re-checking the ROM's own usage stays identical.
+
+The screenshot captured for this milestone (`~/Development/LisaEmu-artifacts/m3-boot-progress.png`, captured via):
 
 ```
 LisaApp.app/Contents/MacOS/LisaApp \

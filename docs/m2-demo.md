@@ -120,7 +120,7 @@ Task 7's manual checkpoint (`--insert-disk … --auto-screenshot
 captures exactly this: the boot-menu screen, disk inserted. Stated honestly,
 not as a bug -- `--insert-disk` only attaches the image; it does not also
 drive the STARTUP FROM click sequence, and the loader itself (once driven)
-draws nothing new anyway. See task-7-report.md for the captured PNG's
+draws nothing new anyway. See task-7-report.md (local SDD artifact, not committed) for the captured PNG's
 dimensions/content confirmation.
 
 ## 4. In the app — insert, boot, and watch it live (M2 Task 7)

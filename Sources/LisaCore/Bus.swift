@@ -325,10 +325,10 @@ public final class Bus {
     /// semantics preserved exactly):
     ///   - `.memory(p)`: RAM, UNLESS `p` itself falls in the ROM window. This
     ///     check is dead code today and intentionally so: `MMU.translate`'s
-    ///     `.memory` formula is `(sorg & 0xFFF) << 9 + offsetInSegment`, and
-    ///     SORG is a hardware 12-bit register, so the highest physical
-    ///     address `.memory` can ever produce is ~0x21FDFF (~2.2MB) --
-    ///     nowhere near `$FE0000` (~16.6MB). It is kept only because the
+    ///     `.memory` formula is `((sorg << 9) + offsetInSegment) & 0x1F_FFFF`, with
+    ///     the 12-bit page-add wrap applied before the offset is added (Task 1), so
+    ///     the highest physical address `.memory` can ever produce is 0x1FFFFF
+    ///     (~2MB) -- nowhere near `$FE0000` (~16.6MB). It is kept only because the
     ///     design note calls for it ("for simplicity detect ROM by final
     ///     physical address range") and it's a harmless, cheap guard.
     ///   - `.io(offset)`: `IODispatcher` -- the real IOSpace ($FC0000-
@@ -388,6 +388,8 @@ public final class Bus {
             // every POST setup-mode access -- which runs before any segment is
             // programmed -- still falls through to flat exactly as before; only
             // code running from an already-mapped segment (the loader) changes.
+            // Note: this branch honors `.memory` only; `.io`/`.special`/readOnly-write
+            // cases fall through to flat RAM (benign for all traced paths; see M3 final review).
             if case .memory(let p) = mmu.translate(
                 a, domain: translationDomain, isSupervisor: supervisorProvider(), isWrite: isWrite) {
                 return ramAccess(address, Int(p), isWrite: isWrite, value: value)

@@ -1486,6 +1486,8 @@ segment) — so the in-handler instruction fetch finds seg-84 unmapped in domain
 1; the CPU tries to take the fault, the exception-vector read (`$0C-$0F`, logical
 `$0F`) *also* finds domain-1 seg-0 unmapped, and it **double-faults to a halt**.
 
+> **Status update (M3 Task 4):** This multi-domain halt was the Checkpoint-D frontier until the supervisor-domain-0 resolution (see "Kernel push (M3 Task 4)" below). The crossover now survives and reaches the loaded OS code.
+
 This is a genuine **multi-domain-bootstrap boundary**, and it is exactly the
 long-carried **OQ1** forcing point ("the Pascal segment loader mapping many
 segments … if it switches domains, capture EVERYTHING"). The evidence pins the
@@ -1516,6 +1518,8 @@ shape precisely:
   **Parked as the Checkpoint-D frontier / OQ1 (still open, but now FORCED and
   characterised with live evidence, not merely predicted).**
 
+> **Status update (M3 Task 4):** This open question was resolved by the supervisor-domain-0 mechanism below. The Checkpoint-D halt no longer occurs; the frontier has moved to the OS's own COPS driver (see "Kernel push (M3 Task 4)" below).
+
 ### OQ1 status
 
 **ANSWERED (active/current domain), with a precisely-renamed successor open
@@ -1530,6 +1534,8 @@ current-domain `MMU.translate`/`slimSorgPortAccess` model matches. (See the
 hardware-notes.md §1 "Setup Latch" strike-through: the original M1a "inactive
 domain" transcription is refuted — it most likely conflated *registers staged
 until setup-off* with *a different domain*.)
+
+> **Status update (M3 Task 4):** OQ1′ (the multi-domain segment presence question) remains open for future investigation. The supervisor-domain-0 resolution (see "Kernel push (M3 Task 4)" below) unblocked the immediate Checkpoint-D halt, moving the frontier forward to the OS's own COPS driver.
 
 **Renamed successor open question (OQ1′ — the Checkpoint-D crossover):**
 *per-domain vs. global segment presence.* Checkpoint D is the first path that

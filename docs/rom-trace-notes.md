@@ -1742,3 +1742,139 @@ above (evidence + citations).
 The M3 Task 3 deferrals table above (Widget HD, ProFile, soft power/Power
 menu, the OS COPS driver, and OQ1″) is this document's live record of what
 M3 consciously left for M4; nothing in that table was silently dropped.
+
+## Checkpoint E (M4 Task 3) — THE UNMASKING: live interrupts and the OS comes alive
+
+M4 Task 1 opened the OS↔COPS handshake; M4 Task 2 gave `lisadbg` a `bootdisk`
+harness. This checkpoint follows the OS from the un-frozen COPS driver through
+`DriverInit`/`INITSYS` to **the first live interrupt delivery in the emulator's
+history**, and finds the OS running its scheduler in user mode. One real
+emulation divergence was found and fixed (an inverted `$F801` bit-2 polarity
+that stormed the OS's level-1 interrupt handler), root-caused against the OS
+assembly source before being patched.
+
+### What the OS does after the COPS driver (LIBHW-DRIVERS `DriverInit`)
+
+The loaded OS at `$520000` runs `DriverInit` (LIBHW-DRIVERS:493) then `INITSYS`.
+`DriverInit` programs the hardware the way the source prescribes and our model
+answers:
+
+- **VIA1 T1 = the millisecond tick.** `DriverInit` picks the T1 reload from the
+  board ID (LIBHW-DRIVERS:578-588): pre-Pepsi `$27CA`, post-Pepsi `$637B`.
+  `DiskROMId` bit 7 selects; our board reports pre-Pepsi (`$C031==0`, OQ3), so
+  the OS writes **`LCounterInit=$CA` / `HCounterInit=$27`** (the pre-Pepsi
+  values) — confirmed live. It sets `ACR1=$48`, enables T1 via `IER1=$C0`, and
+  installs `Level1` at vector `$0064`.
+- **Level-2 COPS.** `DDRA2=$00` (port A input), `PCR2=$C9`, `ACR2=$01`,
+  `IER2=$82` (enable COPS), then `COPSCMD` sends **`$7C`** ("enable mouse
+  interrupts", the very command M4 Task 1's handshake fix let complete), and
+  installs `Level2` at vector `$0068`.
+
+### The divergence — `$F801` bit-2 vsync polarity was inverted (interrupt storm)
+
+The instant the OS lowers SR below `$2700`, its `Level1` handler
+(`$5208A6`, LIBHW-DRIVERS:895) runs. Its first act:
+
+```
+Level1  MOVEM.L A0/D0,-(SP)
+        BTST    #2,StatusRegister+1   ; $FCF801 bit 2 — vertical retrace?
+        BNE.S   @0                    ; "branch if NOT vertical retrace"
+        JSR     VertRetrace           ; else service + ack it
+```
+
+`BNE` taken means bit 2 ≠ 0 ⇒ *not* retrace; so **bit 2 == 0 is the OS's
+"retrace pending" encoding** (active-LOW), and only then does it call
+`VertRetrace`, whose tail writes `$E018` (VertReset) to acknowledge. Our model
+exposed the bit **active-HIGH** (`pending ? 0x04 : 0`), so the handler read
+bit2=1 as "no retrace", never called `VertRetrace`, never acked — while
+`Machine.vsyncPending` (a real level-1 source) stayed asserted. The moment SR
+dropped, the CPU took a level-1 interrupt, `Level1` found "nothing to do",
+`rte`'d, and **immediately re-entered** because the vsync line was still high:
+a permanent interrupt storm, PC pinned in the `$5208xx` handler, no main-code
+progress. (Traced live: `vsyncPending=true`, `F801=$04`, the handler cleanly
+`rte`-ing and re-entering `$5208A6` every iteration.)
+
+**Fix** (`IODispatcher.currentValue`, `case 0xF801`): expose bit 2 active-low —
+`(statusByte & ~0x04) | (pending ? 0 : 0x04)`. Now a pending retrace reads
+bit2=0, `Level1` calls `VertRetrace`, `$E018` clears `vsyncPending`, and the
+level-1 line drops. This is *more* faithful to the ROM too: the ROM's own
+vsync self-test (`$FE0BA2`, "Trace checkpoint B" above) clears via `$E018` then
+waits for bit 2 to read 0 as "the next retrace arrived" — active-low. The ROM
+tolerated the old polarity only because that self-test is soft-fail either way;
+**every ROM anchor (menu FNV `0xd09234d25516d0b8`/78,100 px, POST, floppy boot
+through the COPS driver) is unmoved by the fix**, confirmed by the full suite.
+hardware-notes.md §2/§5 carry the corrected polarity (strike-not-erase).
+
+### The first live interrupts — verified against the OS's handlers
+
+With the storm gone, SR unmasks at `$5208A6` (`$2700 → $2100`) and the
+emulator delivers its first interrupts, straight into the OS's own handlers:
+
+- **Level 2 (COPS/VIA2)** first: vectored to **`Level2` @ `$520A52`** (SR
+  `$2004 → $2200`). The initial COPS packets (the `$7C` ack / power-on stream)
+  are consumed here.
+- **Level 1 (VIA1 T1 ms-tick / vertical retrace)**: vectored to **`Level1` @
+  `$5208A6`** (SR `→ $21xx`), servicing `VertRetrace` (`ScrnFrames`,
+  cursor tracking) and `Timer1` each tick.
+
+Both autovectors match the addresses `DriverInit` installs at `$0064`/`$0068`.
+The M1b-era "interrupt-delivered floppy completion never exercised" item is now
+partially retired: `Level1` polls the Twiggy/disk completion lines (`VIA2 PB4`,
+`VIA1 IFR`) on every tick under live interrupts — though no disk *completion*
+interrupt fires at this checkpoint (the OS issues no new disk command here).
+
+### Where it rests — the OS scheduler idles in a user-mode event-wait (the STOP)
+
+Freed from the storm, the OS runs its scheduler across **eleven loaded code
+segments** (`$22/$24/$26/$28/$2E/$3C/$3E/$46/$48/$4C/$CC xxxx`) and drops to
+**user mode (SR `$0000`)** — its first processes are running. It then settles
+into a steady **user-mode event-wait loop** at `$4C0276`:
+
+```
+$4C0276 movea.l ($a,A6),A0
+$4C027A move.l  (A0),-(A7)
+$4C027C pea     (-$2a,A6)
+$4C0280 jsr     ($7d4,A5)     ; getter -> $2E2BE4: reads a field, returns
+$4C0284 cmpi.b  #$2,(-$2a,A6) ; wait for an in-RAM state byte to become 2
+$4C028A bne     $4c0276
+```
+
+This loop touches **no hardware** — it polls an in-RAM state field for the
+value `2`; the only live I/O in the whole resting steady-state is the ms-tick
+`Level1` handler. Over ~1.77 billion cycles (~350 s emulated) nothing changes:
+`blocksRead` stays 323, `writeAttempts` 0, `mmuPortWrites` ~5508, the screen
+frozen at 78,181 px (the ROM boot screen plus the OS's hourglass/busy cursor —
+the OS's `VertRetrace` cursor code is now live). Injected mouse motion does not
+move the cursor here, so this is not the interactive desktop idle: the OS is
+**blocked in its scheduler waiting for an in-memory event to be posted** that
+never is in our model.
+
+**The STOP (a documented boundary, not a bug):** the OS is alive — scheduler
+running, both interrupt levels delivering to its own handlers, first processes
+in user mode — and idles awaiting an unposted event. Identifying which
+process/event the wait polls (and satisfying it, toward the Office System
+desktop) is **M4 Task 4**. Whether that event is a scheduler/exception post, an
+alarm, or a device-completion the boot volume needs (Widget probe) is the next
+frontier.
+
+### OQ statuses at Checkpoint E
+
+- **OQ1″ (supervisor DATA access to a user domain): still OPEN, not yet
+  forced.** User processes run (SR `$0000`) but `Bus.domain` stays **0**
+  throughout — no supervisor access to a non-zero domain has occurred yet.
+  `Bus.translationDomain` is untouched. Revisit when a process runs in domain
+  1+ and the kernel copies its buffers (M4 Task 4 / M5).
+- **Floppy writes: still none observed** (`writeAttempts==0` everywhere through
+  Checkpoint E). Session write-through stays armed but unbuilt, exactly as the
+  plan's contingency prescribes — nothing to implement until the OS writes.
+- **COPS `$02` clock read:** not observed at this checkpoint; the OS's COPS
+  traffic here is the `$7C` mouse-int enable and the level-2 packet stream.
+
+### What the Checkpoint E test pins (`ROMFloppyBootTests`)
+
+`checkpointE_unmaskingAndFirstLiveInterrupts` — from the loaded OS code:
+`minSR < $2700` (the unmasking, in fact to `$0000`), the `Level1` (`$5208A6`)
+AND `Level2` (`$520A52`) handlers both entered (first live level-1 + level-2
+delivery), user mode reached, the `$4C0270` event-wait loop reached, `!halted`,
+`busErrorPulseCount==0`, `writeAttempts==0`, `blocksRead==323`. Robust
+invariants alongside the exact deterministic handler/loop anchors.

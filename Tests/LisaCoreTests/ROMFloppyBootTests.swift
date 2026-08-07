@@ -358,5 +358,70 @@ extension MusashiSuites {
             #expect(m.bus.floppy.writeAttempts == 0,
                     "no floppy WRITE anywhere on the kernel-push path (no-writes-observed)")
         }
+
+        /// **M4 Task 3 — Checkpoint E: THE UNMASKING and the first live
+        /// interrupts; the OS comes alive.** Past the COPS driver (M4 Task 1
+        /// opened the handshake) the OS's `DriverInit`/`INITSYS` program VIA1
+        /// T1 (the ms tick), enable the level-2 COPS line, install the Level1
+        /// ($0064) and Level2 ($0068) autovectors (LIBHW-DRIVERS `DriverInit`),
+        /// and drop SR below `$2700`. At that instant level-1 (VIA1 T1 ms-tick)
+        /// AND level-2 (COPS/VIA2) interrupts begin delivering to the OS's own
+        /// handlers -- `Level1` at `$5208A6` (poll retrace/timer/floppy) and
+        /// `Level2` at `$520A52`. The OS then runs its scheduler across many
+        /// loaded segments in user mode (SR reaches `$0000`) and settles into a
+        /// steady user-mode event-wait loop (`$4C0276`, polling an in-RAM state
+        /// for `2`). See docs/rom-trace-notes.md "Checkpoint E".
+        ///
+        /// This furthest stable state is unlocked by the M4 Task 3 fix: `$F801`
+        /// bit 2 (vertical-retrace) is **active-low** (0 == pending) per the OS
+        /// source, not active-high -- our old model made the Level1 handler read
+        /// "no retrace", never ack via `VertRetrace`, and `vsyncPending` stormed
+        /// level 1 forever. Every ROM anchor is unmoved (the ROM's own bit-2
+        /// self-test is soft-fail either way -- rom-trace-notes "Trace
+        /// checkpoint B").
+        @Test func checkpointE_unmaskingAndFirstLiveInterrupts() throws {
+            let m = try bootIntoLoader()
+            // Reach loaded OS code, then single-step so interrupt delivery is
+            // exact to the instruction boundary while we watch for the unmask.
+            let lim0 = m.cycles + 30_000_000
+            while m.cycles < lim0 && !m.halted && !(0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]) {
+                _ = m.step()
+            }
+            #expect((0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]),
+                    "reached loaded OS code; got \(String(format: "$%06X", m.cpu[.pc]))")
+
+            var minSR: UInt16 = 0xFFFF
+            var sawLevel1Handler = false     // $5208A6 Level1 (LIBHW-DRIVERS)
+            var sawLevel2Handler = false     // $520A52 Level2
+            var sawUserMode = false          // SR S-bit clear (scheduler ran a user process)
+            var restingRegion = false        // the $4C02xx / $2E2Bxx event-wait loop
+            for _ in 0..<4_000_000 where !m.halted {
+                let pc = m.cpu[.pc]
+                let sr = UInt16(m.cpu[.sr])
+                if sr < minSR { minSR = sr }
+                if pc == 0x0052_08A6 { sawLevel1Handler = true }
+                if pc == 0x0052_0A52 { sawLevel2Handler = true }
+                if (sr & 0x2000) == 0 { sawUserMode = true }
+                if (0x004C_0270...0x004C_028F).contains(pc) { restingRegion = true }
+                if restingRegion && sawLevel1Handler && sawLevel2Handler && sawUserMode
+                    && minSR < 0x0700 { break }
+                _ = m.step()
+            }
+
+            // THE UNMASKING: SR dropped below the level-7 mask it held the whole
+            // boot -- in fact all the way to user mode.
+            #expect(minSR < 0x2700, "SR dropped below $2700 -- the OS unmasked; minSR=\(String(format: "$%04X", minSR))")
+            #expect(sawUserMode, "the scheduler ran a process in user mode (SR S-bit clear)")
+            // FIRST LIVE INTERRUPTS delivered to the OS's own handlers.
+            #expect(sawLevel1Handler, "level-1 (VIA1 T1 ms-tick / retrace) delivered to Level1 @ $5208A6")
+            #expect(sawLevel2Handler, "level-2 (COPS/VIA2) delivered to Level2 @ $520A52")
+            // The OS is alive and idles in its scheduler event-wait loop.
+            #expect(restingRegion, "the OS settles into its user-mode event-wait loop @ $4C0270")
+            #expect(!m.halted, "the OS runs live -- no halt")
+            #expect(m.bus.busErrorPulseCount == 0, "no bus error across the unmasking")
+            #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE observed at Checkpoint E")
+            #expect(m.bus.floppy.blocksRead == 323,
+                    "the OS read its remaining boot blocks (75 -> 323) before unmasking; got \(m.bus.floppy.blocksRead)")
+        }
     }
 }

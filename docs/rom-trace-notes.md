@@ -1699,3 +1699,34 @@ sweep — re-recording them here just makes the M3 ledger's own claim
 ("Widget + Power menu remain consciously deferred to M4 unless evidence
 forces them") checkable against live evidence, in the same place the rest
 of this document tracks what's forced vs. deferred.
+
+## M3 final-state summary (Task 5, milestone close)
+
+M3 opened with the boot stalled at what M2 mislabeled a Pascal segment-call
+gate; it closes with the OS's own code running from `$520000`, having read
+itself off the floppy and built out its own MMU domain-0 map. Three real
+emulation divergences were found and fixed along the way (M3 Task 1's 12-bit
+MMU page-add wrap, M3 Task 2's setup-latch live-translation fix, M3 Task 4's
+supervisor-always-domain-0 translation rule); each was root-caused against
+the Lisa OS assembly source before being patched, not guessed at. The
+milestone's current stop — the OS's own COPS command-send driver spinning on
+a handshake line our simplified COPS model doesn't drive the way this driver
+expects — is a **genuinely new subsystem boundary**, not a fourth emulation
+bug: it is the first time any traced boot path has exercised OS-originated
+(as opposed to ROM-originated) COPS traffic. Full narrative: `docs/m3-demo.md`
+(plain-language walkthrough), "Checkpoint D" and "Kernel push (M3 Task 4)"
+above (evidence + citations).
+
+### Open-question statuses at milestone close
+
+| ID | Question | Status |
+|---|---|---|
+| **OQ1** | Does SLIM/SORG register programming target the CURRENT (active) domain, or an "inactive domain" per the original M1a hardware-notes transcription? | **ANSWERED** (M3 Task 2) — the CURRENT (active) domain, source-established (`initmmutil`/`do_an_mmu` both establish-then-program). The "inactive domain" reading is refuted; hardware-notes.md §1 carries the strike-through. See "OQ1 status" above. |
+| **OQ1′** | Checkpoint D's domain-1 crossover: how does `do_an_mmu`'s own code stay reachable the instant it switches the live context into an empty domain? | **RESOLVED** (M3 Task 4) — supervisor-mode code EXECUTION always translates through domain 0, regardless of the context latch; the latch only gates user-mode accesses. Implemented as `Bus.translationDomain`. Supersedes the Task 2 "per-domain vs. global segment presence" framing — it is neither, it is supervisor-vs-user. See "Kernel push (M3 Task 4)" above. |
+| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | **OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet (min SR stays `$2700`, no user processes run in M3). Flagged for the first user-process milestone (M4/M5); revisit `Bus.translationDomain` then. |
+| **OQ2** | How does the ROM reach ROM/special space (segments 125-127) in translated mode — exact SLIM/SORG values? | **ANSWERED** (M1b Task 5) — seg 127 (prom) SLIM `$F00`/nibble `$F`; seg 126 (iospace) SLIM `$901`/nibble `$9`; seg 125 (screen) left absent at setup-drop. See "Answers to the Task 5 open questions" above. Unrelated to M3's MMU work; listed here only for a complete OQ roster at milestone close. |
+| **OQ3** | Does board-ID `$C031 == 0x00` send POST down a sane (non-error) path? | **ANSWERED** (M1b Task 5) — yes, the pre-Pepsi path, benign. See "Answers to the Task 5 open questions" above; unrelated to M3, listed for completeness. |
+
+The M3 Task 3 deferrals table above (Widget HD, ProFile, soft power/Power
+menu, the OS COPS driver, and OQ1″) is this document's live record of what
+M3 consciously left for M4; nothing in that table was silently dropped.

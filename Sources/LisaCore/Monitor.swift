@@ -4,10 +4,25 @@ public struct Monitor {
     public enum Command: Equatable {
         case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), go(Int)
         case screenshot(String), asciiPreview
+        /// The scripted menu-boot harness (M4 Task 2): cycle/instruction
+        /// budget defaults to `bootdisk`'s own generous constant when no
+        /// argument is given (see `bootdisk`'s doc comment in `lisadbg`).
+        case bootdisk(Int?)
+        /// `sym <hexaddr>` -- one-shot `LinkmapSymbols.lookup` (M4 Task 2).
+        case sym(UInt32)
+        /// `symbase <hexaddr>` -- sets `LinkmapSymbols.baseOffset` (M4 Task
+        /// 2's relocation model; see `LinkmapSymbols.swift`'s doc comment
+        /// "base-offset story").
+        case symbase(UInt32)
         case quit, help
     }
 
     let machine: Machine
+    /// Address->symbol overlay for `d`/`t`/status annotation and the `sym`
+    /// command (M4 Task 2). `nil` (the default) leaves every output
+    /// byte-identical to pre-Task-2 `Monitor` -- existing pins
+    /// (`MonitorTests`) rely on this.
+    public var symbols: LinkmapSymbols?
     public init(machine: Machine) { self.machine = machine }
 
     public static func parse(_ line: String) -> Command? {
@@ -38,6 +53,13 @@ public struct Monitor {
         case "sc": guard parts.count > 1 else { return nil }
                    return .screenshot(parts[1])
         case "sca": return .asciiPreview
+        case "bootdisk":
+            if parts.count > 1, let n = Int(parts[1]), n > 0 { return .bootdisk(n) }
+            return .bootdisk(nil)
+        case "sym": guard let a = hex(1) else { return nil }
+                    return .sym(a)
+        case "symbase": guard let a = hex(1) else { return nil }
+                        return .symbase(a)
         case "q": return .quit
         case "?": return .help
         default:  return nil
@@ -59,14 +81,22 @@ public struct Monitor {
         """
     }
 
+    /// Formats `addr`'s hex + (when `symbols` is loaded and resolves it) a
+    /// `[UNIT.PROC+0xNN]`-style annotation -- the shared "d"/"t"/status
+    /// address presentation (M4 Task 2).
+    public func annotatedAddress(_ addr: UInt32) -> String {
+        let addrStr = String(format: "%06X", Int(addr))
+        guard let sym = symbols?.lookup(addr) else { return addrStr }
+        return "\(addrStr) [\(sym)]"
+    }
+
     public func disassembly(from address: UInt32, count: Int) -> String {
         machine.bus.withPeek {
             var lines: [String] = []
             var pc = address
             for _ in 0..<count {
                 let (text, length) = machine.cpu.disassemble(at: pc)
-                let addrStr = String(format: "%06X", Int(pc))
-                let line = "\(addrStr): \(text)"
+                let line = "\(annotatedAddress(pc)): \(text)"
                 lines.append(line)
                 pc &+= UInt32(length)
             }

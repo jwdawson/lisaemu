@@ -306,23 +306,111 @@ private func issueRead(_ floppy: FloppyController, _ scheduler: FakeScheduler,
     #expect(level1() == true, "still completes -- the driver must be able to see the error")
 }
 
-@Test func writeSubCommandIsAcceptedAndDiscardedWithALoggedWarning() {
-    var logged: [String] = []
-    let (floppy, scheduler, _) = makeController(log: { logged.append($0) })
-    floppy.insert(makeSyntheticImage())
+// MARK: - Session write-through (M4 Task 4 round 4)
+//
+// ~~M2/M3 behavior: `writedisk` accepted-and-DISCARDED.~~ Superseded: the OS
+// (once the boot-floppy devrec carries the real Sony driver) WRITES during
+// FS mount/startup, and a dropped write means the OS later re-reads stale
+// bytes -- guaranteed metadata corruption. Per the M4 plan's Global
+// Constraints, writes become SESSION-SCOPED WRITE-THROUGH the moment the OS
+// writes: stored in an in-memory overlay consulted by subsequent reads,
+// NEVER mutating the backing `.dc42` image. The OS driver stages write data
+// exactly where reads land it: `START_WRITE` (SOURCE-SONYASM:300-380) packs
+// the 12-byte tag at DISKHDR's odd lane (`movep` stride 2 from base+1) and
+// the 512 data bytes at DISKHDR+24 = DISKDATA ($400) odd lane -- the mirror
+// image of FINISH_READ / the ROM's `$FE1DC6 lea ($400,A0),A4` read layout.
 
+private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeScheduler,
+                                track: Int, sector: Int, side: Int,
+                                data: [UInt8], tag: [UInt8]) {
+    for i in 0..<512 { floppy.write(FloppyController.Cell.diskData + 1 + 2 * i, data[i]) }
+    for i in 0..<12 { floppy.write(FloppyController.Cell.diskHdr + 1 + 2 * i, tag[i]) }
     floppy.write(FloppyController.Cell.diskParm, FloppyController.SubCommand.writedisk.rawValue)
-    floppy.write(FloppyController.Cell.diskHead, 0)
-    floppy.write(FloppyController.Cell.diskSec, 5)
-    floppy.write(FloppyController.Cell.diskTrak, 2)
+    floppy.write(FloppyController.Cell.diskDriv, 0)
+    floppy.write(FloppyController.Cell.diskHead, UInt8(side))
+    floppy.write(FloppyController.Cell.diskSec, UInt8(sector))
+    floppy.write(FloppyController.Cell.diskTrak, UInt8(track))
     floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.excmd.rawValue)
     scheduler.advance(by: FloppyController.commandDelayCycles)
     scheduler.advance(by: FloppyController.completionDelayCycles)
+}
 
+@Test func writediskStoresTheBlockSessionScopedAndReadsBackThroughTheWindow() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insert(makeSyntheticImage())
+
+    // block 29 = track 2, sector 5 (zone 0: 12 sec/trk)
+    let data = (0..<512).map { UInt8(truncatingIfNeeded: 0xA5 &+ $0) }
+    let tag = (0..<12).map { UInt8(truncatingIfNeeded: 0x51 &+ $0) }
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0, data: data, tag: tag)
+
+    #expect(floppy.read(FloppyController.Cell.diskErr) == 0, "the write completes without error")
+    #expect(level1() == true, "completion line raised -- the driver sees the write finish")
     #expect(floppy.writeAttempts == 1)
-    #expect(floppy.read(FloppyController.Cell.diskErr) == 0, "write is accepted (no error), just discarded")
-    #expect(floppy.blocksRead == 0, "M2 is read-only -- no image mutation, and this isn't a read")
-    #expect(logged.contains { $0.contains("writedisk") }, "logged warning per the task brief")
+    #expect(floppy.blocksWritten == 1)
+
+    // Clear completion, then read the same block back: the session overlay,
+    // not the original image bytes, must come out of the window.
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.clristat.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles)
+    issueRead(floppy, scheduler, track: 2, sector: 5, side: 0)
+    #expect(floppy.read(FloppyController.Cell.diskErr) == 0)
+    let readBack = (0..<512).map { floppy.read(FloppyController.Cell.diskData + 1 + 2 * $0) }
+    let tagBack = (0..<12).map { floppy.read(FloppyController.Cell.diskHdr + 1 + 2 * $0) }
+    #expect(readBack == data, "readdisk after writedisk returns the SESSION-WRITTEN data")
+    #expect(tagBack == tag, "the 12 tag bytes round-trip through the overlay too")
+}
+
+@Test func writediskNeverMutatesTheBackingDC42Image() {
+    let (floppy, scheduler, _) = makeController()
+    let image = makeSyntheticImage()
+    let originalData = image.data(block: 29)
+    let originalTag = image.tag(block: 29)
+    floppy.insert(image)
+
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0,
+                       data: [UInt8](repeating: 0xEE, count: 512),
+                       tag: [UInt8](repeating: 0xDD, count: 12))
+
+    #expect(image.data(block: 29) == originalData, "the .dc42 image object is never mutated")
+    #expect(image.tag(block: 29) == originalTag)
+}
+
+@Test func insertingAnImageClearsTheSessionOverlay() {
+    let (floppy, scheduler, _) = makeController()
+    let image = makeSyntheticImage()
+    floppy.insert(image)
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0,
+                       data: [UInt8](repeating: 0xEE, count: 512),
+                       tag: [UInt8](repeating: 0xDD, count: 12))
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.clristat.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles)
+
+    floppy.insert(image)   // a fresh insertion = a fresh session
+    issueRead(floppy, scheduler, track: 2, sector: 5, side: 0)
+    let readBack = (0..<512).map { floppy.read(FloppyController.Cell.diskData + 1 + 2 * $0) }
+    #expect(readBack == image.data(block: 29), "re-inserting drops session writes -- the original bytes return")
+    #expect(floppy.blocksWritten == 0, "counter is session-scoped too")
+}
+
+@Test func writediskWithNoDiskOrBadGeometrySetsWriteError() {
+    let (floppy, scheduler, _) = makeController()
+    // No disk inserted.
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0,
+                       data: [UInt8](repeating: 0, count: 512),
+                       tag: [UInt8](repeating: 0, count: 12))
+    #expect(floppy.read(FloppyController.Cell.diskErr) == FloppyController.ErrorCode.write)
+    #expect(floppy.blocksWritten == 0)
+
+    // Disk in, but out-of-range geometry (track 0 has only 12 sectors).
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.clristat.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles)
+    floppy.insert(makeSyntheticImage())
+    stageAndIssueWrite(floppy, scheduler, track: 0, sector: 12, side: 0,
+                       data: [UInt8](repeating: 0, count: 512),
+                       tag: [UInt8](repeating: 0, count: 12))
+    #expect(floppy.read(FloppyController.Cell.diskErr) == FloppyController.ErrorCode.write)
+    #expect(floppy.blocksWritten == 0)
 }
 
 // MARK: - Tagless image read (M2 review Finding 1 regression)

@@ -270,7 +270,23 @@ public final class FloppyController {
 
     public private(set) var blocksRead = 0
     public private(set) var writeAttempts = 0
+    /// Count of `writedisk` commands that actually stored a block into the
+    /// session overlay (M4 Task 4 round 4). `writeAttempts` keeps counting
+    /// every issued `writedisk` (including failed ones), preserving the
+    /// M2/M3 counter semantics the boot pins used.
+    public private(set) var blocksWritten = 0
     public private(set) var lastError: UInt8 = 0
+
+    /// **Session-scoped write-through (M4 Task 4 round 4).** The OS writes
+    /// to the boot floppy during FS mount/startup (e.g. the parameter-memory
+    /// snapshot rewrite, FS metadata updates); a dropped write means the OS
+    /// later re-reads stale bytes -- guaranteed metadata corruption. Writes
+    /// land here, in memory, keyed by DC42 block number; `performRead`
+    /// consults this overlay before the backing image. The `.dc42` image
+    /// object (and its file) is NEVER mutated. `insert(_:)` clears the
+    /// overlay (a fresh insertion = a fresh session); `reset()` deliberately
+    /// does NOT (a warm reboot does not un-write a real floppy's media).
+    private var sessionOverlay: [Int: (data: [UInt8], tag: [UInt8])] = [:]
 
     /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
     /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
@@ -313,6 +329,8 @@ public final class FloppyController {
     /// M4-ish resolution path, not implemented here (out of this task's
     /// doc-only/behavioral-item-1-only scope).
     public func insert(_ image: DC42Image) {
+        sessionOverlay.removeAll()   // fresh insertion = fresh write session
+        blocksWritten = 0
         self.image = image
         window[Cell.diskIn] = 1
         window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
@@ -424,15 +442,38 @@ public final class FloppyController {
             performRead(track: Int(trak), sector: Int(sec), side: Int(head))
         case .writedisk:
             writeAttempts += 1
-            log("FloppyController: writedisk sub-command received -- accepted and discarded (read-only in M2), track=\(trak) sector=\(sec) side=\(head)")
-            setError(ErrorCode.none)
-            raiseCompletionLineAfterDelay()
+            performWrite(track: Int(trak), sector: Int(sec), side: Int(head))
         default:
             // unclamp/format/verify/formattrk/verifytrk/read_bf/write_bf,
             // or a byte matching none of them: unsupported in this HLE.
             setError(ErrorCode.notIssued)
             raiseCompletionLineAfterDelay()
         }
+    }
+
+    /// Session write-through (see `sessionOverlay`): captures the block the
+    /// OS driver staged in the window -- data on the ODD lane at `$400`
+    /// (`START_WRITE`, SOURCE-SONYASM:323-380: `movep` stride 2 into
+    /// DISKHDR+24 = DISKDATA), packed 12-byte tag on the ODD lane at `$3E8`
+    /// (SONYASM:304-321) -- the exact mirror of `performRead`'s layout.
+    private func performWrite(track: Int, sector: Int, side: Int) {
+        guard image != nil,
+              let block = Self.blockNumber(track: track, sector: sector, side: side),
+              block < image!.blockCount else {
+            log("FloppyController: writedisk rejected -- no disk or bad geometry, track=\(track) sector=\(sector) side=\(side)")
+            setError(ErrorCode.write)
+            raiseCompletionLineAfterDelay()
+            return
+        }
+        var data = [UInt8](repeating: 0, count: 512)
+        var tag = [UInt8](repeating: 0, count: 12)
+        for i in 0..<512 { data[i] = window[Cell.diskData + 1 + 2 * i] }
+        for i in 0..<12 { tag[i] = window[Cell.diskHdr + 1 + 2 * i] }
+        sessionOverlay[block] = (data: data, tag: tag)
+        blocksWritten += 1
+        log("FloppyController: writedisk block \(block) stored in the session overlay (track=\(track) sector=\(sector) side=\(side)); the .dc42 image is untouched")
+        setError(ErrorCode.none)
+        raiseCompletionLineAfterDelay()
     }
 
     private func performRead(track: Int, sector: Int, side: Int) {
@@ -447,8 +488,11 @@ public final class FloppyController {
             raiseCompletionLineAfterDelay()
             return
         }
-        let data = image.data(block: block)
-        let tag = image.tag(block: block)
+        // Session write-through: a block the OS wrote THIS session reads
+        // back from the overlay, not the pristine image.
+        let overlaid = sessionOverlay[block]
+        let data = overlaid?.data ?? image.data(block: block)
+        let tag = overlaid?.tag ?? image.tag(block: block)
         // The 6504 shared RAM appears on the ODD bytes of the 68000's
         // $FCC000 window: the ROM's own read routine (twig_entry $FE1D76 ->
         // $FE1DB0/$FE1DC6) reads the tag and data buffers with `movep.l`

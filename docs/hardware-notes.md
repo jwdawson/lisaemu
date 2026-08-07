@@ -261,9 +261,24 @@ Source: libhw-DRIVERS:936-962; independent confirmation OS/source-SERNUM.TEXT.un
 **Registers:**
 - VertReset: IOSpace + $E018 (write re-arms/clears pending)
 - StatusRegister: IOSpace + $F800 (16-bit); low byte at $FCF801
-- StatusRegister bit 2: vertical retrace pending
+- ~~StatusRegister bit 2: vertical retrace pending~~ **(polarity corrected M4
+  Task 3 — see below)** StatusRegister bit 2 is **ACTIVE-LOW**: `0` == retrace
+  pending, `1` == not pending.
 - VRIRENB (V-Retrace Interrupt Enable): $E01A + IOMMU
 - VRIRDIS (V-Retrace Interrupt Disable): $E018 + IOMMU
+
+**M4 Task 3 polarity correction (`$F801` bit 2 is active-LOW).** The OS source
+settles the bit-2 sense the ROM self-test could not (its poll window is far
+shorter than a vsync period, soft-fail either way). LIBHW-DRIVERS `Level1`
+(:895) and `Poll` (:801) both do `BTST #2,StatusRegister+1 / BNE (skip
+VertRetrace)` with the comment *"branch if NOT vertical retrace"* — so bit 2
+**== 0** is "retrace pending" (service it), bit 2 **== 1** is "not pending".
+`VideoTiming.pending` is still the internal boolean; `IODispatcher.currentValue`
+now exposes it inverted at `$F801` (`pending ? 0 : 0x04`). The earlier
+active-high exposure stormed the OS's level-1 handler at the unmasking (it read
+bit2=1 as "no retrace", never acked via `VertRetrace`'s `$E018` write, and
+`Machine.vsyncPending` held level 1 asserted forever). See
+docs/rom-trace-notes.md "Checkpoint E". No ROM anchor moved.
 
 **M1b Task 5 ground truth / polarity resolution:** this section's own two
 phrasings are in tension ("VertReset... write re-arms/clears pending" vs.
@@ -743,7 +758,9 @@ Effect: Post-Pepsi boards use VIA1 T1 reloads $7B/$63 instead of $CA/$27 (libhw-
 
 - **16-bit Address:** IOSpace + $F800 = $FCF800
 - **Low Byte:** $FCF801
-- **Bit 2 (low byte):** Vertical sync pending
+- **Bit 2 (low byte):** Vertical sync pending — **ACTIVE-LOW** (0 == pending,
+  1 == not pending; corrected M4 Task 3 from OS source, see "Vertical Retrace"
+  above and docs/rom-trace-notes.md "Checkpoint E").
 
 ### RAM Sizing
 

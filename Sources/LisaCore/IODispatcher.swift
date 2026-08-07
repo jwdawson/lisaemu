@@ -169,7 +169,19 @@ final class IODispatcher {
     func currentValue(_ offset: UInt32) -> UInt8 {
         switch offset {
         case 0xE800: return videoPageLatch
-        case 0xF801: return statusByte | (videoTiming.pending ? 0x04 : 0)
+        // $F801 bit 2 (vertical-retrace) is ACTIVE-LOW: 0 == retrace pending,
+        // 1 == not pending. Established from the OS source at Checkpoint E (M4
+        // Task 3): the OS's Level1 handler (LIBHW-DRIVERS `Level1`) does
+        // `BTST #2,StatusRegister+1 / BNE (skip VertRetrace)` -- comment
+        // "branch if NOT vertical retrace" -- so a PENDING retrace must expose
+        // bit 2 = 0 for the handler to service (and ack via `VertRetrace`'s
+        // `$E018` write). Our earlier active-high model (bit2 = pending?4:0)
+        // stormed the OS's level-1 handler: it read bit2=1 as "not retrace",
+        // never acked, and `Machine.vsyncPending` held level 1 asserted
+        // forever. The ROM's own bit-2 self-test is polarity-agnostic (a
+        // soft-fail either way -- docs/rom-trace-notes.md "Trace checkpoint B"),
+        // so every ROM anchor is unmoved. See "Checkpoint E".
+        case 0xF801: return (statusByte & ~0x04) | (videoTiming.pending ? 0 : 0x04)
         case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
         // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"):
         // 0=twiggy, 1=single-sided Sony, 2=double-sided Sony. Task 4 moves

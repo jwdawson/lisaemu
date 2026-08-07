@@ -244,10 +244,18 @@ extension MusashiSuites {
         }
 
         @Test
-        func vsyncTickSetsStatusRegisterBit2ThroughRealBusAccess() {
+        func vsyncTickClearsStatusRegisterBit2ThroughRealBusAccess() {
+            // $F801 bit 2 is ACTIVE-LOW: 0 == retrace pending, 1 == not pending.
+            // Established from the OS source at Checkpoint E (M4 Task 3): the
+            // OS's Level1 handler does `BTST #2,StatusRegister+1 / BNE (skip)`
+            // with the comment "branch if NOT vertical retrace", and VertRetrace
+            // only runs when bit 2 reads 0 -- so a *pending* retrace must expose
+            // bit 2 = 0. (Our earlier active-high model stormed the OS's level-1
+            // handler; see docs/rom-trace-notes.md "Checkpoint E".) After a full
+            // vsync period `pending` is true, so bit 2 reads CLEAR.
             let m = spinningMachine()
             m.run(until: VideoTiming.cyclesPerVsync + 1000)
-            #expect(m.bus.read8(0xFC_F801) & 0x04 != 0, "status register bit 2 should be set after a vsync period")
+            #expect(m.bus.read8(0xFC_F801) & 0x04 == 0, "bit 2 active-low: a pending retrace reads 0")
         }
 
         @Test
@@ -263,7 +271,7 @@ extension MusashiSuites {
         func unarmedVsyncNeverAssertsLevel1ThroughRealBusAccess() {
             let m = spinningMachine()
             m.run(until: VideoTiming.cyclesPerVsync + 1000)
-            #expect(m.bus.read8(0xFC_F801) & 0x04 != 0, "status bit still sets")
+            #expect(m.bus.read8(0xFC_F801) & 0x04 == 0, "status bit still tracks pending (active-low: 0 == pending)")
             #expect(m.vsyncPending == false, "never armed -- must not assert level 1")
         }
 
@@ -276,7 +284,7 @@ extension MusashiSuites {
 
             m.bus.write8(0xFC_E018, 0)   // VertReset/VRIRDIS
             #expect(m.vsyncPending == false, "$E018 access should disarm and clear the asserted IRQ")
-            #expect(m.bus.read8(0xFC_F801) & 0x04 == 0, "and clear the status register bit")
+            #expect(m.bus.read8(0xFC_F801) & 0x04 != 0, "clearing pending exposes bit 2 = 1 (active-low: not pending)")
         }
 
         /// End-to-end autovector delivery, the same shape as

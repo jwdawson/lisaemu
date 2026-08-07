@@ -93,15 +93,21 @@ import Testing
 
 // MARK: - Status register low byte ($F801)
 
-@Test func statusByteDefaultsToZeroAndIsSoftwareDriven() {
+@Test func statusByteIsSoftwareDrivenAlongsideTheActiveLowVsyncBit() {
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_F801) == 0)
-    bus.statusByte = 0x04   // M1b will drive this (vsync bit 2); simulate directly
-    #expect(bus.read8(0xFC_F801) == 0x04)
+    // $F801 bit 2 is the vertical-retrace line, ACTIVE-LOW (0 == pending),
+    // owned by `videoTiming.pending` -- see the OS-source derivation in
+    // docs/rom-trace-notes.md "Checkpoint E" (M4 Task 3) and
+    // VideoTimingTests. A bare bus has never fired a vsync, so `pending` is
+    // false and bit 2 reads SET. The software-driven `statusByte` owns the
+    // OTHER bits; exercise it via bit 1 so the two don't overlap.
+    #expect(bus.read8(0xFC_F801) == 0x04, "no vsync pending -> bit 2 set (active-low)")
+    bus.statusByte = 0x02   // a non-vsync status bit, software-driven
+    #expect(bus.read8(0xFC_F801) == 0x06, "software bit 1 OR'd with the not-pending vsync bit 2")
     // CPU writes to the status register are hardware-driven, not
     // software-settable -- a bus write must not clobber it.
     bus.write8(0xFC_F801, 0xFF)
-    #expect(bus.statusByte == 0x04)
+    #expect(bus.statusByte == 0x02)
 }
 
 // MARK: - Vsync reset/enable ($E018/$E01A) -- stored + logged

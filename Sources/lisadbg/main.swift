@@ -226,6 +226,88 @@ func asciiPreview(_ framebuffer: [UInt8], outCols: Int = 90, outRows: Int = 45) 
     return lines.joined(separator: "\n")
 }
 
+// MARK: - `bootdisk` (M4 Task 2)
+//
+// Ports `ROMFloppyBootTests`' proven cursor-walk + click mechanism
+// (Tests/LisaCoreTests/ROMFloppyBootTests.swift `moveCursor`/`click`) into
+// `lisadbg` itself, retiring the "integration test is the sole
+// reproduction vehicle for the $520000 state" limitation documented in
+// docs/rom-trace-notes.md "Kernel push (M3 Task 4)" and docs/m3-demo.md
+// "In lisadbg" (struck, not erased, alongside this change).
+
+/// Walks the ROM's on-screen cursor (`$496`/`$498`) to `(tx,ty)` by
+/// feeding relative mouse-delta packets through `COPS.postMouse` -- see
+/// `ROMFloppyBootTests.moveCursor` for the original derivation.
+func moveCursor(_ m: Machine, to tx: Int, _ ty: Int) {
+    for _ in 0..<24 {
+        let cx = Int(m.bus.read16(0x496)), cy = Int(m.bus.read16(0x498))
+        if abs(cx - tx) <= 1 && abs(cy - ty) <= 1 { return }
+        m.bus.cops.postMouse(dx: Int8(max(-120, min(120, tx - cx))),
+                             dy: Int8(max(-120, min(120, ty - cy))))
+        m.run(until: m.cycles + 250_000)
+    }
+}
+
+/// A mouse click = button-down keycap `$06` then button-up -- see
+/// `ROMFloppyBootTests.click`.
+func click(_ m: Machine) {
+    m.bus.cops.postKey(code: 0x06, down: true)
+    m.run(until: m.cycles + 300_000)
+    m.bus.cops.postKey(code: 0x06, down: false)
+    m.run(until: m.cycles + 300_000)
+}
+
+/// Generous default post-click cycle budget: `ROMFloppyBootTests.
+/// bootIntoLoader` needs ~66M cycles (18M POST + 3M menu redraw + 40M to
+/// reach the loaded boot block + 5M to reach the trap-#6 gate) and the
+/// domain-1 crossover + OS entry a few million more
+/// (`domain1CrossoverSurvivesLoaderLoadsOSImageAndReachesTheCOPSDriver`,
+/// 400,000 further *instructions* -- comfortably under a few more million
+/// cycles). 90M clears the whole documented path with slack for Task 3's
+/// frontier to move further still.
+let defaultBootdiskBudget = 90_000_000
+
+/// Drives the scripted menu-boot harness: waits out POST, clicks "STARTUP
+/// FROM..." (`420,182`, the `$53a` hit-test rect `[416,165,496,192]`),
+/// clicks the top device-list item (`88,33`), then runs in bursts up to
+/// `budget` further cycles -- printing a status line after each phase so
+/// progress is visible interactively, and after every burst once the free
+/// run starts. Requires a disk already inserted (`--disk`) and the machine
+/// parked at power-on (run this as the first command). End condition (the
+/// task brief's wording): a cycle budget, or PC having moved past
+/// `$020000` -- i.e. out of ROM into loaded code, the same RAM/ROM
+/// threshold `ROMFloppyBootTests` anchors its first-jump check on -- either
+/// way, always finishes with a status line.
+func bootdisk(_ m: Machine, monitor: Monitor, budget: Int) {
+    guard m.bus.floppy.isInserted else {
+        print("bootdisk: no disk inserted -- start lisadbg with --disk <path.dc42>")
+        return
+    }
+    func status(_ label: String) {
+        let pc = m.cpu[.pc]
+        let location = (0x02_0000..<0xFE_0000).contains(pc) ? "RAM/loaded code" : "ROM"
+        print("      [\(label)] PC=\(monitor.annotatedAddress(pc)) (\(location)) cycles=\(m.cycles) halted=\(m.halted) \(diskStatus(m))")
+    }
+
+    if m.cycles < 18_000_000 { m.run(until: 18_000_000) }         // POST done, menu idle
+    status("POST complete, menu idle")
+
+    moveCursor(m, to: 420, 182); click(m)                          // "STARTUP FROM..."
+    m.run(until: m.cycles + 3_000_000)                             // device-list window drawn
+    status("STARTUP FROM... clicked")
+
+    moveCursor(m, to: 88, 33); click(m)                            // top device item
+    status("device item clicked")
+
+    let burstSize: UInt64 = 10_000_000
+    let target = m.cycles + UInt64(max(0, budget))
+    while m.cycles < target && !m.halted {
+        m.run(until: min(target, m.cycles + burstSize))
+        status("running")
+    }
+    status("bootdisk complete")
+}
+
 // `--disk <path.dc42>` (M2 Task 4) can appear anywhere alongside either the
 // `--rom <dir>` or `<binary> [hex-load-address]` forms below -- pulled out
 // first so the rest of the parsing is unaffected by its position.
@@ -282,7 +364,24 @@ if let diskPath {
     }
 }
 
-let monitor = Monitor(machine: machine)
+// Linkmap symbol overlay (M4 Task 2) -- `LISAEMU_LINKMAP_DIR` or the
+// default `~/Development/Lisa_Source/LISA_OS/Linkmaps 3.0/`
+// (`LinkmapSymbols.defaultDirectory`). Never bundled/committed: this is a
+// user-supplied local path read at runtime only, per the global
+// constraints. Missing directory = symbols simply stay unloaded (`d`/`t`/
+// `sym` degrade gracefully to unannotated output, exactly the pre-Task-2
+// behavior) -- this is routine, not an error, so it's not `fail()`.
+var monitor = Monitor(machine: machine)
+let linkmapDir = ProcessInfo.processInfo.environment["LISAEMU_LINKMAP_DIR"]
+    .map { URL(fileURLWithPath: $0) } ?? LinkmapSymbols.defaultDirectory
+do {
+    let loaded = try LinkmapSymbols.load(directory: linkmapDir)
+    monitor.symbols = loaded
+    print("lisadbg — loaded \(loaded.symbols.count) linkmap symbols from \(linkmapDir.path)")
+} catch {
+    print("lisadbg — no linkmap symbols (\(linkmapDir.path): \(error)); d/t/sym will show raw addresses")
+}
+
 print(monitor.registerDump())
 while let line = readLine(strippingNewline: true) {
     switch Monitor.parse(line) {
@@ -344,10 +443,26 @@ while let line = readLine(strippingNewline: true) {
         }
     case .asciiPreview:
         print(asciiPreview(machine.bus.framebufferSnapshot()))
+    case .bootdisk(let n):
+        bootdisk(machine, monitor: monitor, budget: n ?? defaultBootdiskBudget)
+        print(monitor.registerDump())
+    case .sym(let addr):
+        if monitor.symbols == nil {
+            print("      no linkmap symbols loaded (set LISAEMU_LINKMAP_DIR, or check out Lisa_Source at \(LinkmapSymbols.defaultDirectory.path))")
+        } else {
+            print("      \(monitor.annotatedAddress(addr))")
+        }
+    case .symbase(let addr):
+        guard monitor.symbols != nil else {
+            print("      no linkmap symbols loaded -- symbase has nothing to offset")
+            break
+        }
+        monitor.symbols?.baseOffset = addr
+        print("      symbol base offset set to $\(String(format: "%06X", addr))")
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | sym <hexaddr> | symbase <hexaddr> | q")
     case nil:
         print("? — unknown command")
     }

@@ -93,15 +93,21 @@ import Testing
 
 // MARK: - Status register low byte ($F801)
 
-@Test func statusByteDefaultsToZeroAndIsSoftwareDriven() {
+@Test func statusByteIsSoftwareDrivenAlongsideTheActiveLowVsyncBit() {
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_F801) == 0)
-    bus.statusByte = 0x04   // M1b will drive this (vsync bit 2); simulate directly
-    #expect(bus.read8(0xFC_F801) == 0x04)
+    // $F801 bit 2 is the vertical-retrace line, ACTIVE-LOW (0 == pending),
+    // owned by `videoTiming.pending` -- see the OS-source derivation in
+    // docs/rom-trace-notes.md "Checkpoint E" (M4 Task 3) and
+    // VideoTimingTests. A bare bus has never fired a vsync, so `pending` is
+    // false and bit 2 reads SET. The software-driven `statusByte` owns the
+    // OTHER bits; exercise it via bit 1 so the two don't overlap.
+    #expect(bus.read8(0xFC_F801) == 0x04, "no vsync pending -> bit 2 set (active-low)")
+    bus.statusByte = 0x02   // a non-vsync status bit, software-driven
+    #expect(bus.read8(0xFC_F801) == 0x06, "software bit 1 OR'd with the not-pending vsync bit 2")
     // CPU writes to the status register are hardware-driven, not
     // software-settable -- a bus write must not clobber it.
     bus.write8(0xFC_F801, 0xFF)
-    #expect(bus.statusByte == 0x04)
+    #expect(bus.statusByte == 0x02)
 }
 
 // MARK: - Vsync reset/enable ($E018/$E01A) -- stored + logged
@@ -118,9 +124,23 @@ import Testing
 
 // MARK: - Board ID ($C031)
 
-@Test func boardIdReturnsZero() {
+@Test func boardIdReturnsPepsiClassDiskROMId() {
+    // $FCC031 = DiskROMId (LIBHW-DRIVERS:135). M4 Task 4 round 4: the Task-3
+    // era 0x00 stub made the OS's BOOT_IO_INIT decode our machine as a Twiggy
+    // Lisa 1 (SOURCE-STARTUP:1876-1878: signed byte >= 0 -> iob_lisa), which
+    // installed the vestigial TWIGIO stub driver on the boot floppy devrec
+    // (SOURCE-CD:750; source-twiggy:1235+1237 -- body compiled out under
+    // (*$IFC TWIGGYBUILD*)) and orphaned the FS-mount read (Checkpoint F
+    // stall). The Lisa 2/10 machine we model must present a Pepsi-class ID:
+    // bit7 set (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), and NOT
+    // in [$A0,$DF] (SOURCE-STARTUP:1879-1885's iob_sony/iob_lite ranges) so
+    // the decode falls through to the $FCC015 internal-disk check ->
+    // iob_pepsi (STARTUP:1886-1890). The specific byte $88 is derived from
+    // the decode (any bit7-set value outside [$A0,$DF] with bit5 clear
+    // works; the 6504 disk ROM itself is not in the source tree) -- see
+    // docs/hardware-notes.md "Board IDs".
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_C031) == 0x00)
+    #expect(bus.read8(0xFC_C031) == 0x88)
 }
 
 // MARK: - VIA1 (stride 8, 16 regs at $D901) / VIA2 (stride 2, 16 regs at $DD81)
@@ -295,9 +315,12 @@ import Testing
 
 @Test func c031BoardIDUnchangedByTheFloppyWindow() {
     // $FCC031 falls inside the $C000-$C7FF window but must keep its own
-    // pre-existing (Task 3 era) behavior, not become a plain window byte.
+    // hardware-register behavior (DiskROMId, $88 -- see
+    // boardIdReturnsPepsiClassDiskROMId), not become a plain window byte.
     let bus = Bus(ramSize: 0x1000)
-    #expect(bus.read8(0xFC_C031) == 0x00)
+    #expect(bus.read8(0xFC_C031) == 0x88)
+    bus.write8(0xFC_C031, 0x42)   // hardware-driven; CPU writes have no effect
+    #expect(bus.read8(0xFC_C031) == 0x88)
 }
 
 @Test func floppyWindowRoutesPlainCellsAsRAMThroughTheBus() {

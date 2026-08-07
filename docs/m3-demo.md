@@ -57,15 +57,25 @@ COPS handshake gate.
 
 ### In `lisadbg`
 
-There is no menu-navigation harness in `lisadbg` (no cursor-walk + click), so
-it cannot drive the ROM past the boot menu on its own — the same limitation
-M2 already documented. `lisadbg --rom … --disk …` plus `g`/`sca` still shows
-exactly the M2 picture: POST completes, the disk is inserted, the menu is
-drawn, `blocksRead=0` because nothing has clicked "STARTUP FROM…" yet. **The
-$520000 frontier this document describes is reachable only through the
-integration test harness below** — see "Reproduce" for the actual repro
-vehicle, and `docs/rom-trace-notes.md`'s "Kernel push (M3 Task 4)" section's
-"Reproduction" paragraph for the fuller citation.
+~~There is no menu-navigation harness in `lisadbg` (no cursor-walk + click),
+so it cannot drive the ROM past the boot menu on its own — the same
+limitation M2 already documented. `lisadbg --rom … --disk …` plus `g`/`sca`
+still shows exactly the M2 picture: POST completes, the disk is inserted,
+the menu is drawn, `blocksRead=0` because nothing has clicked "STARTUP
+FROM…" yet. **The $520000 frontier this document describes is reachable
+only through the integration test harness below** — see "Reproduce" for the
+actual repro vehicle, and `docs/rom-trace-notes.md`'s "Kernel push (M3 Task
+4)" section's "Reproduction" paragraph for the fuller citation.~~
+**Superseded (M4 Task 2):** `lisadbg` now has a `bootdisk` command (ported
+from this same cursor-walk + click mechanism) that drives the ROM past the
+menu, into the loader, and into the loaded OS image entirely on its own —
+`lisadbg --rom … --disk … ` then typing `bootdisk` reaches (and currently
+runs well past) the `$520000` frontier with no integration test involved.
+`d`/`t`/status output also gets a Linkmap-symbol overlay (`sym`/`symbase`
+commands; `LISAEMU_LINKMAP_DIR` or the default `Lisa_Source` path) — though
+see `task-2-report.md` for the honest coverage finding: the available
+Linkmaps only cover Office System applications, not the OS kernel this
+frontier lives in, so kernel-space addresses currently show no annotation.
 
 ## The three MMU discoveries, in plain language
 

@@ -169,8 +169,39 @@ final class IODispatcher {
     func currentValue(_ offset: UInt32) -> UInt8 {
         switch offset {
         case 0xE800: return videoPageLatch
-        case 0xF801: return statusByte | (videoTiming.pending ? 0x04 : 0)
-        case 0xC031: return 0x00   // board ID: pre-Pepsi (0x00) until ROM trace says otherwise
+        // $F801 bit 2 (vertical-retrace) is ACTIVE-LOW: 0 == retrace pending,
+        // 1 == not pending. Established from the OS source at Checkpoint E (M4
+        // Task 3): the OS's Level1 handler (LIBHW-DRIVERS `Level1`) does
+        // `BTST #2,StatusRegister+1 / BNE (skip VertRetrace)` -- comment
+        // "branch if NOT vertical retrace" -- so a PENDING retrace must expose
+        // bit 2 = 0 for the handler to service (and ack via `VertRetrace`'s
+        // `$E018` write). Our earlier active-high model (bit2 = pending?4:0)
+        // stormed the OS's level-1 handler: it read bit2=1 as "not retrace",
+        // never acked, and `Machine.vsyncPending` held level 1 asserted
+        // forever. The ROM's own bit-2 self-test is polarity-agnostic (a
+        // soft-fail either way -- docs/rom-trace-notes.md "Trace checkpoint B"),
+        // so every ROM anchor is unmoved. See "Checkpoint E".
+        case 0xF801: return (statusByte & ~0x04) | (videoTiming.pending ? 0 : 0x04)
+        // $FCC031 = DiskROMId (LIBHW-DRIVERS:135), the I/O-board disk-ROM
+        // ident byte. M4 Task 4 round 4: was a 0x00 "pre-Pepsi" stub (benign
+        // for the ROM, whose only gate is the bit7 Pepsi contrast tweak at
+        // $FE0B24-$FE0B3C -- docs/rom-trace-notes.md "$C031 board ID"), but
+        // the OS's BOOT_IO_INIT decodes it as the MACHINE IDENTITY
+        // (SOURCE-STARTUP:1876-1890): signed >= 0 -> iob_lisa (Twiggy
+        // Lisa 1), which made STARTUP:1970-1972 install the vestigial TWIGIO
+        // stub driver (SOURCE-CD:750, body compiled out in OS 3.1 under
+        // (*$IFC TWIGGYBUILD*), source-twiggy:1235/1237) on the boot-floppy
+        // devrecs "#14#1"/"#14#2" -- the Checkpoint F orphaned-mount-read
+        // stall. The Lisa 2/10 we model presents a Pepsi-class ID: bit7 set
+        // (LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside
+        // [$A0,$DF] (iob_sony/iob_lite, STARTUP:1879-1885) -> with
+        // $FCC015=1 below, iomodel = iob_pepsi (STARTUP:1886-1890). The
+        // specific byte $88 is derived from the decode, not an external
+        // ident table (the 6504 disk ROM is not in the source tree): any
+        // bit7-set value outside [$A0,$DF] with bit5 clear satisfies every
+        // decode the ROM and OS perform -- see docs/hardware-notes.md
+        // "Board IDs" for the full derivation statement.
+        case 0xC031: return 0x88
         // $FCC015 (adr_intdisk, docs/hardware-notes.md §9 "Board IDs"):
         // 0=twiggy, 1=single-sided Sony, 2=double-sided Sony. Task 4 moves
         // this from unknown-I/O (0xFF) to 1 -- matches the 400K install

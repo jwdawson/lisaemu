@@ -1049,6 +1049,10 @@ extern const uint8    m68ki_ea_idx_cycle_table[];
 extern uint           m68ki_aerr_address;
 extern uint           m68ki_aerr_write_mode;
 extern uint           m68ki_aerr_fc;
+/* LisaEmu (M4 Task 4 round 4) -- see m68kcpu.c and
+ * m68ki_exception_bus_error() below. */
+extern uint           m68ki_opcode_fetch_active;
+extern uint           m68ki_ppc_prev;
 
 /* Forward declarations to keep some of the macros happy */
 static inline uint m68ki_read_16_fc (uint address, uint fc);
@@ -1678,12 +1682,16 @@ static inline void m68ki_stack_frame_0010(uint sr, uint vector)
 
 /* Bus error stack frame (68000 only).
  */
-static inline void m68ki_stack_frame_buserr(uint sr)
+/* LisaEmu (M4 Task 4 round 4): parameterized on the pushed PC and access
+ * address so the 68000 bus-error path can push real-68000 jump-fault
+ * values while the address-error path keeps its historical REG_PC /
+ * m68ki_aerr_address behavior (TomHarte conformance). */
+static inline void m68ki_stack_frame_buserr(uint sr, uint pc, uint address)
 {
-	m68ki_push_32(REG_PC);
+	m68ki_push_32(pc);
 	m68ki_push_16(sr);
 	m68ki_push_16(REG_IR);
-	m68ki_push_32(m68ki_aerr_address);	/* access address */
+	m68ki_push_32(address);	/* access address */
 	/* 0 0 0 0 0 0 0 0 0 0 0 R/W I/N FC
 	 * R/W  0 = write, 1 = read
 	 * I/N  0 = instruction, 1 = not
@@ -1994,7 +2002,71 @@ static inline void m68ki_exception_bus_error(void)
 	 * Scripts/vendor-musashi.sh, which re-applies this patch after
 	 * re-vendoring from upstream.
 	 */
-	m68ki_stack_frame_buserr(sr);
+	/* LisaEmu fix (M4 Task 4 round 4): real-68000 jump-gate frame
+	 * semantics. The Lisa OS's recoverable-bus-error engine
+	 * (SOURCE-EXCEPASM BUS_ERR) decodes the group-0 frame's instruction
+	 * register and applies instruction-specific PC adjustments to RE-RUN a
+	 * faulting jump after its target code segment is swapped in:
+	 * JSR.L -> PC-6, JSR d16(An) -> PC-4, JSR (An)/JMP/RTS/RTE -> PC-2,
+	 * and for RTS it additionally un-pops the return address. Those
+	 * constants encode real 68000 microcode order: the TARGET PREFETCH
+	 * happens inside the jump instruction, BEFORE a JSR pushes its return
+	 * (so a re-run pushes it exactly once) and AFTER an RTS pops it.
+	 * Musashi instead completes the jump and faults at the next loop-top
+	 * opcode fetch with PC = target+2 -- which made the OS's re-run push a
+	 * SECOND return address into a syscall parameter frame (observed live;
+	 * docs/rom-trace-notes.md "Checkpoint G (round 4)"). When the fault is
+	 * that loop-top fetch (m68ki_opcode_fetch_active) and the previous
+	 * instruction (still in REG_IR -- the aborted fetch never overwrote
+	 * it) is one of the OS-recoverable jump forms, push the frame the real
+	 * 68000 way: PC = jump address + the OS's expected offset, access
+	 * address = the full unmasked target (REG_PC-2, preserving the OS's
+	 * $A0xxxxxx gate tag bits, which the 24-bit bus mask strips before the
+	 * Swift Bus ever sees them), and undo a JSR's already-committed push.
+	 * Mid-instruction data faults push PC = instruction start + 2 (the
+	 * convention the OS's TST stack-probe case decodes with PC-2). */
+	{
+		uint frame_pc = REG_PC;
+		uint frame_addr = m68ki_aerr_address;
+		if(m68ki_opcode_fetch_active)
+		{
+			/* Edge (documented, accepted): REG_IR still holds the LAST
+			 * EXECUTED instruction. If an exception/interrupt dispatched
+			 * right after a completed jump form and the FIRST opcode fetch
+			 * of its handler faulted, that fetch would be misclassified as
+			 * the jump's own target prefetch (PC re-pointed at the old jump
+			 * site, a JSR's push wrongly undone). Unreachable on traced
+			 * Lisa paths: every exception/interrupt vector points into
+			 * resident kernel segments (vec dump at Checkpoint G --
+			 * $2E2xxx/$5208xx/$F80018/$4602xx), whose fetches cannot
+			 * fault; only the deliberate $A0xxxxxx gate targets do, and
+			 * those are always reached by the jump itself. */
+			uint op = REG_IR;
+			uint adj = 0, undo_push = 0, matched = 0;
+			if(op == 0x4eb9)                 { adj = 6; undo_push = 1; matched = 1; } /* JSR (xxx).L */
+			else if((op & 0xfff8) == 0x4ea8) { adj = 4; undo_push = 1; matched = 1; } /* JSR d16(An) */
+			else if((op & 0xfff8) == 0x4e90) { adj = 2; undo_push = 1; matched = 1; } /* JSR (An)    */
+			else if(op == 0x4ef9 || (op & 0xfff8) == 0x4ed0 ||
+			        op == 0x4e75 || op == 0x4e73)
+			                                 { adj = 2; matched = 1; }               /* JMP.L / JMP (An) / RTS / RTE */
+			if(matched)
+			{
+				frame_pc = m68ki_ppc_prev + adj;
+				frame_addr = REG_PC - 2;
+				if(undo_push)
+				{
+					if(sr & 0x2000) REG_SP += 4;
+					else            REG_USP += 4;
+				}
+			}
+			m68ki_opcode_fetch_active = 0;
+		}
+		else
+		{
+			frame_pc = REG_PPC + 2;
+		}
+		m68ki_stack_frame_buserr(sr, frame_pc, frame_addr);
+	}
 
 	m68ki_jump_vector(EXCEPTION_BUS_ERROR);
 
@@ -2106,7 +2178,7 @@ static inline void m68ki_exception_address_error(void)
 	CPU_RUN_MODE = RUN_MODE_BERR_AERR_RESET_WSF;
 
 	/* Note: This is implemented for 68000 only! */
-	m68ki_stack_frame_buserr(sr);
+	m68ki_stack_frame_buserr(sr, REG_PC, m68ki_aerr_address);
 
 	m68ki_jump_vector(EXCEPTION_ADDRESS_ERROR);
 

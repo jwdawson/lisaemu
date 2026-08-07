@@ -276,9 +276,15 @@ With `$C031 == 0x00`, bit7 is clear, `bpl` at `$FE0B2A` **is taken**: the ROM
 takes the **pre-Pepsi path**, skipping the Pepsi-only DAC adjustment. This is a
 benign, sane branch — `0x00` does not send POST into any error. The alternate
 value `$80` (bit7=Pepsi) would instead run the `lsr/add` contrast tweak — also
-benign, not an error. **No stub change is warranted: the `0x00` default is
+benign, not an error. ~~**No stub change is warranted: the `0x00` default is
 correct and is the simplest documented board (pre-Pepsi, VIA1 T1 reload
-`$CA/$27`).** This closes OQ3 below.
+`$CA/$27`).**~~ This closes OQ3 below. **(M4 Task 4 round 4 correction:
+`0x00` is indeed benign for the ROM — both branches here are sane — but the
+OS decodes `$C031` as the MACHINE IDENTITY (STARTUP:1876-1890), and `0x00`
+made it configure a Twiggy Lisa 1 with a compiled-out floppy driver — the
+Checkpoint-F stall's root cause. `$C031` now returns `$88` (Lisa 2/10); the
+ROM re-takes the bit7-set Pepsi contrast branch, which is framebuffer-neutral
+— every ROM anchor re-verified green. See "Checkpoint G (round 4)".)**
 
 ### `$D241` — unidentified controller, passes the stub (not blocking)
 
@@ -305,7 +311,7 @@ recorded here as a future serial-device requirement.
 | `$F801` status register bit 1 (`btst #1`)                 | still undetermined — Task 6 found all 3 statically-cited gating sites (`$FE00D0`/`$FE0F14`/`$FE0F72`) are either dead code or unconfirmed live-reached through 30M cycles; see "Bus-error frame spike" below | later task |
 | `$FE2DBE` unconditional "next COPS input byte" wait        | **RESOLVED (Task 7)** — NOT a POST blocker: it is the boot MENU's "await next COPS input event" (mouse/keypress) idle loop. POST is complete and the startup menu is drawn by the time the ROM sits here; with no user input it correctly waits forever. See "POST completion (Task 7)" below. | ~~later task~~ |
 | `$D241` controller (error `$37/$38`)                      | candidate SCC; passes 0xFF stub, defer       | later serial task |
-| `$C031` board ID                                          | none — `0x00` (pre-Pepsi) already correct    | — |
+| `$C031` board ID                                          | ~~none — `0x00` (pre-Pepsi) already correct~~ **M4 Task 4 round 4: `0x00` was correct FOR THE ROM only — the OS decodes `$C031` as machine identity; now `$88` (Pepsi/Lisa 2/10), ROM anchors unmoved. See "Checkpoint G (round 4)".** | — |
 
 ## COPS (Task 4)
 
@@ -626,8 +632,17 @@ read (`$FE0B24`/`$FE0B2C`/`$FE119A`). The gating branch `tst.b $fcc031;
 bpl $fe0b3c` takes the **pre-Pepsi path** on `0x00` (bit7 clear) — it skips a
 Pepsi-only contrast/DAC adjustment and otherwise proceeds normally. `0x00` does
 **not** divert POST into any error, and the alternate `$80` path is equally
-benign. **The `0x00` default is correct and needs no change** (it selects the
-simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).
+benign. ~~**The `0x00` default is correct and needs no change** (it selects the
+simplest documented board, pre-Pepsi, VIA1 T1 reload `$CA/$27`).~~
+**(M4 Task 4 round 4 correction — same supersession as the twin claim
+above at "`$C031` board ID — read, and `0x00` does NOT divert POST":
+`0x00` is indeed benign for the ROM — both branches here are sane — but
+the OS decodes `$C031` as the MACHINE IDENTITY (STARTUP:1876-1890), and
+`0x00` made it configure a Twiggy Lisa 1 with a compiled-out floppy
+driver — the Checkpoint-F stall's root cause. `$C031` now returns `$88`
+(Lisa 2/10); the ROM re-takes the bit7-set Pepsi contrast branch, which
+is framebuffer-neutral — every ROM anchor re-verified green. See
+"Checkpoint G (round 4)".)**
 
 ## Bus-error frame spike + board-ID/memory-sizing validation (M1b Task 6)
 
@@ -1616,10 +1631,12 @@ mechanism:**
   run: EXCEPASM saves `domvalue` ("*user's domain on sys call entry*") so the
   OS can act on the user's domain on syscall entry, hinting the kernel may
   read/write user buffers in domain N while supervisor (LDSN mechanism, or a
-  data-reference mode that DOES follow the latch). **OQ1″ (open, flagged for
+  data-reference mode that DOES follow the latch). ~~**OQ1″ (open, flagged for
   the first user-process milestone, M4/M5):** *does supervisor DATA access to a
   user domain follow the context latch?* No traced path exercises it; revisit
-  `translationDomain` then. (See the open-questions table below.)
+  `translationDomain` then.~~ **(ANSWERED — M4 Task 4 round 5: it forces
+  domain 0, captured live; see "Checkpoint G … OQ1″ — ANSWERED (round 5)" and
+  the updated open-questions table below.)**
 
 ### What the fix reveals — the loader loads the OS image; the OS's COPS driver
 
@@ -1674,11 +1691,17 @@ ever occurs (`writeAttempts==0`). Framebuffer unchanged (menu still present,
   calls, `mmuPortWrites` climbs past 4638, `blocksRead==75`, `lastError==0`,
   the PC reaches the OS COPS driver `$520800-$5208FF`, `writeAttempts==0`.
 
-**Reproduction.** This frontier is reachable **only through the integration
-test** — `lisadbg` cannot get here on its own: it has no menu-harness (the
-cursor-walk + click that selects a boot device), so it cannot drive the ROM
-past the boot menu into the loader. `bootIntoLoader` (the `ROMFloppyBootTests`
-harness) is the sole reproduction vehicle for the `$520000` state.
+**Reproduction.** ~~This frontier is reachable **only through the
+integration test** — `lisadbg` cannot get here on its own: it has no
+menu-harness (the cursor-walk + click that selects a boot device), so it
+cannot drive the ROM past the boot menu into the loader. `bootIntoLoader`
+(the `ROMFloppyBootTests` harness) is the sole reproduction vehicle for the
+`$520000` state.~~ **Superseded (M4 Task 2):** `lisadbg` now has its own
+menu-boot harness (the `bootdisk` command, `Sources/lisadbg/main.swift`,
+porting this exact cursor-walk + click mechanism) and reaches this state —
+and well past it — on its own; the integration test is no longer the sole
+reproduction vehicle. See `task-2-report.md` for a live transcript reaching
+`$520712`+ (the current, Task-1-advanced frontier) standalone.
 
 ## M3 Task 3 — deferrals re-recorded to M4 (parked-debt bundle)
 
@@ -1696,7 +1719,7 @@ has forced either into scope.
 | **ProFile HLE** | Same low-core cell: `dev_type` never observed `= 1` (`dev_prof`) on any traced path. `docs/hardware-notes.md` §9's "ProFile interleave table" is transcribed as research only, never exercised. | None yet. |
 | **Soft power / Power menu** | No traced boot path (menu idle-wait, floppy boot, the OS loader through Checkpoint D) has been observed to issue a Power Command byte (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`, docs/hardware-notes.md §7). | `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`) already recognizes and logs every Power Command byte, regression-pinned by `COPSTests.powerCommandsAreLogged` — no shutdown/reboot/alarm semantics are modeled behind the log, by design, until M4 evidence demands them. |
 | **OS COPS command-send driver** (M3 Task 4 STOP) | The boot now reaches the OS's own COPS driver at `$520824` (sends `$7C`) and spins: our simplified COPS model drops CRDY on *every* register-15 write, but this driver re-writes register 15 each poll iteration (real hw: register 15 is *no-handshake* — stages without strobing the COPS; the `DDRA2 $00→$FF` transition is the real send). See "Kernel push (M3 Task 4)". | `Sources/LisaCore/COPS.swift` (`handleCommandWrite`) — needs a **DDRA2-gated CRDY handshake** + re-validation of the pinned ROM COPS path (menu FNV, POST presence probe, `COPSTests`, M1c input) before it can advance. |
-| **OQ1″ — supervisor DATA access to a user domain** (open) | `Bus.translationDomain` models `supervisor ⇒ domain 0` as unconditional, but only supervisor *execution* is proven (§1). EXCEPASM saves `domvalue` so the OS can act on the user's domain on syscall entry — the kernel may read/write user buffers in domain N while supervisor once processes run. No traced path exercises it. | `Sources/LisaCore/Bus.swift` `translationDomain` — revisit at the first user-process milestone (M4/M5). |
+| **OQ1″ — supervisor DATA access to a user domain** ~~(open)~~ **ANSWERED (M4 Task 4 round 5)** | ~~No traced path exercises it.~~ Captured live: ~1.02 M supervisor data accesses (kernel-stack writes, SYSGLOBAL/vector reads from ISRs) while the latch was 1, to segments domain 1 maps ABSENT — all resolved through domain 0, boot healthy to the installer UI. Syscall VAR write-backs happen in USER mode (Read_PMem trace), so supervisor stores into user-domain private memory do not arise. See "Checkpoint G … OQ1″ — ANSWERED (round 5)". | `Sources/LisaCore/Bus.swift` `translationDomain` — model CONFIRMED unconditional; residual falsifier (both-present-differing supervisor data access) documented there and in the OQ1″ section. |
 
 Wired the same way the plan's own precedent already established
 (`docs/hardware-notes.md` §7 "Soft Power Control" carries the mirrored
@@ -1729,10 +1752,545 @@ above (evidence + citations).
 |---|---|---|
 | **OQ1** | Does SLIM/SORG register programming target the CURRENT (active) domain, or an "inactive domain" per the original M1a hardware-notes transcription? | **ANSWERED** (M3 Task 2) — the CURRENT (active) domain, source-established (`initmmutil`/`do_an_mmu` both establish-then-program). The "inactive domain" reading is refuted; hardware-notes.md §1 carries the strike-through. See "OQ1 status" above. |
 | **OQ1′** | Checkpoint D's domain-1 crossover: how does `do_an_mmu`'s own code stay reachable the instant it switches the live context into an empty domain? | **RESOLVED** (M3 Task 4) — supervisor-mode code EXECUTION always translates through domain 0, regardless of the context latch; the latch only gates user-mode accesses. Implemented as `Bus.translationDomain`. Supersedes the Task 2 "per-domain vs. global segment presence" framing — it is neither, it is supervisor-vs-user. See "Kernel push (M3 Task 4)" above. |
-| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | **OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet (min SR stays `$2700`, no user processes run in M3). Flagged for the first user-process milestone (M4/M5); revisit `Bus.translationDomain` then. |
+| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | ~~**OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet.~~ **ANSWERED (M4 Task 4 round 5)** — forces domain 0, same as execution. Captured live at Checkpoint G: ~1.02 M supervisor data accesses (kernel-stack pushes, SYSGLOBAL + autovector reads inside ISRs) with the latch at 1 to segments domain 1 maps ABSENT, every one resolved via domain 0; a latch-following model could not survive the first interrupt during user execution (fatal-on-supervisor-fault rule, SOURCE-EXCEPRES:227-232). Residual falsifier (a both-present-differing supervisor data access) documented in "Checkpoint G … OQ1″ — ANSWERED (round 5)". |
 | **OQ2** | How does the ROM reach ROM/special space (segments 125-127) in translated mode — exact SLIM/SORG values? | **ANSWERED** (M1b Task 5) — seg 127 (prom) SLIM `$F00`/nibble `$F`; seg 126 (iospace) SLIM `$901`/nibble `$9`; seg 125 (screen) left absent at setup-drop. See "Answers to the Task 5 open questions" above. Unrelated to M3's MMU work; listed here only for a complete OQ roster at milestone close. |
 | **OQ3** | Does board-ID `$C031 == 0x00` send POST down a sane (non-error) path? | **ANSWERED** (M1b Task 5) — yes, the pre-Pepsi path, benign. See "Answers to the Task 5 open questions" above; unrelated to M3, listed for completeness. |
 
 The M3 Task 3 deferrals table above (Widget HD, ProFile, soft power/Power
 menu, the OS COPS driver, and OQ1″) is this document's live record of what
 M3 consciously left for M4; nothing in that table was silently dropped.
+
+## Checkpoint E (M4 Task 3) — THE UNMASKING: live interrupts and the OS comes alive
+
+M4 Task 1 opened the OS↔COPS handshake; M4 Task 2 gave `lisadbg` a `bootdisk`
+harness. This checkpoint follows the OS from the un-frozen COPS driver through
+`DriverInit`/`INITSYS` to **the first live interrupt delivery in the emulator's
+history**, and finds the OS running its scheduler in user mode. One real
+emulation divergence was found and fixed (an inverted `$F801` bit-2 polarity
+that stormed the OS's level-1 interrupt handler), root-caused against the OS
+assembly source before being patched.
+
+### What the OS does after the COPS driver (LIBHW-DRIVERS `DriverInit`)
+
+The loaded OS at `$520000` runs `DriverInit` (LIBHW-DRIVERS:493) then `INITSYS`.
+`DriverInit` programs the hardware the way the source prescribes and our model
+answers:
+
+- **VIA1 T1 = the millisecond tick.** `DriverInit` picks the T1 reload from the
+  board ID (LIBHW-DRIVERS:578-588): pre-Pepsi `$27CA`, post-Pepsi `$637B`.
+  `DiskROMId` bit 7 selects; ~~our board reports pre-Pepsi (`$C031==0`, OQ3), so
+  the OS writes **`LCounterInit=$CA` / `HCounterInit=$27`** (the pre-Pepsi
+  values) — confirmed live.~~ **Superseded (M4 round 4, 2026-08-07):** round
+  4's `DiskROMId` fix (commit 90d7cdf) set `$C031=$88` (bit7 set), so
+  `DriverInit` now selects the **post-Pepsi `$637B`** reload per
+  LIBHW-DRIVERS:578-588 — this was true of the pre-round-4 machine and
+  remains accurate history for Checkpoint E AS RUN THEN, but is not the
+  live board state after round 4. It sets `ACR1=$48`, enables T1 via
+  `IER1=$C0`, and installs `Level1` at vector `$0064`.
+- **Level-2 COPS.** `DDRA2=$00` (port A input), `PCR2=$C9`, `ACR2=$01`,
+  `IER2=$82` (enable COPS), then `COPSCMD` sends **`$7C`** ("enable mouse
+  interrupts", the very command M4 Task 1's handshake fix let complete), and
+  installs `Level2` at vector `$0068`.
+
+### The divergence — `$F801` bit-2 vsync polarity was inverted (interrupt storm)
+
+The instant the OS lowers SR below `$2700`, its `Level1` handler
+(`$5208A6`, LIBHW-DRIVERS:895) runs. Its first act:
+
+```
+Level1  MOVEM.L A0/D0,-(SP)
+        BTST    #2,StatusRegister+1   ; $FCF801 bit 2 — vertical retrace?
+        BNE.S   @0                    ; "branch if NOT vertical retrace"
+        JSR     VertRetrace           ; else service + ack it
+```
+
+`BNE` taken means bit 2 ≠ 0 ⇒ *not* retrace; so **bit 2 == 0 is the OS's
+"retrace pending" encoding** (active-LOW), and only then does it call
+`VertRetrace`, whose tail writes `$E018` (VertReset) to acknowledge.
+**`VertRetrace`'s own ack spin settles the polarity independently and even
+more decisively than the `Level1` gate above** (LIBHW-DRIVERS:958-960, the
+Task-3 reviewer's re-proof): after writing `$E018`, `VertRetrace` waits for the
+retrace to *pass* by spinning WHILE `$F801` bit 2 reads 0 (`btst #2` / branch
+back while zero) — i.e. bit 2 == 0 is unambiguously "retrace in progress /
+pending" and the routine loops until hardware raises it to 1 ("retrace over").
+A model exposing bit 2 active-HIGH would make this spin exit immediately (or
+never enter), the opposite of the hardware's intent. Our model
+exposed the bit **active-HIGH** (`pending ? 0x04 : 0`), so the handler read
+bit2=1 as "no retrace", never called `VertRetrace`, never acked — while
+`Machine.vsyncPending` (a real level-1 source) stayed asserted. The moment SR
+dropped, the CPU took a level-1 interrupt, `Level1` found "nothing to do",
+`rte`'d, and **immediately re-entered** because the vsync line was still high:
+a permanent interrupt storm, PC pinned in the `$5208xx` handler, no main-code
+progress. (Traced live: `vsyncPending=true`, `F801=$04`, the handler cleanly
+`rte`-ing and re-entering `$5208A6` every iteration.)
+
+**Fix** (`IODispatcher.currentValue`, `case 0xF801`): expose bit 2 active-low —
+`(statusByte & ~0x04) | (pending ? 0 : 0x04)`. Now a pending retrace reads
+bit2=0, `Level1` calls `VertRetrace`, `$E018` clears `vsyncPending`, and the
+level-1 line drops. This is *more* faithful to the ROM too: the ROM's own
+vsync self-test (`$FE0BA2`, "Trace checkpoint B" above) clears via `$E018` then
+waits for bit 2 to read 0 as "the next retrace arrived" — active-low. The ROM
+tolerated the old polarity only because that self-test is soft-fail either way;
+**every ROM anchor (menu FNV `0xd09234d25516d0b8`/78,100 px, POST, floppy boot
+through the COPS driver) is unmoved by the fix**, confirmed by the full suite.
+hardware-notes.md §2/§5 carry the corrected polarity (strike-not-erase).
+
+### The first live interrupts — verified against the OS's handlers
+
+With the storm gone, SR unmasks at `$5208A6` (`$2700 → $2100`) and the
+emulator delivers its first interrupts, straight into the OS's own handlers:
+
+- **Level 2 (COPS/VIA2)** first: vectored to **`Level2` @ `$520A52`** (SR
+  `$2004 → $2200`). The initial COPS packets (the `$7C` ack / power-on stream)
+  are consumed here.
+- **Level 1 (VIA1 T1 ms-tick / vertical retrace)**: vectored to **`Level1` @
+  `$5208A6`** (SR `→ $21xx`), servicing `VertRetrace` (`ScrnFrames`,
+  cursor tracking) and `Timer1` each tick.
+
+Both autovectors match the addresses `DriverInit` installs at `$0064`/`$0068`.
+The M1b-era "interrupt-delivered floppy completion never exercised" item is now
+partially retired: `Level1` polls the Twiggy/disk completion lines (`VIA2 PB4`,
+`VIA1 IFR`) on every tick under live interrupts — though no disk *completion*
+interrupt fires at this checkpoint (the OS issues no new disk command here).
+
+### Where it rests — the OS scheduler idles in a user-mode event-wait (the STOP)
+
+Freed from the storm, the OS runs its scheduler across **eleven loaded code
+segments** (`$22/$24/$26/$28/$2E/$3C/$3E/$46/$48/$4C/$CC xxxx`) and drops to
+**user mode (SR `$0000`)** — its first processes are running. It then settles
+into a steady **user-mode event-wait loop** at `$4C0276`:
+
+```
+$4C0276 movea.l ($a,A6),A0
+$4C027A move.l  (A0),-(A7)
+$4C027C pea     (-$2a,A6)
+$4C0280 jsr     ($7d4,A5)     ; getter -> $2E2BE4: reads a field, returns
+$4C0284 cmpi.b  #$2,(-$2a,A6) ; wait for an in-RAM state byte to become 2
+$4C028A bne     $4c0276
+```
+
+This loop touches **no hardware** — it polls an in-RAM state field for the
+value `2`; the only live I/O in the whole resting steady-state is the ms-tick
+`Level1` handler. Over ~1.77 billion cycles (~350 s emulated) nothing changes:
+`blocksRead` stays 323, `writeAttempts` 0, `mmuPortWrites` ~5508, the screen
+frozen at 78,181 px (the ROM boot screen plus the OS's hourglass/busy cursor —
+the OS's `VertRetrace` cursor code is now live). Injected mouse motion does not
+move the cursor here, so this is not the interactive desktop idle: the OS is
+**blocked in its scheduler waiting for an in-memory event to be posted** that
+never is in our model.
+
+**The STOP (a documented boundary, not a bug):** the OS is alive — scheduler
+running, both interrupt levels delivering to its own handlers, first processes
+in user mode — and idles awaiting an unposted event. Identifying which
+process/event the wait polls (and satisfying it, toward the Office System
+desktop) is **M4 Task 4**. Whether that event is a scheduler/exception post, an
+alarm, or a device-completion the boot volume needs (Widget probe) is the next
+frontier.
+
+### OQ statuses at Checkpoint E
+
+- ~~**OQ1″ (supervisor DATA access to a user domain): still OPEN, not yet
+  forced.**~~ **(ANSWERED — M4 Task 4 round 5, see "Checkpoint G … OQ1″".)**
+  At Checkpoint E it was true that `Bus.domain` stayed **0** throughout and
+  no supervisor access to a non-zero domain had occurred yet.
+- **Floppy writes: still none observed** (`writeAttempts==0` everywhere through
+  Checkpoint E). Session write-through stays armed but unbuilt, exactly as the
+  plan's contingency prescribes — nothing to implement until the OS writes.
+- **COPS `$02` clock read:** not observed at this checkpoint; the OS's COPS
+  traffic here is the `$7C` mouse-int enable and the level-2 packet stream.
+
+### What the Checkpoint E test pins (`ROMFloppyBootTests`)
+
+`checkpointE_unmaskingAndFirstLiveInterrupts` — from the loaded OS code:
+`minSR < $2700` (the unmasking, in fact to `$0000`), the `Level1` (`$5208A6`)
+AND `Level2` (`$520A52`) handlers both entered (first live level-1 + level-2
+delivery), user mode reached, the `$4C0270` event-wait loop reached, `!halted`,
+`busErrorPulseCount==0`, `writeAttempts==0`, ~~`blocksRead==323`~~. Robust
+invariants alongside the exact deterministic handler/loop anchors.
+**Superseded (M4 round 4, 2026-08-07):** the committed test now asserts
+`blocksRead==344` — re-anchored in round 4 (the +21 SYSTEM.CDD/CD loader
+reads that the real Sony driver fix causes before the unmasking); see
+"Checkpoint G (round 4)"'s "Checkpoint E re-anchor" note.
+
+
+## Checkpoint F (M4 Task 4) — the init-time driver I/O-completion poll (CORRECTED)
+
+Checkpoint E left the OS idle in a poll at `$4C0270`, waiting for an in-RAM byte
+to become `2`. M4 Task 4 dissected that wait. **The first-round diagnosis below
+was WRONG and is struck; the corrected diagnosis, proven against the OS source
+(source-DRIVERDEFS/asynctr/clock/SOURCE-STARTUP), follows.**
+
+> ~~**(Struck — M4 Task 4 review.)** The polled cell is an "event object" and
+> the OS "blocks on an event that another process or a device would post";
+> hypothesis-4 "no second process" was read as confirmation of a
+> co-process/"multiprocess event-dispatch" boundary; the leading trigger was
+> guessed to be "a periodic COPS/RTC status interrupt our HLE doesn't emit."~~
+> Every one of those claims is refuted below. The empirical traces that fed
+> them (getter `$2E2BE4` reads obj+`$14`; the sole writer `$2E2BFC` sets it to
+> `2`; input does not post it; the OS Timer Manager is healthy; A5 never
+> changes; nothing else runs) are all correct — only their *interpretation* was
+> wrong.
+
+### What the poll actually is: a driver-request-block completion wait
+
+The polled object is a **driver I/O request block** (`reqblk`,
+source-DRIVERDEFS:182-204). Field offsets confirmed live: obj+`$4` =
+`pcb_chain.kind` = `reqblk_type(1)` (proves the record type); the polled cell
+obj+`$14` is `reqstatus.reqsrv_f`, enum `(active,in_service,complete)=0/1/2` —
+so the awaited value **`2` means `complete`**. The getter `$2E2BE4` returns that
+field; the loop spins until it is `complete`.
+
+The sole writer `$2E2BFC` is **`unblk_req`** (source-asynctr:209-245), matched
+instruction-for-instruction: `cmpi.b #$2,(A4)` = "if reqsrv_f <> complete";
+`move.b #$2,(A4)` = "reqsrv_f := complete"; the `[$15]:=[$16] xor 1` "toggle"
+(mis-read at first round as a blink pair) is literally
+`reqsuccess_f := not reqabt_f`; `tst.l (A3)` = "if pcb_chain.headr <> nil"; the
+`($c54,A5)` call = `ALARMRELATIVE(unblk_alarm,0)`. `unblk_req`/IODONE is called
+from **device-completion handlers** (floppy, ProFile, serial, console) and from
+the 10 ms clock ISR `CLK_Q_MGR` (source-clock:447). The poster is an
+**ISR/driver completion**, not a co-process.
+
+### The boot phase: single-process STARTUP, before multiprocessing
+
+Per SOURCE-STARTUP:2174-2184, `INITSYS` runs `BOOT_IO_INIT` (= Checkpoint E's
+unmasking, "Init all devices, runs FS_INIT") → `SYS_PROC_INIT` (creates the
+system processes) → … → `ENTER_SCHEDULER`. Our observed "A5 never changes, no
+context switch" is **not** a co-process boundary — it means the boot is still in
+the **single outer STARTUP process, inside `BOOT_IO_INIT`, before
+`SYS_PROC_INIT` has created any other process.** At this phase a wait can only
+be satisfied by an ISR/driver completion.
+
+### The request, identified: an FS-mount READ to the OS's own Sony driver
+
+The reqblk fields (live): `operatn` (obj+`$18`) = `1` = **read**; `cfigptr`
+(obj+`$1A`) → a `devrec` at `$CC5CE0` whose driver `entry_pt` is a jump table
+into segments `$46/$48/$4A`; `req_extent` (obj+`$1E`) → a `disk_extend` reading
+**block `41`** = the volume's `fs_strt_blok` (`ext_diskconfig.fs_strt_blok`,
+`num_bloks=$694`=1684). Devices `"#14#1"`/`"#14#2"` share this driver. The
+driver code references **`$FCC000`/`$FCC180`** (the floppy shared-RAM window +
+parameter memory), so this **is the OS's own Sony floppy driver** for the two
+drive slots — issuing the boot-volume MDDF/catalog read that FS_INIT needs to
+mount the boot volume. (It is NOT an unimplemented device, and NOT the boot
+Sony we already serve via the ROM routine — see next.)
+
+### Why it never completes — the precise, corrected frontier
+
+Counting across the whole boot-to-rest:
+
+- **`unblk_req` (`$2E2BFC`) executes 0 times** — no reqblk is ever completed.
+- **The OS Sony driver's hardware layer never runs** — its command-issue
+  (`$46027A`: `move.b #$88,($3,A2)` to `$FCC003`) and command-wait
+  (`$460160`: poll `$FCC001` + `$FCD801` bit 6) execute **0 times**. The request
+  is never dispatched to hardware (no `$FCC000` access occurs after the last
+  read).
+- **Every working read (248, blocks 75→323) used the *synchronous* ROM read
+  routine `$FE1E0E`** (`movea.l #$fcc001,A0`) — the loader-style path. The
+  boot loads itself synchronously via the ROM; the **first time it issues an
+  *async* `reqblk` read (the FS mount), it hangs.**
+
+The reviewer's suspect (a) — "the ms-tick never reaches `CLK_Q_MGR`'s
+alarm-expiry path" — is **refuted**: the alarm mechanism is alive and firing.
+The alarm-callback table `$CC0090[]` holds kernel alarms `$521360` and
+`$52123E`, both of which **fire** (9× / 10× over 40 M cycles) driven by the ms
+tick → Timer Manager. But the **Sony driver's own servicing alarms**
+(`$4612EC`, `$4611A0`, also registered in `$CC0090[]`) are **registered but
+never armed** (their `$CC0026` active bit stays clear), so the driver is never
+kicked to service the queued request. The gap is therefore **not** the clock
+ISR and **not** an unimplemented device: it is that the enqueued async disk
+request is **never dispatched to the Sony driver** (its servicing alarm is never
+armed) at this pre-multiprocessing stage, so no completion ISR ever calls
+`unblk_req`.
+
+**Corrected boundary (M5 frontier):** the OS's **async driver request-dispatch
+path** for the boot-volume FS-mount read does not function under our emulation
+during single-process `BOOT_IO_INIT` — ~~the Sony driver's servicing alarm is
+never armed,~~ the read is never issued to `$FCC000`, and `reqsrv_f` stays
+`active` forever. The synchronous ROM-routine read path works (248 reads); the
+async OS-driver path does not. ~~Identifying *why* the driver's alarm is not
+armed when `DEV_IO` enqueues the request (a driver-model / request-dispatch
+divergence — e.g., a device/parameter-memory state the driver checks before
+arming, or the `(-$55c,A5)` "skip-wait" mode flag the loop tests at `$4C0270`
+that is `0` here) is the M5 fix target.~~ **(Struck — the two candidates in that
+clause are RESOLVED in round-2 sharpening below; both are refuted.)** No
+evidence-gated device/core fix was reached this task: the two first-round-
+plausible fixes (clock-ISR alarm expiry; an unimplemented device) are both
+refuted, and fabricating completion would be faking progress.
+
+### Checkpoint F (round-2 sharpening) — the request is never STARTED, and disk-presence is answered correctly
+
+M4 Task 4 fix round 2 traced the reqblk's life directly (live, from OS start to
+the poll) and SHARPENS the frontier, resolving both round-1 candidates:
+
+- **The reqblk IS built here.** Creation traced to `$460472`. ~~(segment `$46`,
+  the OS Sony driver)~~ **(Struck — round 3: segment `$46` here is FS/mount code,
+  NOT the Sony driver; see round-3 section.)** The request-BUILD code runs; the
+  **hardware go-byte issue (`$46027A`) never runs.**
+- **`dskio` returns SUCCESS — `disk_present`=`gooddisk`, NOT `nodiskpres`.** The
+  caller's post-driver check `$4C026C: tst.w (A0); bgt $4C02E2` falls THROUGH to
+  the wait (returned status `0`, not the positive `nodiskpres`=614=`$266`; a
+  `>0` error would branch to `$4C02E2`). Per SOURCE-SONY:664-675 `dskio` returns
+  `nodiskpres` only `if disk_present = nodisk`; since it returned success,
+  `disk_present`=`gooddisk`.
+- **Our FloppyController HLE answers disk-presence CORRECTLY.** The OS learns
+  presence via `isdiskin` (SOURCE-SONYASM:437-440: `MOVE.B DISKIN(A2),D0` =
+  read window `$41`, `MOVE D0,RESPONSE(A3)`); hdinit sets `disk_present:=gooddisk`
+  when `response<>0` (SOURCE-SONY:629-636). `insert()` sets `window[$41]=1` and
+  `$FCC041` routes to `floppy.read(0x41)` (IODispatcher `0xC000...0xC7FF`), and
+  the one live DISKIN read in the whole boot returns `1`. **So round-1
+  candidate (a) "our HLE answers the disk-present query wrongly" is REFUTED by
+  direct evidence — the OS never even mis-reads presence.**
+- **The `(-$55c,A5)` "skip-wait" flag is `0`, so the wait is CORRECTLY taken**
+  (`$4C0270: tst.b (-$55c,A5)`). Refutes round-1 candidate (b).
+- **`reqsrv_f` never leaves `active`.** Verified live: over a 12 M-instruction
+  window at rest, `reqsrv_f` (`reqblk`+`$14`) never reaches `in_service(1)`, let
+  alone `complete(2)`. ~~Per SOURCE-HDISK:675-679 `ADD_REQUEST` starts a request
+  only via `if cur_num_requests = 1 then START_NEW_REQUEST`, and
+  `START_NEW_REQUEST` (SOURCE-HDISK:414-485) … The M5 fix target is thus the async
+  request-START mechanism (`ADD_REQUEST`/`START_NEW_REQUEST` and the driver's
+  device-busy/`cur_num_requests` accounting).~~ **(Struck — round 3. Source-
+  attribution error: HDISK is the shared queue helper, `ADD_REQUEST` is not a
+  real procedure (the enclosing proc is `dskio`), and the reviewer correctly
+  noted the analogous SONY code is SOURCE-SONY:251/333/336. But the deeper round-3
+  finding supersedes ALL of this: that queue code — `cur_num_requests`,
+  `START_NEW_REQUEST`, `dskio` — NEVER RUNS for this reqblk. See round-3 below.)**
+
+### Checkpoint F (round-3) — the reqblk is dispatched to a stub driver (nil control block), never queued
+
+Round 3 traced the reqblk **instruction-by-instruction** from its creation
+(`$460472`) to the poll (`$4C0270`) — 532 instructions, the entire path. The
+decisive facts (all live-verified, `ROMFloppyBootTests.checkpointF`):
+
+- **No queue code runs.** Nowhere in the 532-instruction enqueue→poll path is
+  there a `cur_num_requests += 1`, an `if cur_num_requests = 1` gate, a `START`/
+  `reqsrv_f := in_service` write, a go-byte to `$FCC000`, or any SONYASM/Sony-
+  driver code. **This refutes the round-2 "never reaches in_service via
+  START_NEW_REQUEST" framing AND the reviewer's stale-`cur_num_requests`
+  hypothesis: that accounting simply never executes for this request.**
+- **The dispatch target is a stub.** The path builds the reqblk (FS/mount code in
+  segment `$46`, using the `$221xxx` runtime multiply/divide routines) then calls
+  the target device's `entry_pt` (`$460210` loads `(devrec)` = `entry_pt` and
+  `jsr`s it). The boot-volume FS devrec is **"#14#1"** at `$CC5CE0` (= the
+  reqblk's `cfigptr`, `reqblk`+`$1A`). Its `entry_pt` (`devrec`+`$0`) is a `JMP.L`
+  trampoline `$CC50C2 → $46124E`, and `$46124E` is a **3-instruction driver body**
+  — `link A6,#-$32; clr.w ($c,A6); unlk; move.l (A7)+,(A7); rts` — i.e. it sets
+  its function result to `0` and returns, **doing no I/O**.
+- **Nil control block.** `devrec` "#14#1" has `cb_addr` (`devrec`+`$4`) = **`$0`**
+  (nil). Both floppy slots share this: "#14#1" (`$CC5CE0`) and "#14#2"
+  (`$CC5D3C`) both have `cb_addr=nil` and the SAME stub `entry_pt` `$CC50C2→
+  $46124E`. (For contrast, a real block driver needs a control block; and dskio
+  itself, SOURCE-SONY:664-675, dereferences `cb_addr→drivecb→ext_ptr`.)
+- **Consequence.** The async read is "accepted" (the stub returns status `0`,
+  which the caller at `$4C026C tst.w/bgt` reads as success and falls through to
+  the wait) but **orphaned**: it is never enqueued onto any device queue (the
+  reqblk's chain links stay nil), never started, never issued, never completed.
+  `reqsrv_f` stays `active` forever.
+
+**Refuted this round:** stale `cur_num_requests` counter (that code never runs);
+the round-2 `START_NEW_REQUEST` framing; (still, from prior rounds) co-process
+boundary, unimplemented device, clock-ISR gap, disk-present gap.
+
+~~**Open M5 question (the true next target):** WHY do the boot-volume floppy
+devrecs "#14#1"/"#14#2" carry a **stub `entry_pt` + nil `cb_addr`** at this point
+— i.e. why is the real Sony driver not installed/attached (no control block
+allocated) for these devices when the FS issues the mount read? This is a
+device-configuration / driver-attach path question (genio/CONFIG/`USE_HDISK`/
+`dinit` during `BOOT_IO_INIT`), not a device-register HLE answer. Whether it is
+an emulation divergence (an earlier config/driver-load path taking a different
+branch on our machine) or an OS ordering we have not yet satisfied is UNRESOLVED;
+no evidence-gated fix was reached, and fabricating completion would fake
+progress.~~ **(RESOLVED — round 4, see "Checkpoint G (round 4)" below. It WAS an
+emulation divergence: the `$FCC031` DiskROMId `0x00` stub made BOOT_IO_INIT
+decode the machine as a Twiggy Lisa 1 and install the compiled-out TWIGIO stub
+on those devrecs. The devrec names decode as MAKE_NAME's 1-based printing of
+`cd_twiggy`=13 → "#14#1"/"#14#2" (SOURCE-CD:694-717, STARTUP:1970), the nil
+`cb_addr` and `$694`=1684 `num_bloks` match MAKE_DISK_INFO exactly
+(SOURCE-CD:736/754), and the 3-instruction return-0 body is TWIGIO with its
+whole implementation compiled out under `(*$IFC TWIGGYBUILD*)`
+(source-twiggy:1235/1237).)**
+
+### OQ / writes / screen at Checkpoint F ~~(unchanged, re-confirmed)~~ (all superseded by round 4, below)
+
+- ~~**OQ1″: still OPEN.** Single-process STARTUP, supervisor stays domain 0;
+  A5/context never change; no supervisor DATA access to a non-zero domain.~~
+  **(Round 4: the boot now context-switches — see Checkpoint G's OQ1″ note.)**
+- ~~**Floppy writes: still NONE** (`writeAttempts == 0`).~~ **(Round 4: the OS
+  now WRITES the boot floppy; session write-through built — see below.)**
+- **COPS `$02` clock: not read** (`clockSetNibbles == []`). (Not implicated —
+  the wait is a disk-driver completion, not a COPS event.)
+- ~~**Screen: one frozen rest screen**~~ **(Round 4: the screen advances to the
+  Office System installer UI — see below.)** The frozen Checkpoint-F rest
+  screen (`m4-checkpoint-f-rest.png`, 78,181 set px) remains the mid-boot
+  hourglass state, re-captured as `m4-checkpoint-f-os-boot-hourglass.png`.
+
+### ~~What the Checkpoint F test pins (`ROMFloppyBootTests`)~~ (test superseded)
+
+~~`checkpointF_blockedOnDriverIOCompletion` — reaches the `$4C0276` init-time
+I/O-completion poll and pins the corrected diagnosis …~~ **(Superseded — round
+4. The Checkpoint-F stall no longer exists: the mount read completes. The test
+was replaced by `checkpointG_officeSystemInstallerUIDraws`, which pins the
+FIXED mechanism — `unblk_req` ($2E2BFC) now EXECUTES, A5 changes
+(SYS_PROC_INIT), user-mode domain-1 execution, recoverable gate bus errors,
+floppy session writes, and the installer-dialog framebuffer anchor. See
+"Checkpoint G (round 4)" below.)**
+
+## Checkpoint G (M4 Task 4 round 4) — the Office System installer UI draws
+
+Round 4 answered the round-3 open question ("why do the boot-volume devrecs
+carry a stub driver?"), which unravelled into THREE stacked emulation
+divergences. Fixing them advances the boot from the Checkpoint-F stall all the
+way to the **Lisa 7/7 Office System 3.0 installer dialog, live on screen,
+idling in its event-wait loop**.
+
+### Root cause 1 — `$FCC031` DiskROMId `0x00`: the OS thought we were a Twiggy Lisa 1
+
+- The boot-volume devrecs "#14#1"/"#14#2" are the builtin **cd_twiggy**
+  position-1/2 records: MAKE_NAME prints slot/chan 1-based, `cd_twiggy`=13
+  (source-DRIVERDEFS:82) → "#14#1"/"#14#2" (SOURCE-CD:694-717;
+  SOURCE-STARTUP:1970).
+- They got their stub because BOOT_IO_INIT read `adr_ioboard` = `$FCC031`
+  (STARTUP:1746, = LIBHW-DRIVERS:135 `DiskROMId`) as our stubbed `0x00`:
+  signed ≥ 0 → **`iomodel := iob_lisa`** (Twiggy Lisa 1, STARTUP:1876-1878) →
+  `MAKE_DISK_INFO(cd_twiggy,…)` ran for positions 1/2 (STARTUP:1970-1972),
+  setting `cb_addr := nil` (SOURCE-CD:736), `num_bloks := 1684` = the observed
+  `$694` (SOURCE-CD:754), and `entry_pt := @TWIGIO` (SOURCE-CD:750) — and in
+  OS 3.1 **TWIGIO's entire body is compiled out** under `(*$IFC TWIGGYBUILD*)`
+  (source-twiggy:1237), leaving exactly `TWIGIO := 0` (source-twiggy:1235) =
+  the round-3-observed 3-instruction return-0 stub at `$46124E`.
+- **Fix:** `$C031` now returns `$88` — Pepsi-class (bit7, LIBHW-DRIVERS:581),
+  not LisaLite (bit5 clear, :583), outside `[$A0,$DF]` — so with `$C015`=1 the
+  decode falls to the `$FCC015` internal-disk check → **`iomodel = iob_pepsi`**
+  (Lisa 2/10; STARTUP:1879-1890). The ROM anchors are UNMOVED by this change
+  (the ROM's only `$C031` gate is the bit-7 contrast tweak at `$FE0B24-$FE0B3C`,
+  framebuffer-neutral — menu FNV `0xd09234d25516d0b8`/78,100 px re-verified
+  green), which supersedes the "0x00 already correct" row in the wait-target
+  table above: correct FOR THE ROM, wrong for the OS's machine-identity decode.
+- With the Lisa-2 identity, BOOT_IO_INIT takes the REAL config path:
+  INIT_CONFIG reads the boot volume's MDDF **parameter-memory snapshot** and
+  (PM being blank) installs it via INIT_WRITE_PM (STARTUP:1103-1154);
+  FIND_PM_IDS/FIND_CDDS/LOADEM read `SYSTEM.CDD` + the Sony boot CD
+  `SYSTEM.CD_*` off the disk through the loader's synchronous reads and
+  NEW_CONFIG/UP install the REAL Sony driver with a real control block
+  (STARTUP:1613-1663) — live-confirmed: the mount-read devrec now has non-nil
+  `cb_addr` and a real `entry_pt`, `unblk_req` executes, `reqsrv_f` reaches
+  `complete`, and the `$4C0276` poll breaks. **Checkpoint E re-anchor:**
+  `blocksRead` at the unmasking grew 323 → **344** (the +21 SYSTEM.CDD/CD
+  loader reads happen before the unmasking).
+
+### Root cause 2 — floppy writes were silently dropped
+
+With the boot advancing, the OS **writes** the boot floppy (the PM-snapshot
+rewrite when PM is bad/snapshot good — STARTUP:1140-1151 — plus FS metadata).
+The M2-era `writedisk` model accepted-and-DISCARDED writes; re-read stale
+bytes would corrupt FS state. Per the plan's write rule, `FloppyController`
+now stores every written block (data + packed tag, staged on the window's odd
+lanes exactly as `START_WRITE` packs them — SOURCE-SONYASM:300-380) in an
+in-memory **session overlay** consulted by reads; the `.dc42` is never
+mutated. See docs/hardware-notes.md §9 "`writedisk` — session-scoped
+write-through" and `FloppyControllerTests`.
+
+### Root cause 3 — Musashi's jump-fault frames broke the OS's gate engine (fatal 10201)
+
+With 1+2 fixed the boot ran into SYS_PROC_INIT, multi-domain user processes,
+and the OS's fault-driven **gate mechanism**: user code reaches swapped-out
+segments and OS entry points through `$A0xxxxxx`-tagged jump-table entries
+whose instruction fetch deliberately bus-faults; `BUS_ERR`
+(SOURCE-EXCEPASM:434-505) decodes the group-0 frame's IR + PC and re-runs the
+faulting JSR/JMP/RTS after the memory manager swaps the target in. Stock
+Musashi completes a jump and faults at the NEXT loop-top opcode fetch
+(frame PC = target+2, jump side-effects committed) — so the OS's re-run
+pushed a **second return address**, which landed where a syscall VAR
+parameter belonged: traced live to `Read_PMem` (SOURCE-PMEM:165-222) writing
+`errnum := -621` (`PMb_SSg` — precisely our blank-PM/good-snapshot state)
+through a "pointer" that was really the gate's return address into a
+read-only code segment → `writeToReadOnly` in a domain-0 process →
+`e_hardsyscode` **10201** (source-EXCEPRIM:70; fatal rule SOURCE-EXCEPRES:
+227-232) → the ROM boot-error dialog (crossed-out floppy icon, code 10201).
+**Fix (vendored CPU core):** loop-top fetch faults now push real-68000
+frames — PC = jump address + the OS's expected offset (6/4/2), fault address
+= the full unmasked 32-bit target (the `$A0` tag survives in the frame while
+the 24-bit bus mask strips it before decode), a faulting JSR's committed push
+undone, RTS's pop left committed — and mid-instruction data faults push
+PC = instruction start + 2 (the OS's TST stack-probe convention). Full table:
+docs/hardware-notes.md §5 "68000 group-0 bus-error frames". Pinned by
+`BusErrorFrameTests` (JSR.L/JSR (An)/JSR d16(An)/JMP.L/RTS/user-mode-JSR
+frame + side-effect tests); TomHarte conformance untouched (address-error
+path keeps legacy frame values); re-applied on re-vendor by
+Scripts/vendor-musashi.sh.
+
+### The new frontier — installer UI, event-wait idle
+
+With all three fixes the boot proceeds: mount read completes → volume mounts
+→ SYS_PROC_INIT (A5 changes; first context switches) → user-mode processes in
+domain 1 → dozens of recoverable gate faults (all `$A0xxxxxx` fetches,
+handled by design) → the screen advances through the **desktop gray +
+menu-bar background** (`m4-checkpoint-g-desktop-background.png`, 126,116 px
+at ~93.6 M cycles) to the **Lisa 7/7 Office System 3.0 installer dialog** —
+"Finished / Repair / Install / Restore", ©1983,1984 Apple Computer
+(`m4-checkpoint-g-installer-ui.png`, FNV `0x04a19e4eb59704f4`, 60,107 px,
+~118.3 M cycles) — and idles there in the installer's event-wait syscall
+loop (user mode, domain 1, A-line gate polling through `$F80018`), stable
+from ~8 M post-boot-block instructions through 400 M (probe horizon).
+`blocksRead` reaches ~670 (segment swap-ins + installer resources);
+`writeAttempts == blocksWritten` = 28 within the pinned window (all stored,
+none dropped); `busErrorPulseCount` > 0 by design (re-anchoring the old
+"no bus error" pins — recoverable gate faults ARE the OS's normal operation
+from SYS_PROC_INIT onward).
+
+### OQ1″ — ANSWERED (round 5): supervisor DATA access captured, forced domain 0 confirmed
+
+~~Round-4 wording: "OQ1″ is ANSWERED by the live multi-domain boot" (zero
+anomalies through the installer).~~ **(Round-5 review: overbroad as worded —
+that was no-counterexample evidence, not a captured access. The round-5
+bounded probe captured the events themselves; the strong form follows.)**
+
+A temporary (reverted) `Bus.access` hook logged every **supervisor-mode,
+translated (setup-OFF), non-fetch** access made **while the domain latch was
+non-zero** to a segment whose latched-domain register DIFFERS from domain
+0's, across the 10 M-instruction boot-to-installer window (the known
+do_an_mmu seg-84 window — OQ1′'s own already-documented case — and SLIM/SORG
+register-port traffic excluded). Captured, with one example each
+(PC/SR/latch/register pair):
+
+| seg | count | example | dom0 map | dom1 map |
+|---|---|---|---|---|
+| 101 (kernel supervisor STACK) | 792,987 | WRITE `$CBFF74`, PC `$A84066`, SR `$2104`, latch 1 | sorg `$E52` slim `$603` (stack) | **ABSENT** (`$C00`) |
+| 102 (SYSGLOBAL) | 175,265 | READ `$CC02A4`, PC `$520916` (Level1 ISR), SR `$2100`, latch 1 | sorg `$01E` slim `$7A0` (RW) | **ABSENT** |
+| 0 (vectors/low mem) | 28,572 | READ `$000064` (level-1 autovector), PC `$A84066`, SR `$2104`, latch 1 | sorg `$000` slim `$7FC` (RW) | **ABSENT** |
+| 103 (syslocal region) | 25,069 | READ `$CE004C`, PC `$2E01F4` (syscall dispatcher), SR `$2004`, latch 1 | sorg `$1A8` slim `$7FA` (RW) | **ABSENT** |
+| 41 (kernel code seg `$52xxxx`) | 2,138 | READ `$5204EC`, PC `$520460`, SR `$2000`, latch 1 | sorg `$009` slim `$5EB` (RO) | **ABSENT** |
+
+Plus 147,282 supervisor data accesses (latch ≠ 0) to segments mapped
+IDENTICALLY in both domains (domain-agnostic either way). **Every one of the
+~1.02 M differing-segment accesses — kernel-stack pushes, SYSGLOBAL reads
+from live ISRs, and the exception-VECTOR fetches themselves — hit a segment
+the latched domain maps ABSENT; under the forced-domain-0 model they all
+resolved to domain 0's mapping, and the OS runs to the installer.** If
+supervisor data access followed the latch, each would bus-error into an
+absent segment — and the OS treats any supervisor-context hardware exception
+as fatal (`superstack` → `e_hardsyscode`, SOURCE-EXCEPRES:227-232), so a
+latch-following machine could not survive its first interrupt during
+user-mode execution. OS-source expectation matches: kernel structures live
+only in domain 0's map (`initmmutil` LDASM:215 "domain 0, the OS domain");
+the `domvalue` save (SYSGLOBAL:137) serves the kernel's *bookkeeping* of the
+caller's domain, and syscall VAR write-backs into caller memory happen in
+**USER mode** (round-4 trace: the `Read_PMem` body executes with SR `$0004`),
+not via supervisor stores into user domains.
+
+**Residual falsifier (the one event class never observed):** a supervisor
+DATA access to a segment that BOTH domain 0 and the latched domain map as
+PRESENT but with DIFFERENT origins/limits — where forced-domain-0 silently
+picks one physical target over the other rather than faulting. No such
+access occurred in the probe window (the only both-present-differing traffic
+was SLIM/SORG register-port writes, which bypass translation by design). If
+one is ever observed misbehaving, `Bus.translationDomain` is the revisit
+point. Roster rows updated in place below (OQ1′ precedent).
+
+### What the Checkpoint G test pins (`ROMFloppyBootTests`)
+
+`checkpointG_officeSystemInstallerUIDraws` — boots to the loader, then runs
+10 M instructions and asserts: no halt; `unblk_req` ($2E2BFC) EXECUTES; A5
+changes (processes exist); user-mode execution with domain latch 1 (OQ1″);
+`busErrorPulseCount > 0` (gates fire and recover); `writeAttempts > 0` with
+`blocksWritten == writeAttempts` (session write-through, nothing dropped);
+`blocksRead >= 600`; and the framebuffer equals the installer-dialog anchor
+(FNV `0x04a19e4eb59704f4`, 60,107 set px).

@@ -81,17 +81,33 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
 
 // MARK: - CRDY handshake (output/command path)
 
-@Test func commandWriteDropsCRDYImmediately() {
+@Test func commandWriteDropsCRDYButSuppressesItForExactlyOneSubsequentRead() {
+    // M4 Task 1: the OLD (pre-M4) model dropped CRDY the same instant a
+    // command byte was written, AND that drop was immediately visible to
+    // the very next read -- see COPS.swift's type doc comment "M4 Task 1"
+    // for why that breaks the OS's own COPSCMD (Phase A writes then
+    // IMMEDIATELY tests, in the same instruction pair; if that test could
+    // ever see anything but "still ready", Phase A would loop forever). The
+    // corrected model still drops CRDY synchronously with the write, but
+    // gates its VISIBILITY by read count, not cycle count (see that doc
+    // comment for why a cycle-based delay doesn't survive
+    // `Machine.run(until:)`'s burst execution): the FIRST read after the
+    // drop-triggering write still reports ready; every read after that
+    // reports the real dropped state.
     let (cops, _, _) = makeCOPS()
     #expect(cops.portBInput() & 0x40 != 0, "CRDY idles high (ready)")
 
     cops.handlePortAAccess(index: 15, value: 0x00, isWrite: true)   // the ROM's own POST probe uses register 15
-    #expect(cops.portBInput() & 0x40 == 0, "CRDY drops the instant a command byte is written")
+    #expect(cops.portBInput() & 0x40 != 0,
+            "the FIRST read after the write still sees ready -- the OS's write-then-immediate-test pair depends on this")
+    #expect(cops.portBInput() & 0x40 == 0,
+            "the SECOND read (and every read after) sees the real dropped state")
 }
 
 @Test func commandCompletesAfterPlausibleDelayRestoringCRDY() {
     let (cops, scheduler, _) = makeCOPS()
     cops.handlePortAAccess(index: 15, value: 0x00, isWrite: true)
+    _ = cops.portBInput()   // consume the one suppressed (still-ready) read
     #expect(cops.portBInput() & 0x40 == 0)
 
     scheduler.advance(by: COPS.commandAckDelayCycles - 1)
@@ -107,6 +123,7 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
     // 15, but the OS driver may use either.
     let (cops, scheduler, _) = makeCOPS()
     cops.handlePortAAccess(index: 1, value: 0x7C, isWrite: true)
+    _ = cops.portBInput()   // consume the one suppressed (still-ready) read
     #expect(cops.portBInput() & 0x40 == 0)
     scheduler.advance(by: COPS.commandAckDelayCycles)
     #expect(cops.portBInput() & 0x40 != 0)
@@ -123,6 +140,123 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
         scheduler.advance(by: COPS.commandAckDelayCycles)
         #expect(cops.portBInput() & 0x40 != 0, "probe byte $\(String(probe, radix: 16)) should still ack")
     }
+}
+
+// MARK: - M4 Task 1: the OS's own COPSCMD retry+poll shape (LIBHW-DRIVERS:829-887)
+
+/// Simulates the OS's own `COPSCMD` (LIBHW-DRIVERS:829-887, byte-identical
+/// to the live `$520824` OS driver per task-1-report.md's disassembly
+/// cross-check) directly against `COPS`+`FakeScheduler`: Phase A rewrites
+/// the command byte and tests CRDY on every retry (real 68000 timing: the
+/// `MOVE.B`-then-`BTST` pair at `$520848`/`$52084C` has zero intervening
+/// instructions -- modeled here as a write immediately followed by a test,
+/// zero elapsed cycles between them, the worst case for catching a
+/// same-instant drop); Phase B is up to 14 back-to-back `BTST`/`Bcc` checks
+/// (`$520850`-`$520892`) waiting for CRDY to THEN drop; Phase C
+/// (DDRA2 = `$FF`, fixed delay, DDRA2 = `$00`, `$520894`-`$5208A2`) is not
+/// modeled at all -- `COPS` has no bit-level Port A bus simulation, so a
+/// pure data-direction change is not separately observable here (see the
+/// type doc comment "M4 Task 1"). Per-instruction cycle costs below are
+/// plausible approximations (classic MC68000 timing: `MOVE.B Dn,(d16,An)`
+/// ~=12, `BTST Dn,(An)`/`Bcc` ~=8-10), not Musashi-exact -- same "plausible,
+/// not cycle-exact" bar the rest of this type's timing already uses.
+@Test func osCOPSCMDRetryThenPollThenDropSequenceCompletes() {
+    let (cops, scheduler, _) = makeCOPS()
+    drainPowerOnStream(cops, scheduler)   // realistic idle COPS, as the OS would find it
+
+    let writeCost: UInt64 = 12
+    let testCost: UInt64 = 8
+
+    // Phase A.
+    var phaseARetries = 0
+    var sawReadyRightAfterWrite = false
+    while phaseARetries < 50 {
+        cops.handlePortAAccess(index: 15, value: 0x7C, isWrite: true)   // COPSCMD's own $7C (enable mouse interrupts)
+        scheduler.advance(by: writeCost)
+        let ready = cops.portBInput() & 0x40 != 0
+        scheduler.advance(by: testCost)
+        if ready { sawReadyRightAfterWrite = true; break }
+        phaseARetries += 1
+    }
+    #expect(sawReadyRightAfterWrite,
+            "Phase A must eventually observe CRDY still ready right after a write -- the OLD instant-drop model could NEVER do this, hence the M3/M4 frontier hang")
+    #expect(phaseARetries == 0,
+            "on an idle COPS the very first write's own test should already read ready -- the OS/ROM's typical fast path")
+
+    // Phase B.
+    var phaseBChecks = 0
+    var sawDrop = false
+    while phaseBChecks < 14 {
+        let notReady = cops.portBInput() & 0x40 == 0
+        scheduler.advance(by: testCost)
+        phaseBChecks += 1
+        if notReady { sawDrop = true; break }
+    }
+    #expect(sawDrop,
+            "Phase B's 14-check window must observe the drop -- otherwise COPSCMD loops back to Phase A forever, re-creating the frontier hang")
+
+    // Phase C is a no-op for COPS (DDRA2 only); CRDY still rises on its own
+    // schedule afterward, ready for the NEXT command.
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+    #expect(cops.portBInput() & 0x40 != 0, "CRDY is ready again for the next command")
+}
+
+/// Models the ROM's own `$FE0956` `SendCOPSCommand` end-to-end (hardware-notes.md
+/// §4 "Command Protocol"): single write, poll for CRDY==0 (loop 1, up to the
+/// ROM's own 1562-iteration timeout), a near-instant redundant second poll
+/// (loop 2), DDRA2 = `$FF` (not modeled), poll for CRDY==1 (the ack, loop
+/// "step 5"), DDRA2 = `$00`. Must still complete under the corrected model.
+@Test func romsPollThenDriveThenAckPatternStillCompletes() {
+    let (cops, scheduler, _) = makeCOPS()
+    drainPowerOnStream(cops, scheduler)
+
+    cops.handlePortAAccess(index: 15, value: 0x00, isWrite: true)   // the ROM's own POST probe byte
+
+    var loop1Iterations = 0
+    while cops.portBInput() & 0x40 != 0 && loop1Iterations < 1562 {
+        scheduler.advance(by: 20)
+        loop1Iterations += 1
+    }
+    #expect(loop1Iterations < 1562, "loop 1 must observe the drop well inside the ROM's own timeout")
+    #expect(cops.portBInput() & 0x40 == 0, "loop 2's first check already sees it dropped -- near-instant, per the M1b trace")
+
+    var ackIterations = 0
+    while cops.portBInput() & 0x40 == 0 && ackIterations < 1562 {
+        scheduler.advance(by: 20)
+        ackIterations += 1
+    }
+    #expect(ackIterations < 1562, "the ack (step 5) must arrive well inside the ROM's own timeout")
+    #expect(cops.portBInput() & 0x40 != 0, "CRDY reads ready again -- COPS acknowledging receipt")
+}
+
+/// M4 Task 1: reg-15 (no-handshake) PEEKS -- Port A reads, never writes --
+/// must never perturb CRDY (a Port B concern), including while a command's
+/// own drop/ack schedule is in flight (the ROM's presence probe and the
+/// OS's input-FIFO peeks both rely on this never happening). Also verifies
+/// Port A peeks don't accidentally consume the Port B
+/// `suppressCRDYDropForNextRead` gate meant for the sender's OWN next
+/// `portBInput` read.
+@Test func reg15PeeksNeverPerturbCRDYEvenDuringAnInFlightCommand() {
+    let (cops, scheduler, _) = makeCOPS()
+    drainPowerOnStream(cops, scheduler)
+
+    for _ in 0..<5 { cops.handlePortAAccess(index: 15, value: 0, isWrite: false) }
+    #expect(cops.portBInput() & 0x40 != 0, "bare peeks on an idle COPS never drop CRDY")
+
+    cops.handlePortAAccess(index: 15, value: 0x7C, isWrite: true)
+    for _ in 0..<5 {
+        cops.handlePortAAccess(index: 15, value: 0, isWrite: false)   // Port A peek -- unrelated port
+        scheduler.advance(by: 4)
+    }
+    #expect(cops.portBInput() & 0x40 != 0,
+            "the suppressed first CRDY read still shows ready -- untouched by the interleaved Port A peeks")
+    #expect(cops.portBInput() & 0x40 == 0, "the second CRDY read now shows the real dropped state")
+
+    for _ in 0..<5 { cops.handlePortAAccess(index: 15, value: 0, isWrite: false) }
+    #expect(cops.portBInput() & 0x40 == 0, "peeks during the not-ready window neither re-raise nor re-drop it")
+
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+    #expect(cops.portBInput() & 0x40 != 0, "the ack still fires on schedule despite the interleaved peeks")
 }
 
 // MARK: - Command decode
@@ -158,10 +292,12 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
     #expect(interruptRaised() == false, "FIFO drained")
 
     cops.handlePortAAccess(index: 1, value: COPS.Command.readClock, isWrite: true)
-    // Two separate hops: the command's own ack delay, THEN (once the reply
-    // is enqueued as a result of that ack firing) the first reply byte's
-    // own delivery delay -- each is scheduled relative to the cycle at the
-    // moment it's requested, not the cycle at the start of this test.
+    // Two separate hops: the command's own ack delay (register 1 is the
+    // "real" handshake ORA, so no suppressed-read consumption is needed
+    // here -- this test never reads portBInput at all), THEN (once the
+    // reply is enqueued as a result of that ack firing) the first reply
+    // byte's own delivery delay -- each is scheduled relative to the cycle
+    // at the moment it's requested, not the cycle at the start of this test.
     scheduler.advance(by: COPS.commandAckDelayCycles)
     scheduler.advance(by: COPS.byteDeliveryDelayCycles)
 

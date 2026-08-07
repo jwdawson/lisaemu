@@ -261,9 +261,24 @@ Source: libhw-DRIVERS:936-962; independent confirmation OS/source-SERNUM.TEXT.un
 **Registers:**
 - VertReset: IOSpace + $E018 (write re-arms/clears pending)
 - StatusRegister: IOSpace + $F800 (16-bit); low byte at $FCF801
-- StatusRegister bit 2: vertical retrace pending
+- ~~StatusRegister bit 2: vertical retrace pending~~ **(polarity corrected M4
+  Task 3 — see below)** StatusRegister bit 2 is **ACTIVE-LOW**: `0` == retrace
+  pending, `1` == not pending.
 - VRIRENB (V-Retrace Interrupt Enable): $E01A + IOMMU
 - VRIRDIS (V-Retrace Interrupt Disable): $E018 + IOMMU
+
+**M4 Task 3 polarity correction (`$F801` bit 2 is active-LOW).** The OS source
+settles the bit-2 sense the ROM self-test could not (its poll window is far
+shorter than a vsync period, soft-fail either way). LIBHW-DRIVERS `Level1`
+(:895) and `Poll` (:801) both do `BTST #2,StatusRegister+1 / BNE (skip
+VertRetrace)` with the comment *"branch if NOT vertical retrace"* — so bit 2
+**== 0** is "retrace pending" (service it), bit 2 **== 1** is "not pending".
+`VideoTiming.pending` is still the internal boolean; `IODispatcher.currentValue`
+now exposes it inverted at `$F801` (`pending ? 0 : 0x04`). The earlier
+active-high exposure stormed the OS's level-1 handler at the unmasking (it read
+bit2=1 as "no retrace", never acked via `VertRetrace`'s `$E018` write, and
+`Machine.vsyncPending` held level 1 asserted forever). See
+docs/rom-trace-notes.md "Checkpoint E". No ROM anchor moved.
 
 **M1b Task 5 ground truth / polarity resolution:** this section's own two
 phrasings are in tension ("VertReset... write re-arms/clears pending" vs.
@@ -492,25 +507,72 @@ AFTER, not before, the "wait for not-ready" poll) — the original OS-source
 listing's step numbering implied output-then-poll; the ROM trace is the
 primary source for the corrected order.
 
-**M4 boundary — the OS's own COPS command-send driver (M3 Task 4 STOP).**
-Once M3 Task 4 resolved OQ1′ (§1 Domain Context Latches), the boot loads the
-OS image and reaches loaded OS code at `$520000` running the identical
-command-send protocol from RAM — an OS driver (`$520824`) sending `$7C`
-("enable mouse interrupts"). It **stages** to IORA2 register 15 (`$FCDD9F`,
+**M4 boundary — the OS's own COPS command-send driver (M3 Task 4 STOP;
+CLOSED by M4 Task 1, model below).** Once M3 Task 4 resolved OQ1′ (§1 Domain
+Context Latches), the boot loads the OS image and reaches loaded OS code at
+`$520000` running the identical command-send protocol from RAM — an OS
+driver (`$520824`, `COPSCMD`, LIBHW-DRIVERS:829-887) sending `$7C` ("enable
+mouse interrupts"). It **stages** to IORA2 register 15 (`$FCDD9F`,
 no-handshake) and then **drives** via DDRA2 (`$FCDD87` ← `$FF`), exactly as
-steps 1-4 above. The emulator STALLS here: `LisaCore/COPS.swift`'s simplified
-model drops CRDY on *every* register-15 write (it has no per-index guard on
-writes), but this driver re-writes register 15 on **every poll iteration**, so
-CRDY — which the loop reads *high* to proceed — never recovers. The ROM path
-survives the shortcut only because it writes register 15 exactly once. Closing
-this needs a **DDRA2-gated CRDY handshake** (register-15 write = no CRDY
-change; the `DDRA2 $00→$FF` transition = the real send that drops CRDY; the ack
-raises it) **plus** re-validation of the pinned ROM COPS path (menu FNV, the
-POST presence probe, `COPSTests`, M1c input) — a rework, deferred to M4.
-Companion observations at this boundary: interrupts stay masked at 7 the whole
-path (`minSR=$2700` — the COPS/floppy IRQ is never delivered), and no floppy
-WRITE ever occurs (`writeAttempts==0`). See rom-trace-notes.md "Kernel push
-(M3 Task 4)".
+steps 1-4 above. The emulator STALLED here (M3 Task 4 — pre-M4 state, kept
+for provenance): `LisaCore/COPS.swift`'s simplified model dropped CRDY on
+*every* register-15 write (it had no per-index guard on writes), but this
+driver re-writes register 15 on **every poll iteration**, so CRDY — which
+the loop reads *high* to proceed — never recovered. The ROM path survived
+the shortcut only because it writes register 15 exactly once.
+
+~~Closing this needs a **DDRA2-gated CRDY handshake** (register-15 write =
+no CRDY change; the `DDRA2 $00→$FF` transition = the real send that drops
+CRDY; the ack raises it)~~ — **REFUTED by M4 Task 1's disassembly evidence**
+(both the live `$520824` OS binary and the ROM's own `$FE0956`, task-1-report.md):
+in BOTH senders, Phase A/loop-1's CRDY poll for the drop runs, and succeeds,
+*entirely before* the DDRA2 flip ever executes (OS: Phase A/B, `$520842`-
+`$520892`, all precede Phase C's DDRA2 write at `$520894`; ROM: steps 2-3
+precede step 4's DDRA2 write at `$FE0994`). So the DDRA2 transition CANNOT be
+what drops CRDY for either sender — **the register-15 write is the drop's
+real trigger**, matching the pre-M4 model's mechanism, not contradicting it.
+
+**M4 Task 1 model (implemented):** the write still drops CRDY, but the
+*visibility* of that drop is gated by READ COUNT, not cycle count
+(`COPS.swift`'s `suppressCRDYDropForNextRead`): the FIRST `portBInput` read
+after a fresh (ready→not-ready) transition-triggering write still reports
+ready; every read after that reports the real dropped state. This lets the
+OS's Phase A (`$520842`-`$52084E`: write, then IMMEDIATELY test, zero
+intervening instructions) see "still ready" and fall through on the common
+(idle-COPS) path, while Phase B's very next check (`$520850`, the SECOND
+read since the same write) deterministically sees the real drop — closing
+the M3 Task 4 stall without ever needing the ROM to change how it drives
+DDRA2 at all. A cycle-scheduled short delay was tried first and rejected: it
+broke under `Machine.run(until:)`'s burst execution (`Bus`'s injected
+`scheduleEvent` computes a scheduled event's due cycle from `Machine.cycles`,
+which only updates once an entire CPU burst completes — up to
+`Machine.irqPollQuantum`, 1024 cycles, stale relative to a write that
+happens mid-burst), regressing `ROMFloppyBootTests` back into the same
+looks-instant-drop failure mode this task exists to fix. The read-count gate
+needs no cycle scheduling for the drop's visibility at all, so it is exact
+under any execution granularity. Re-validated: menu FNV/px, POST presence
+probe, `COPSTests`, M1c input backstop, and the M2/M3 boot anchors
+(`blocksRead` 75, `$520000` entry) all unchanged (task-1-report.md). DDRA2
+itself remains unmodeled by `COPS` (no bit-level Port A bus simulation).
+
+**Frontier check (M4 Task 1):** with the fix, `$7C`'s handshake completes and
+the CRDY spin breaks. `COPSCMD` is called via `jsr` from `$52070E`, so its
+`rts` (`$5208A4`) returns to `$520712` — the very next instruction in its
+CALLER, driver-init — which immediately installs the level-2 (COPS)
+autovector handler (`lea ($33C,PC),A1; move.l A1,$68.w`) and continues
+driver-init (clearing OS globals, walking a 16-entry device table at
+`$2B0.w` via `jsr $520A74` per entry, etc.). **Not** the `Level1`-shaped
+code visible at `$5208A6`+ immediately after `COPSCMD` in binary layout —
+that address is simply the next routine in the image, never reached from
+this call site; it would only run later via an actual interrupt, and
+interrupts are still masked at this point. Task 3 should start tracing from
+`$520712`.
+
+Companion observations at the (now-passed) M3 Task 4 boundary: interrupts
+stay masked at 7 the whole path up to that point (`minSR=$2700` — the
+COPS/floppy IRQ is never delivered), and no floppy WRITE ever occurs
+(`writeAttempts==0`). See rom-trace-notes.md "Kernel push (M3 Task 4)" and
+"Checkpoint E" (M4 Task 1/3).
 
 ### Command Bytes
 
@@ -582,6 +644,46 @@ power-on stream is not load-bearing for the boot path — see
 docs/rom-trace-notes.md "POST completion (Task 7)").
 
 ## 5. Interrupts
+
+### 68000 group-0 bus-error frames — the OS's recoverable-fault engine (M4 Task 4 round 4)
+
+The Lisa OS's bus-error handler `BUS_ERR` (SOURCE-EXCEPASM:434-505) is a
+RECOVERY engine, not just an error trap: user-space code reaches swapped-out
+code segments and OS entry points through `$A0xxxxxx`-tagged jump-table
+gates whose fetch deliberately faults; `BUS_ERR` decodes the group-0
+frame's **instruction register** (frame+6, its `B1`/`B2` equates) and
+**fault address** (frame+2, `BADADDR`), then backs the frame **PC** up by
+an instruction-specific constant so the jump RE-RUNS after `CODE_CHK`/the
+memory manager swaps the target segment in:
+
+| frame IR | form | PC fix | side-effect expectation |
+|----------|------|--------|--------------------------|
+| `$4EB9` | JSR (xxx).L | PC−6 | return NOT yet pushed (re-run pushes once) |
+| `$4EA8`+reg | JSR d16(An) | PC−4 | return NOT yet pushed |
+| `$4E90`+reg | JSR (An) | PC−2 | return NOT yet pushed |
+| `$4EF9` / `$4ED0`+reg | JMP.L / JMP (An) | PC−2 | none |
+| `$4E75` | RTS | PC−2 | pop COMMITTED — handler un-pops (USP−4) |
+| `$4E73` | RTE | PC := BADADDR | pops committed |
+| `$4A`xx | TST (stack probe / `gentrap`'s `TST.W stkspace(A7)`) | PC−2 | stack growth via `Check_Stack` |
+| `$2211` | MOVE.L (A1),D1 | — | intrinsic-library data fault |
+
+Those constants encode real 68000 microcode order: a jump's **target
+prefetch happens inside the jump instruction**, before a JSR writes its
+return address and after an RTS pops it, and the pushed frame PC is the
+jump-site-relative value above (mid-instruction data faults push
+`instruction start + 2`). Stock Musashi diverges (it completes the jump
+and faults at the next loop-top opcode fetch with PC = target+2), which
+made every OS gate re-run push a SECOND return address — corrupting
+syscall parameter frames (observed live as fatal OS error 10201
+`e_hardsyscode`, source-EXCEPRIM:70). The vendored core is patched to push
+real-68000 frames for these cases (`m68ki_exception_bus_error`,
+Sources/CMusashi/m68kcpu.h; re-applied by Scripts/vendor-musashi.sh;
+pinned by Tests/LisaCoreTests/BusErrorFrameTests.swift). The frame's
+fault-address field carries the full unmasked 32-bit target for
+fetch faults — the `$A0` tag bits survive there (and in registers) even
+though the 24-bit address bus strips them before memory decode, which is
+exactly how the OS's gate scheme works on real hardware. See
+docs/rom-trace-notes.md "Checkpoint G (round 4)".
 
 ### Autovector Addresses
 
@@ -696,7 +798,9 @@ Effect: Post-Pepsi boards use VIA1 T1 reloads $7B/$63 instead of $CA/$27 (libhw-
 
 - **16-bit Address:** IOSpace + $F800 = $FCF800
 - **Low Byte:** $FCF801
-- **Bit 2 (low byte):** Vertical sync pending
+- **Bit 2 (low byte):** Vertical sync pending — **ACTIVE-LOW** (0 == pending,
+  1 == not pending; corrected M4 Task 3 from OS source, see "Vertical Retrace"
+  above and docs/rom-trace-notes.md "Checkpoint E").
 
 ### RAM Sizing
 
@@ -1013,6 +1117,22 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
 - **Sub-commands** (to `$03`, paired with excmd) — SONY.TEXT:51-59:
   readdisk=0, writedisk=1, unclamp=2, format=3, verify=4, formattrk=5,
   verifytrk=6, read_bf=7, write_bf=8 (Twiggy adds clampcmd=9 — twiggy:83).
+- **`writedisk` — session-scoped write-through (M4 Task 4 round 4;
+  supersedes the M2 "accepted and discarded" model).** The OS writes the
+  boot floppy during startup (the parameter-memory snapshot rewrite when PM
+  is bad but the MDDF snapshot is good — SOURCE-STARTUP:1140-1151
+  `INIT_WRITE_PM`/`rewrite_pm` — plus FS metadata), and its driver stages
+  the write exactly where reads land: `START_WRITE` (SOURCE-SONYASM:
+  300-380) packs the 12-byte tag onto DISKHDR's odd lane and the 512 data
+  bytes onto DISKHDR+24 = DISKDATA (`$400`) odd lane via `movep` stride 2 —
+  the mirror of FINISH_READ. `FloppyController.performWrite` captures that
+  block into an in-memory session overlay (keyed by DC42 block number)
+  which `performRead` consults before the backing image; the `.dc42`
+  image object and file are NEVER mutated, and `insert(_:)` clears the
+  overlay (fresh insertion = fresh session; `reset()` deliberately keeps it
+  — a warm reboot does not un-write real media). Counters: `writeAttempts`
+  (every issued writedisk) and `blocksWritten` (stored ones). Pinned by
+  `FloppyControllerTests` (`writedisk*`/`insertingAnImageClears*`).
 - **Completion:** interrupt-generating commands return immediately
   (`response := waitint`); completion arrives as a hardware interrupt
   (SONYASM:136-157).
@@ -1078,6 +1198,23 @@ zone/track/sector/side:
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
 - **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
+  **Round-2 (M4 Task 4) live confirmation — our HLE answers this correctly.**
+  ISDISKIN does `MOVE.B DISKIN(A2),D0; MOVE D0,RESPONSE(A3)` (read window `$41`,
+  return it); hdinit sets `disk_present:=gooddisk` when `response<>0`
+  (SONY.TEXT:629-636). `FloppyController.insert()` sets `window[$41]=1` and
+  `$FCC041` routes to `floppy.read(0x41)` (IODispatcher `$C000…$C7FF`), so a
+  live boot reads `1`, and the OS's `dskio` returns SUCCESS
+  (`disk_present`=`gooddisk`, verified: the caller's `$4C026C tst.w/bgt` falls
+  through to the wait, not the `nodiskpres`=614 error path). The OS's boot-time
+  I/O-completion hang (Checkpoint F) is therefore **NOT** a disk-presence HLE
+  gap. ~~It is the OS's own async request-START path (SOURCE-HDISK
+  `ADD_REQUEST`/`START_NEW_REQUEST`) never flipping the queued reqblk
+  `active`→`in_service`.~~ **(Struck — round 3, both the citation and the
+  mechanism were wrong: that HDISK queue code never runs. Round-3 instruction
+  trace shows the mount reqblk is dispatched to the boot-volume FS devrec
+  "#14#1", which has a NIL `cb_addr` and an `entry_pt` stub (`$46124E`) that
+  returns 0 without doing I/O, so the request is orphaned.)** See
+  docs/rom-trace-notes.md "Checkpoint F (round-3)".
 - **disk_control idle bit — AMBIGUITY (b) — SETTLED (Task 5, boot-ROM
   disassembly).** The Rev H boot ROM polls **bit 6 of `$FCD901`**, ~~not
   `$FCD801`~~. Its handshake/ready wait (`$FE1E04`, called after every go-byte)
@@ -1161,16 +1298,48 @@ zone/track/sector/side:
   iob_sony; `[$C0,$DF]` → iob_lite; else check `$FCC015` (adr_intdisk):
   0=twiggy, 1=single-sided Sony, 2=double-sided Sony (STARTUP:1747-1748)
   → iob_twiggy/iob_pepsi.
-- **Current emulator stubs:** `$C031`=0 (validated benign through the menu
+- ~~**Current emulator stubs:** `$C031`=0 (validated benign through the menu
   in M1b), `$C015` currently unknown-I/O `0xFF` → Task 4 sets `$C015`=1
   (single-sided, matches 400K install disks), Task 5 validates against the
-  boot path with trace evidence.
+  boot path with trace evidence.~~ **(Struck — M4 Task 4 round 4.
+  `$C031`=0 was benign FOR THE ROM (whose only gate is the bit-7 Pepsi
+  contrast tweak, framebuffer-neutral — menu FNV anchor unchanged), but the
+  OS decodes `$C031` as the MACHINE IDENTITY: `0x00` ≥ 0 signed →
+  `iomodel := iob_lisa` (Twiggy Lisa 1, STARTUP:1876-1878), which made
+  BOOT_IO_INIT skip the Lisa-2 config path and instead run
+  `MAKE_DISK_INFO(cd_twiggy,…)` for builtin positions 1/2 (STARTUP:
+  1970-1972) — installing devrecs "#14#1"/"#14#2" with `cb_addr := nil`
+  (SOURCE-CD:736) and `entry_pt := @TWIGIO` (SOURCE-CD:750), whose entire
+  I/O body is compiled out in OS 3.1 under `(*$IFC TWIGGYBUILD*)`
+  (source-twiggy:1235/1237 — the observed 3-instruction return-0 stub).
+  That was the entire Checkpoint-F orphaned-mount-read stall.
+  **`$C031` now returns `$88`** — bit7 set (Pepsi-class,
+  LIBHW-DRIVERS:581), bit5 clear (not LisaLite, :583), outside `[$A0,$DF]`
+  (iob_sony/iob_lite, STARTUP:1879-1885) — so with `$C015`=1 the decode
+  falls through to the internal-disk check and lands `iomodel = iob_pepsi`
+  (Lisa 2/10, STARTUP:1886-1890). **Source for the specific `$88` byte
+  (round-5 precision): the decode derivation itself, not an external ident
+  table** — the 6504 disk ROM is not in this source tree ("Could Not Find"
+  #1 below), so no first-party citation for the exact real-hardware byte
+  exists here. Any value with bit7 SET (`BTST #7,DiskROMId`,
+  LIBHW-DRIVERS:581), bit5 CLEAR (`BTST #5`, LIBHW-DRIVERS:583 — not
+  LisaLite), and outside `[$A0,$DF]` (STARTUP:1879-1885) satisfies every
+  decode the ROM and the OS perform; `$88` is the chosen representative of
+  that class. If the real 2/10 ident byte is ever established from the 6504
+  firmware, swapping it in is a no-op as long as it stays in the same
+  decode class. With that identity, INIT_BOOT_CDS installs the REAL Sony CD
+  driver from the boot disk (see docs/rom-trace-notes.md "Checkpoint G
+  (round 4)").)**
 - **Task 4 update:** `$C015` now returns `1` (was `0xFF` unknown-I/O), per
   the line above. The `$C000-$C7FF` window (`FloppyController`, this
   section's shared-RAM cells) is now live RAM served by that device;
-  `$C031` is UNCHANGED (still the Task-3-era `0` stub, checked before the
-  window range in `IODispatcher.currentValue` so it isn't shadowed by it).
-  Re-ran the full ROM-gated boot suite (`ROMBootTests`,
+  ~~`$C031` is UNCHANGED (still the Task-3-era `0` stub, checked before the
+  window range in `IODispatcher.currentValue` so it isn't shadowed by it).~~
+  **Superseded (M4 round 4, 2026-08-07):** per the round-4 bullet above
+  (`$C031` now returns `$88`, Pepsi-class/Lisa 2/10 identity, commit
+  90d7cdf), `$C031` is no longer the Task-3-era `0` stub as of round 4 —
+  this statement described the Task-4-era machine only. Re-ran the full
+  ROM-gated boot suite (`ROMBootTests`,
   `LISAEMU_ROM_DIR=... swift test`) after this change: the exact boot-menu
   anchor (`romCompletesPOSTAndReachesBootMenu`'s FNV hash
   `0xd09234d25516d0b8` / 78,100 set pixels) is UNCHANGED, because the

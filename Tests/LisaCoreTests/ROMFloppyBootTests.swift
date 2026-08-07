@@ -358,5 +358,161 @@ extension MusashiSuites {
             #expect(m.bus.floppy.writeAttempts == 0,
                     "no floppy WRITE anywhere on the kernel-push path (no-writes-observed)")
         }
+
+        /// **M4 Task 3 — Checkpoint E: THE UNMASKING and the first live
+        /// interrupts; the OS comes alive.** Past the COPS driver (M4 Task 1
+        /// opened the handshake) the OS's `DriverInit`/`INITSYS` program VIA1
+        /// T1 (the ms tick), enable the level-2 COPS line, install the Level1
+        /// ($0064) and Level2 ($0068) autovectors (LIBHW-DRIVERS `DriverInit`),
+        /// and drop SR below `$2700`. At that instant level-1 (VIA1 T1 ms-tick)
+        /// AND level-2 (COPS/VIA2) interrupts begin delivering to the OS's own
+        /// handlers -- `Level1` at `$5208A6` (poll retrace/timer/floppy) and
+        /// `Level2` at `$520A52`. The OS then runs its scheduler across many
+        /// loaded segments in user mode (SR reaches `$0000`) and settles into a
+        /// steady user-mode event-wait loop (`$4C0276`, polling an in-RAM state
+        /// for `2`). See docs/rom-trace-notes.md "Checkpoint E".
+        ///
+        /// This furthest stable state is unlocked by the M4 Task 3 fix: `$F801`
+        /// bit 2 (vertical-retrace) is **active-low** (0 == pending) per the OS
+        /// source, not active-high -- our old model made the Level1 handler read
+        /// "no retrace", never ack via `VertRetrace`, and `vsyncPending` stormed
+        /// level 1 forever. Every ROM anchor is unmoved (the ROM's own bit-2
+        /// self-test is soft-fail either way -- rom-trace-notes "Trace
+        /// checkpoint B").
+        @Test func checkpointE_unmaskingAndFirstLiveInterrupts() throws {
+            let m = try bootIntoLoader()
+            // Reach loaded OS code, then single-step so interrupt delivery is
+            // exact to the instruction boundary while we watch for the unmask.
+            let lim0 = m.cycles + 30_000_000
+            while m.cycles < lim0 && !m.halted && !(0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]) {
+                _ = m.step()
+            }
+            #expect((0x0052_0000...0x0052_FFFF).contains(m.cpu[.pc]),
+                    "reached loaded OS code; got \(String(format: "$%06X", m.cpu[.pc]))")
+
+            var minSR: UInt16 = 0xFFFF
+            var sawLevel1Handler = false     // $5208A6 Level1 (LIBHW-DRIVERS)
+            var sawLevel2Handler = false     // $520A52 Level2
+            var sawUserMode = false          // SR S-bit clear (scheduler ran a user process)
+            var restingRegion = false        // the $4C02xx / $2E2Bxx event-wait loop
+            for _ in 0..<4_000_000 where !m.halted {
+                let pc = m.cpu[.pc]
+                let sr = UInt16(m.cpu[.sr])
+                if sr < minSR { minSR = sr }
+                if pc == 0x0052_08A6 { sawLevel1Handler = true }
+                if pc == 0x0052_0A52 { sawLevel2Handler = true }
+                if (sr & 0x2000) == 0 { sawUserMode = true }
+                if (0x004C_0270...0x004C_028F).contains(pc) { restingRegion = true }
+                if restingRegion && sawLevel1Handler && sawLevel2Handler && sawUserMode
+                    && minSR < 0x0700 { break }
+                _ = m.step()
+            }
+
+            // THE UNMASKING: SR dropped below the level-7 mask it held the whole
+            // boot -- in fact all the way to user mode.
+            #expect(minSR < 0x2700, "SR dropped below $2700 -- the OS unmasked; minSR=\(String(format: "$%04X", minSR))")
+            #expect(sawUserMode, "the scheduler ran a process in user mode (SR S-bit clear)")
+            // FIRST LIVE INTERRUPTS delivered to the OS's own handlers.
+            #expect(sawLevel1Handler, "level-1 (VIA1 T1 ms-tick / retrace) delivered to Level1 @ $5208A6")
+            #expect(sawLevel2Handler, "level-2 (COPS/VIA2) delivered to Level2 @ $520A52")
+            // The OS is alive and idles in its scheduler event-wait loop.
+            #expect(restingRegion, "the OS settles into its user-mode event-wait loop @ $4C0270")
+            #expect(!m.halted, "the OS runs live -- no halt")
+            #expect(m.bus.busErrorPulseCount == 0, "no bus error across the unmasking")
+            #expect(m.bus.floppy.writeAttempts == 0, "still no floppy WRITE observed at Checkpoint E")
+            // M4 Task 4 round 4 re-anchor: 323 -> 344. With $FCC031 now
+            // presenting the Pepsi-class DiskROMId ($88), BOOT_IO_INIT's
+            // INIT_BOOT_CDS takes the real Lisa-2 config path BEFORE the
+            // unmasking: INIT_CONFIG reads the boot volume's MDDF PM-snapshot
+            // and FIND_CDDS/LOADEM read 'SYSTEM.CDD' + the Sony boot CD
+            // 'SYSTEM.CD_*' off the disk via the loader's synchronous reads
+            // (SOURCE-STARTUP:1103-1154, 1613-1663) -- 21 additional blocks.
+            #expect(m.bus.floppy.blocksRead == 344,
+                    "boot blocks (75 -> 323) + INIT_BOOT_CDS's SYSTEM.CDD/CD reads before unmasking; got \(m.bus.floppy.blocksRead)")
+        }
+
+        /// **M4 Task 4 (round 4) — Checkpoint G: the Office System installer UI
+        /// draws.** Supersedes `checkpointF_blockedOnDriverIOCompletion`
+        /// (rounds 1-3), whose frontier -- the FS-mount read orphaned on a stub
+        /// driver devrec "#14#1" (nil `cb_addr`, `entry_pt` -> the compiled-out
+        /// TWIGIO body) -- is now ROOT-CAUSED and FIXED
+        /// (docs/rom-trace-notes.md "Checkpoint G (round 4)"):
+        ///
+        ///  1. `$FCC031` (DiskROMId, LIBHW-DRIVERS:135) was a `0x00` stub, so
+        ///     BOOT_IO_INIT decoded our machine as a Twiggy Lisa 1
+        ///     (SOURCE-STARTUP:1876-1878) and installed the vestigial TWIGIO
+        ///     stub (SOURCE-CD:750; source-twiggy:1235/1237 -- body compiled
+        ///     out under `(*$IFC TWIGGYBUILD*)`) on the boot floppy devrecs.
+        ///     Fixed: `$C031` = `$88` (Pepsi-class) -> iomodel = iob_pepsi ->
+        ///     INIT_BOOT_CDS installs the REAL Sony CD driver from the disk.
+        ///  2. Floppy writes now happen (PM-snapshot rewrite, FS metadata):
+        ///     `FloppyController` stores them in a session-scoped in-memory
+        ///     overlay (never mutating the .dc42).
+        ///  3. The OS's recoverable-bus-error machinery (SOURCE-EXCEPASM
+        ///     :434-505 `BUS_ERR`) re-runs faulting JSR/JMP/RTS syscall and
+        ///     segment-swap gates by decoding the group-0 frame's IR + PC;
+        ///     Musashi's stock jump semantics (complete the jump, fault at the
+        ///     next fetch) corrupted a syscall parameter frame with a second
+        ///     return address (the fatal 10201 `e_hardsyscode`,
+        ///     source-EXCEPRIM:70). Fixed in the vendored core: target-prefetch
+        ///     faults now push real-68000 frames (see BusErrorFrameTests).
+        ///
+        /// With all three in place the boot now runs: mount read COMPLETES
+        /// (`unblk_req` executes), SYS_PROC_INIT creates processes (A5
+        /// changes), the scheduler dispatches user-mode code in domain 1 (the
+        /// first non-zero-domain execution -- OQ1'' evidence: the forced
+        /// supervisor->domain-0 translation model HOLDS through live
+        /// multi-domain scheduling), dozens of $A0xxxxxx-tagged gate faults
+        /// are taken and recovered by design, and the **Lisa 7/7 Office
+        /// System 3.0 installer dialog draws** (Finished/Repair/Install/
+        /// Restore) -- the machine idles in the installer's event-wait loop
+        /// awaiting input. Screenshots:
+        /// ~/Development/LisaEmu-artifacts/m4-checkpoint-g-desktop-background.png
+        /// and m4-checkpoint-g-installer-ui.png.
+        @Test func checkpointG_officeSystemInstallerUIDraws() throws {
+            let m = try bootIntoLoader()
+            let a5Boot = m.cpu[.a5]
+            var sawUnblkReq = false, a5Changed = false, sawUserDomain1 = false
+            var steps = 0
+            while steps < 10_000_000 && !m.halted {
+                let pc = m.cpu[.pc]
+                if pc == 0x002E_2BFC { sawUnblkReq = true }
+                if m.cpu[.a5] != a5Boot { a5Changed = true }
+                if (UInt16(m.cpu[.sr]) & 0x2000) == 0 && m.bus.domain == 1 { sawUserDomain1 = true }
+                _ = m.step(); steps += 1
+            }
+
+            #expect(!m.halted, "the OS runs live through the whole window -- no halt, no double fault")
+            // The round-1/2/3 stall mechanism is gone: driver I/O completions run.
+            #expect(sawUnblkReq, "unblk_req ($2E2BFC) EXECUTES -- the FS-mount reqblk completes (rounds 1-3: it never ran)")
+            // Single-process STARTUP is over: SYS_PROC_INIT ran, processes exist.
+            #expect(a5Changed, "A5 changes -- SYS_PROC_INIT created processes and the scheduler dispatched them")
+            // OQ1'' -- first context switch into a non-zero domain, observed:
+            // user-mode execution with the domain latch = 1 (the supervisor->
+            // domain-0 forced translation model survives real multi-domain
+            // scheduling; docs/rom-trace-notes.md "Checkpoint G (round 4)").
+            #expect(sawUserDomain1, "user-mode code executes in domain 1 -- live multi-domain scheduling")
+            // Recoverable bus errors are the OS's DESIGN at this stage
+            // (SOURCE-EXCEPASM:434-505 gate re-runs) -- the old "no bus error"
+            // pin is re-anchored: pulses now occur and are all RECOVERED.
+            #expect(m.bus.busErrorPulseCount > 0, "the $A0xxxxxx segment/syscall gate faults fire and are recovered by design")
+            // Session write-through: the OS writes the boot floppy (PM
+            // snapshot, FS metadata) and every write is stored in the
+            // in-memory overlay -- none dropped, the .dc42 never mutated.
+            #expect(m.bus.floppy.writeAttempts > 0, "the OS writes the boot floppy at Checkpoint G")
+            #expect(m.bus.floppy.blocksWritten == m.bus.floppy.writeAttempts,
+                    "every writedisk stored in the session overlay; \(m.bus.floppy.blocksWritten)/\(m.bus.floppy.writeAttempts)")
+            #expect(m.bus.floppy.blocksRead >= 600,
+                    "the OS keeps reading (segment swap-ins, installer resources); got \(m.bus.floppy.blocksRead)")
+
+            // THE ANCHOR: the Lisa 7/7 Office System 3.0 installer dialog is
+            // on screen (Finished/Repair/Install/Restore), stable across the
+            // idle event-wait loop.
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fnv1a(fb) == 0x04a1_9e4e_b597_04f4,
+                    "installer-dialog framebuffer FNV; got \(String(format: "0x%016llx", fnv1a(fb)))")
+            #expect(fb.reduce(0) { $0 + $1.nonzeroBitCount } == 60107,
+                    "installer-dialog set-pixel count; got \(fb.reduce(0) { $0 + $1.nonzeroBitCount })")
+        }
     }
 }

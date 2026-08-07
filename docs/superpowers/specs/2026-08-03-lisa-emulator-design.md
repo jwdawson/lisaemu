@@ -132,7 +132,14 @@ Deferred: sound, full-screen, config UI.
 - Memory viewer: physical or per-domain logical views.
 - MMU inspector: live 4 × 128 decoded segment table, current domain highlighted.
 - **Symbols: load `Lisa_Source/LISA_OS/Linkmaps 3.0` maps** → names in
-  disassembly, break on `SCHEDULER.SelectProcess` by name.
+  disassembly, break on `SCHEDULER.SelectProcess` by name. *(Project-history
+  note, M4 Task 2: the loader + `d`/`t`/status/`sym` annotation are built
+  (`LinkmapSymbols.swift`, `lisadbg`'s `sym`/`symbase` commands) — the
+  "break on `SCHEDULER.SelectProcess` by name" half is not (no breakpoint
+  command exists yet in `lisadbg`), and the available Linkmaps only cover
+  Office System applications, never the OS kernel, so kernel-space names
+  like `SCHEDULER.SelectProcess` have no data to resolve against yet
+  regardless — see `task-2-report.md`.)*
 - I/O trace: filterable device register + interrupt log.
 - **Whole-machine snapshot save/restore** (forces clean device state ownership;
   turns 90-second boots into instant repro).
@@ -171,13 +178,47 @@ Milestones (each a demo):
    127 `trap #6` calls, then reading and entering the OS image itself at
    `$520000`], and is currently blocked at the OS's own COPS-driver
    handshake — a new subsystem boundary, not a bug, deferred to the
-   project's M4. Symbol-overlay debugging (the "watch with symbols" half of
-   this line) is unimplemented; the debugger's Linkmap-symbol feature per
-   §4 has not been built yet.)*
+   project's M4. ~~Symbol-overlay debugging (the "watch with symbols" half
+   of this line) is unimplemented; the debugger's Linkmap-symbol feature
+   per §4 has not been built yet.~~ **Superseded (M4 Task 2, 2026-08-06):**
+   built — `lisadbg` loads `Lisa_Source/LISA_OS/Linkmaps 3.0` (or
+   `LISAEMU_LINKMAP_DIR`) and annotates `d`/`t`/status output and a `sym`
+   lookup command with resolved `UNIT.PROC+0xNN` symbols
+   (`LinkmapSymbols.swift`). Honest finding: the "watch with symbols" line
+   assumed the Linkmaps would cover the OS kernel being traced; they
+   don't — all 22 files in both Linkmaps directories are Office System
+   application/library maps (Filer, LisaWrite, sys1lib, ...), so kernel
+   addresses like the `$520000+` frontier currently resolve to nothing. The
+   overlay is real and works (verified against a real, cited symbol), it
+   just has no data for the address range M3/M4's trace needs yet — see
+   `task-2-report.md`.)*
+   *(Project-history note, 2026-08-07: the "kernel starts" clause is now closed
+   far beyond "starts". The project's own M4 (`docs/m4-demo.md`) carried the
+   loaded OS from M3's COPS-handshake stop all the way to the **Lisa 7/7 Office
+   System 3.0 installer dialog live on screen** — the OS takes live interrupts
+   into its own `Level1`/`Level2` handlers, runs its multi-domain scheduler,
+   reaches user mode, and draws the installer UI. It idles there awaiting mouse
+   input; an Install attempt correctly reports "can't find a suitable disk"
+   because no hard disk is modeled yet [deferred to the project's M5 = Widget/
+   ProFile HLE]. See `docs/rom-trace-notes.md` "Checkpoint E/F/G" and
+   `task-4-report.md`.)*
 4. **M3 Widget** — install OS 3.1 onto Widget image in-emulator; boot from HD.
    *(Project-history note, 2026-08-06: not yet reached by the project's own
    milestone numbering — see the M2/M3 note above for how this spec's
    numbering diverged from the actual build order.)*
 5. **M4 Desktop ⭐** — mouse/keyboard/clock live; Office System desktop.
+   *(Project-history note, 2026-08-07: substantially reached, one honest step
+   short of the desktop itself. The project's own M4 (`docs/m4-demo.md`)
+   delivered live interrupts (mouse/COPS level 2, ms-tick/vsync level 1 into the
+   OS's own handlers) and the running multi-domain scheduler, and drove the boot
+   to the **Office System 3.0 installer UI on screen** (screenshot
+   `~/Development/LisaEmu-artifacts/m4-checkpoint-g-installer-ui.png`). The
+   **Office System desktop** proper is the POST-install boot, which is still
+   ahead: it needs a hard disk to install onto first — the installer reports
+   "can't find a suitable disk" because none is modeled. So the desktop ⭐ waits
+   on the project's M5 (Widget/ProFile HLE), after which installing the OS and
+   booting from HD yields the desktop. Also carried to M5: driving the installer
+   UI (mouse input at its event-wait), the soft-power/Power menu, `$C015` vs.
+   800K double-sided, and the parked 1 MB-POST divergence `$FE099C`.)*
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

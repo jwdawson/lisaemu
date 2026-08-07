@@ -162,7 +162,22 @@ Milestones (each a demo):
 2. **M1 Self-test** — real boot ROM passes POST, draws boot menu (MMU, video,
    VIAs, COPS basics, vsync). Most unknowns die here.
 3. **M2 Floppy boot** — install disk loads; kernel starts (watch with symbols).
+   *(Project-history note, 2026-08-06: this line's two clauses landed as two
+   separate milestones in the actual build order. "Install disk loads" ✓ —
+   closed by the project's own M2 (`docs/m2-demo.md`): the loader runs from
+   RAM and reads the LFS off the floppy. "Kernel starts" — closed by the
+   project's own M3 (`docs/m3-demo.md`), honestly stated: the loaded OS
+   image EXECUTES its own initialization code [MMU domain-0/1 bootstrap,
+   127 `trap #6` calls, then reading and entering the OS image itself at
+   `$520000`], and is currently blocked at the OS's own COPS-driver
+   handshake — a new subsystem boundary, not a bug, deferred to the
+   project's M4. Symbol-overlay debugging (the "watch with symbols" half of
+   this line) is unimplemented; the debugger's Linkmap-symbol feature per
+   §4 has not been built yet.)*
 4. **M3 Widget** — install OS 3.1 onto Widget image in-emulator; boot from HD.
+   *(Project-history note, 2026-08-06: not yet reached by the project's own
+   milestone numbering — see the M2/M3 note above for how this spec's
+   numbering diverged from the actual build order.)*
 5. **M4 Desktop ⭐** — mouse/keyboard/clock live; Office System desktop.
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

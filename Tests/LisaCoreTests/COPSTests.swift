@@ -292,11 +292,12 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
     #expect(interruptRaised() == false, "FIFO drained")
 
     cops.handlePortAAccess(index: 1, value: COPS.Command.readClock, isWrite: true)
-    // Three separate hops: the command's own latch delay, then its ack
-    // delay, THEN (once the reply is enqueued as a result of that ack
-    // firing) the first reply byte's own delivery delay -- each is
-    // scheduled relative to the cycle at the moment it's requested, not the
-    // cycle at the start of this test.
+    // Two separate hops: the command's own ack delay (register 1 is the
+    // "real" handshake ORA, so no suppressed-read consumption is needed
+    // here -- this test never reads portBInput at all), THEN (once the
+    // reply is enqueued as a result of that ack firing) the first reply
+    // byte's own delivery delay -- each is scheduled relative to the cycle
+    // at the moment it's requested, not the cycle at the start of this test.
     scheduler.advance(by: COPS.commandAckDelayCycles)
     scheduler.advance(by: COPS.byteDeliveryDelayCycles)
 

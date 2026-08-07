@@ -541,11 +541,17 @@ probe, `COPSTests`, M1c input backstop, and the M2/M3 boot anchors
 itself remains unmodeled by `COPS` (no bit-level Port A bus simulation).
 
 **Frontier check (M4 Task 1):** with the fix, `$7C`'s handshake completes and
-the CRDY spin breaks. Control leaves `COPSCMD` (`$5208A4` `rts`) into a new
-polling loop at `$5208A6`+ that matches LIBHW-DRIVERS' `Level1` interrupt
-dispatch handler shape (`btst #2,$FCF801` vertical-retrace test, `$FCD969`
-VIA1 IFR1 timer-1 test, VIA2 IFR2 COPS-pending test) — the OS's own
-interrupt-servicing entry point. Deep tracing from here is M4 Task 3's job.
+the CRDY spin breaks. `COPSCMD` is called via `jsr` from `$52070E`, so its
+`rts` (`$5208A4`) returns to `$520712` — the very next instruction in its
+CALLER, driver-init — which immediately installs the level-2 (COPS)
+autovector handler (`lea ($33C,PC),A1; move.l A1,$68.w`) and continues
+driver-init (clearing OS globals, walking a 16-entry device table at
+`$2B0.w` via `jsr $520A74` per entry, etc.). **Not** the `Level1`-shaped
+code visible at `$5208A6`+ immediately after `COPSCMD` in binary layout —
+that address is simply the next routine in the image, never reached from
+this call site; it would only run later via an actual interrupt, and
+interrupts are still masked at this point. Task 3 should start tracing from
+`$520712`.
 
 Companion observations at the (now-passed) M3 Task 4 boundary: interrupts
 stay masked at 7 the whole path up to that point (`minSR=$2700` — the

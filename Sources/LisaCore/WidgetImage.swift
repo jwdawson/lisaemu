@@ -62,12 +62,10 @@ public final class WidgetImage {
     public let url: URL
     public let blockCount: Int
 
-    /// In-memory mirror of the whole image, for O(1) reads. `write` keeps it
-    /// in lockstep with the file (write-through), so a reopened image and a
-    /// live one agree.
-    private var storage: [UInt8]
-    /// The backing file, opened for updating; `write` seeks + writes through
-    /// it, `flush` fsyncs it. `nil` only after `close()`.
+    /// The backing file, opened for updating and the **single source of truth**
+    /// (review M3: no redundant in-memory mirror). `data`/`tag` seek + read
+    /// through it; `write` seeks + writes through it; `flush` fsyncs it. Closed
+    /// in `deinit`.
     private let handle: FileHandle
 
     /// Creates a fresh, all-zero image of `blockCount` blocks at `url`,
@@ -82,7 +80,6 @@ public final class WidgetImage {
         try Data(count: byteCount).write(to: url)
         self.url = url
         self.blockCount = blockCount
-        self.storage = [UInt8](repeating: 0, count: byteCount)
         self.handle = try FileHandle(forUpdating: url)
     }
 
@@ -92,14 +89,13 @@ public final class WidgetImage {
     ///   `Error.sizeNotBlockAligned` if the size is not a whole multiple of
     ///   `bytesPerBlock`; a Foundation file error if it cannot be read/opened.
     public init(contentsOf url: URL) throws {
-        let data = try Data(contentsOf: url)
-        guard data.count > 0 else { throw Error.emptyImage }
-        guard data.count % Self.bytesPerBlock == 0 else {
-            throw Error.sizeNotBlockAligned(size: data.count, bytesPerBlock: Self.bytesPerBlock)
+        let size = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? Int) ?? 0
+        guard size > 0 else { throw Error.emptyImage }
+        guard size % Self.bytesPerBlock == 0 else {
+            throw Error.sizeNotBlockAligned(size: size, bytesPerBlock: Self.bytesPerBlock)
         }
         self.url = url
-        self.blockCount = data.count / Self.bytesPerBlock
-        self.storage = [UInt8](data)
+        self.blockCount = size / Self.bytesPerBlock
         self.handle = try FileHandle(forUpdating: url)
     }
 
@@ -107,20 +103,34 @@ public final class WidgetImage {
         try? handle.close()
     }
 
+    /// Reads `length` bytes at `offset` from the backing file. A short read or
+    /// I/O error on our own backing file is a system/programmer fault, not
+    /// recoverable input, so it traps (same precondition philosophy as
+    /// `DC42Image`'s block indexing) rather than throwing.
+    private func read(offset: Int, length: Int) -> Data {
+        do {
+            try handle.seek(toOffset: UInt64(offset))
+            guard let bytes = try handle.read(upToCount: length), bytes.count == length else {
+                preconditionFailure("WidgetImage short read at offset \(offset) (\(url.path))")
+            }
+            return bytes
+        } catch {
+            preconditionFailure("WidgetImage read failed at offset \(offset): \(error)")
+        }
+    }
+
     /// The 512-byte data payload of `block` (0-based). Traps on an
     /// out-of-range block -- a caller bug, exactly like `DC42Image.data`.
     public func data(block: Int) -> Data {
         precondition(block >= 0 && block < blockCount, "block \(block) out of range [0..<\(blockCount)]")
-        let start = block * Self.bytesPerBlock
-        return Data(storage[start..<(start + Self.dataBytesPerBlock)])
+        return read(offset: block * Self.bytesPerBlock, length: Self.dataBytesPerBlock)
     }
 
     /// The 20-byte header/tag of `block` (0-based). Traps on an out-of-range
     /// block.
     public func tag(block: Int) -> Data {
         precondition(block >= 0 && block < blockCount, "block \(block) out of range [0..<\(blockCount)]")
-        let start = block * Self.bytesPerBlock + Self.dataBytesPerBlock
-        return Data(storage[start..<(start + Self.tagBytes)])
+        return read(offset: block * Self.bytesPerBlock + Self.dataBytesPerBlock, length: Self.tagBytes)
     }
 
     /// Writes `data` (512 bytes) + `tag` (20 bytes) to `block`, through to the
@@ -135,11 +145,7 @@ public final class WidgetImage {
         precondition(data.count == Self.dataBytesPerBlock, "data must be \(Self.dataBytesPerBlock) bytes, got \(data.count)")
         precondition(tag.count == Self.tagBytes, "tag must be \(Self.tagBytes) bytes, got \(tag.count)")
 
-        let start = block * Self.bytesPerBlock
-        storage.replaceSubrange(start..<(start + Self.dataBytesPerBlock), with: data)
-        storage.replaceSubrange((start + Self.dataBytesPerBlock)..<(start + Self.bytesPerBlock), with: tag)
-
-        try handle.seek(toOffset: UInt64(start))
+        try handle.seek(toOffset: UInt64(block * Self.bytesPerBlock))
         handle.write(Data(data) + Data(tag))
     }
 

@@ -85,8 +85,15 @@ func formatMMUPortWrite(_ e: (domain: Int, segment: Int, isSorg: Bool, value: UI
 /// Compact disk-state suffix for the `t`/`g` status lines (M2 Task 4 brief:
 /// "status line shows disk state").
 func diskStatus(_ machine: Machine) -> String {
-    guard machine.bus.floppy.isInserted else { return "disk=OUT" }
-    return "disk=IN blocksRead=\(machine.bus.floppy.blocksRead)"
+    // Widget hard-disk stats appended only when one is attached (M5 Task 4:
+    // `widgetCmds` = completed ProFile commands, the unambiguous boot-from-
+    // Widget progress signal -- it counts both the OS driver's $FCD801 path
+    // and the boot ROM's $FCD901 path, unlike `widgetRegionAccesses` which is
+    // the $FCD801 OS-driver seam metric only).
+    let widget = machine.bus.widget.isAttached
+        ? " widgetCmds=\(machine.bus.widget.completedCommands)" : ""
+    guard machine.bus.floppy.isInserted else { return "disk=OUT" + widget }
+    return "disk=IN blocksRead=\(machine.bus.floppy.blocksRead)" + widget
 }
 
 func formatIOAccess(_ access: IOAccess) -> String {

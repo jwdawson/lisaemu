@@ -202,14 +202,33 @@ final class IODispatcher {
         record(offset: offset, value: value, isWrite: true)
     }
 
-    /// The two VIA1 offsets that carry the Widget driver's Port-B control
-    /// strobe: HWBASE Port B (`$FCD801` register 0) and its HWSTATUS mirror
-    /// (`$FCDC01`), per docs/hardware-notes.md §10.1-10.2. The `$FCD901`
-    /// mirror (the ROM floppy handshake's Port B) is intentionally NOT
-    /// included -- the Widget must not react to floppy-path Port B traffic.
+    /// The VIA1 Port B (ORB / register 0) offsets that carry the Widget's
+    /// CMD strobe + DIR select (docs/hardware-notes.md §10.1-10.2). All of
+    /// `$FCD801` (OS-driver HWBASE), `$FCD901` (ROM parallel-port base, §3),
+    /// and `$FCDC01` (HWSTATUS mirror) decode to the SAME physical VIA1 PORTB
+    /// register (`viaRegisterIndex` maps them all to `(via:1, index:0)`), so
+    /// on real hardware writing CMD/DIR through any of the three aliases
+    /// drives the same output pins. The OS ProFile/Widget driver bit-bangs
+    /// via `$FCD801`; the boot ROM's own parallel-port boot routine
+    /// (`prof_entry` = `$FE1F70`) bit-bangs via `$FCD901` (`ANDI/ORI` on
+    /// `(A0)` with `A0 = $FCD901`, offsets $18/$10 = DDR, bit 4 = CMD, bit 3 =
+    /// DIR -- docs/rom-trace-notes.md "Checkpoint K"). **M5 Task 4:** the
+    /// `$FCD901` alias was previously excluded (a Task-3 guard against the
+    /// floppy path); that also blocked the ROM's legitimate boot-from-Widget
+    /// probe/read, so the ROM never saw the disk (STARTUP FROM listed only
+    /// the floppy). Forwarding all three is both more faithful (they are one
+    /// register) and what lets the ROM boot the installed OS off the Widget.
+    /// The floppy path only READS VIA1 PB6 (`$FE1E04`, DDR-masked input) and
+    /// never writes the CMD bit, and `widget.portBWrite` is a no-op while the
+    /// Widget is detached -- so the no-widget floppy-boot checkpoints (E/G)
+    /// and the widget-attached install (J) are unaffected (verified in the
+    /// full matrix).
     private static func isWidgetPortBOffset(_ offset: UInt32, index: Int) -> Bool {
         if offset == 0xDC01 { return true }
-        return index == 0 && offset >= 0xD801 && offset <= 0xD801 + 15 * 8
+        guard index == 0 else { return false }
+        if offset >= 0xD801 && offset <= 0xD801 + 15 * 8 { return true }
+        if offset >= 0xD901 && offset <= 0xD901 + 15 * 8 { return true }
+        return false
     }
 
     /// Count of accesses (read or write) to the OS ProFile/Widget driver's

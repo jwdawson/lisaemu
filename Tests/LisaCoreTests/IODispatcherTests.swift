@@ -386,3 +386,61 @@ import Testing
     bus.write8(0xFC_D801, 0x18)   // reg 0: CMD deasserted
     #expect(bus.read8(0xFC_DC01) & 0x02 == 0x02, "BSY = 1 once CMD deasserts")
 }
+
+@Test func widgetPortBStrobeRoutesThroughTheROMParallelBaseD901() throws {
+    // **M5 Task 4 -- boot-from-Widget.** The boot ROM's own parallel-port boot
+    // routine (`prof_entry` = $FE1F70) bit-bangs the ProFile CMD/DIR strobe on
+    // VIA1 PORT B at base **$FCD901** (`A0 = $FCD901`, docs/rom-trace-notes.md
+    // "Checkpoint K"), NOT the OS driver's $FCD801. $FCD801/$FCD901 alias the
+    // SAME physical VIA1 PORTB register (viaRegisterIndex maps both to
+    // (via:1,index:0)), so a CMD strobe through the $D901 alias must reach the
+    // Widget exactly like the $D801 path above -- this is what lets the ROM
+    // probe + boot the disk (before the fix the $D901 alias was excluded and
+    // STARTUP FROM never listed the Widget). Data/BSY reads already reached the
+    // drive at $D901 (same VIA instance); the gap was the Port-B WRITE forward.
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("iodisp-widget-d901-\(UUID().uuidString).widget")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let image = try WidgetImage(createBlankAt: url, blockCount: 8)
+
+    let bus = Bus(ramSize: 0x1000)
+    bus.widget.attach(image)
+
+    // The ROM's handshake, driven entirely through the $FCD901 alias:
+    bus.write8(0xFC_D901, 0x18)   // reg 0 ($D901): CMD false, DIR in
+    bus.write8(0xFC_D901, 0x08)   // reg 0: CMD asserted -> present ready code, BSY->0
+    // Response byte on PORTA reg 15 ($FCD979 = $D901 + 15*8), and BSY on
+    // PORTB bit 1 read back at $FCD901 (reg 0, DDRB=0 input at reset) -- the
+    // ROM reads both off this base, not the $DC01 mirror.
+    #expect(bus.read8(0xFC_D979) == 0x01, "PORTA (reg 15) via $D901 reads the $01 idle->ready response")
+    #expect(bus.read8(0xFC_D901) & 0x02 == 0x00, "BSY = 0 while CMD asserted (read via $D901 PORTB)")
+    bus.write8(0xFC_D901, 0x18)   // CMD deasserted
+    #expect(bus.read8(0xFC_D901) & 0x02 == 0x02, "BSY = 1 once CMD deasserts")
+}
+
+@Test func widgetPortBForwardIgnoresNonPortBVia1Offsets() throws {
+    // The forward is gated to VIA1 register 0 (PORTB/ORB) only. A write to a
+    // DIFFERENT VIA1 register at the $D901 base -- e.g. DDRB (index 2, offset
+    // $10) or a timer -- must NOT be mistaken for a CMD strobe. The floppy
+    // read routine ($FE1E04) writes VIA1 DDRB (to make PB6 an input) on the
+    // shared base every boot; that traffic must leave the Widget idle. Here:
+    // DDRB writes with the CMD bit both clear and set leave BSY = 1 (idle),
+    // proving no phantom CMD assertion.
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("iodisp-widget-guard-\(UUID().uuidString).widget")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let image = try WidgetImage(createBlankAt: url, blockCount: 8)
+
+    let bus = Bus(ramSize: 0x1000)
+    bus.widget.attach(image)
+
+    bus.write8(0xFC_D901 + 0x10, 0xFF)   // DDRB1 (index 2) with the CMD-bit position set
+    bus.write8(0xFC_D901 + 0x50, 0x00)   // SR1 (index 10) -- not PORTB
+    bus.write8(0xFC_D901 + 0x30, 0x00)   // T1LL1 (index 6, a timer latch) -- not PORTB
+    // Assert on the drive's own view (bypasses VIA read-back DDR semantics):
+    // the CMD line was never asserted, so BSY stays high (idle) and no
+    // transaction opened.
+    #expect(bus.widget.portBInput & 0x02 == 0x02,
+            "BSY stays 1 (idle) -- non-PORTB VIA1 writes never assert the Widget CMD")
+    #expect(bus.widget.completedCommands == 0, "no command was opened by non-PORTB traffic")
+}

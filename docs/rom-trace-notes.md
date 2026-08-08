@@ -2342,23 +2342,52 @@ window. That is what is observed.
   handshake reading PB6 (PC `$FE1E24`, `$1000BE`), already documented in §9
   (`disk_control` idle bit) — likewise not ProFile.
 
-### INFERRED (source reading, hardware-notes §10.9)
+### INFERRED (source reading, hardware-notes §10.9) — one part REFUTED by M5 Task 2
 
 - No `PROF_INIT` runs because **no `cd_intdisk` (or `cd_paraport`) hard-disk
-  devrec is built**: on `iob_pepsi` the external parallel port is refused
-  (`cdnoparaport`, CD:1006-1013), and the internal-disk devrec is created only
-  from a parameter-memory `cd_intdisk` entry (CD:1030) that the install disk's
-  PM does not carry — the BOOT_IO_INIT builtin loop creates only Twiggy floppy
-  devrecs, never a hard disk (STARTUP:1950-2006).
-- Therefore the installer's "can't find a suitable disk" (user-confirmed on a
-  live Install click) is the app scanning `configinfo` for a `diskdev` target
-  and finding only the boot floppy — no hard-disk `via1` devrec exists to
-  enumerate.
+  devrec is built** on the boot/STARTUP path: on `iob_pepsi` the external
+  parallel port is refused (`cdnoparaport`, CD:1006-1013), and the BOOT_IO_INIT
+  builtin loop creates only Twiggy floppy devrecs, never a hard disk
+  (STARTUP:1950-2006). *(This much stands.)*
+- ~~The internal-disk devrec is created only from a parameter-memory
+  `cd_intdisk` entry (CD:1030); therefore the installer's "can't find a
+  suitable disk" is the app scanning `configinfo` for a `diskdev` target.~~
+  **REFUTED (M5 Task 2, Task-1 Q2; struck, not erased).** See hardware-notes
+  §10.9a: the installer does **not** read configinfo/PM to find disks — it
+  builds a candidate list from `machineType.io_board` (slot 12 for `IOpepsi`,
+  APIN-OFFICE:3005-3040), **`CDMake`s the `cd_intdisk` devrec itself** with zero
+  PM (APIN-OFFICE:2944-2946 → CD:1366-1428 → NEW_DEVICE CD:1030), then tests via
+  FS `LookUp`/`Mount` (APIN-OFFICE:3044-3055, 3111-3113). PM is an *output* of a
+  completed install (`CheckPMList`/`PMWrite`, APIN-OFFICE:3141), consumed only
+  by the *next* boot's `INIT_CDS` (CD:1758-1935). So no PM model is needed for
+  the installer to find the disk.
+
+### Checkpoint H (M5 Task 2) — OBSERVED with a Widget attached
+
+`ROMFloppyBootTests.checkpointH_widgetAttachedDoesNotDriveTheRegionOrMoveThe
+Installer` boots the checkpoint-G window **with a `WidgetDrive` + blank
+`WidgetImage` attached** on VIA1 (decode now widened to `$FCD801`/`$FCDC01`/
+`$FCDC05`). OBSERVED:
+
+- `bus.widgetRegionAccesses == 0` and `bus.widget.completedCommands == 0`: the
+  OS/ROM **still never touches the `$FCD801`/`$FCDC01` region** on the boot-to-
+  installer-*dialog* path, even with a Widget present. Attaching hardware alone
+  does not provoke `PROF_INIT` — consistent with §10.9a (the driver is built +
+  driven by the installer's `CDMake`/`Mount` scan, which runs on the *Install
+  click*, not before). The `$FCD801` mirror the driver drives is therefore
+  **still UNOBSERVED**; `IODispatcher.firstWidgetRegionAccessCycle` will capture
+  it the first time Task 3's scripted Install reaches the scan.
+- The installer dialog is **byte-identical** with a Widget attached (FNV
+  `0x04a19e4eb59704f4`, same as checkpoint G). Attaching a Widget does **not**
+  move the boot menu / installer UI — no re-anchoring needed (contrast the M2
+  floppy-devrec precedent, where a new boot device *did* move the menu).
 
 ### Bottom line
 
-The live branch matches the derived conditional exactly: **identity `$88`/`1`
-→ `iob_pepsi` → no ProFile devrec → no `$FCD801` probe → no suitable disk.**
-Closing this (Checkpoint H proper) needs a Widget device model answering the
-§10.1-10.7 protocol at `$FCD801` **and** a `cd_intdisk` devrec to come into
-existence (via the install flow writing PM/CDD) — the work of M5 Tasks 2-3.
+The live branch matches the derived conditional: **identity `$88`/`1` →
+`iob_pepsi` → no ProFile devrec on the boot path → no `$FCD801` probe → the
+installer dialog draws.** Closing this (Checkpoint H proper) needs only (a) the
+Widget device model answering §10.1-10.7 at `$FCD801` (**M5 Task 2, done**) and
+(b) driving the installer far enough to run its own `SetDevices`/`CDMake`/
+`MountInit` scan (**Task 3** — the Install click). It does **not** need a
+parameter-memory model (the refuted half above).

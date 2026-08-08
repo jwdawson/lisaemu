@@ -14,6 +14,10 @@ public struct Monitor {
         /// 2's relocation model; see `LinkmapSymbols.swift`'s doc comment
         /// "base-offset story").
         case symbase(UInt32)
+        /// `widget create <path>` (M5 Task 2) -- creates a fresh all-zero
+        /// Widget-10 hard-disk image at `<path>` and attaches it, so the
+        /// installer can format-and-populate a blank disk (§10.10).
+        case widgetCreate(String)
         case quit, help
     }
 
@@ -60,6 +64,12 @@ public struct Monitor {
                     return .sym(a)
         case "symbase": guard let a = hex(1) else { return nil }
                         return .symbase(a)
+        case "widget":
+            // `widget create <path>` -- only sub-command today.
+            guard parts.count >= 3, parts[1] == "create" else { return nil }
+            // Rejoin the tail so paths containing spaces survive the split.
+            let path = parts[2...].joined(separator: " ")
+            return .widgetCreate(path)
         case "q": return .quit
         case "?": return .help
         default:  return nil

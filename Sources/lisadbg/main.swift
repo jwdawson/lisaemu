@@ -321,8 +321,20 @@ if let diskFlagIndex = args.firstIndex(of: "--disk") {
     args.removeSubrange(diskFlagIndex...(diskFlagIndex + 1))
 }
 
+// `--widget <path.widget>` (M5 Task 2): attach a persistent Widget hard disk.
+// A missing path is created as an all-zero blank Widget-10 image on demand
+// (§10.10). Position-independent, same as `--disk`.
+var widgetPath: String?
+if let widgetFlagIndex = args.firstIndex(of: "--widget") {
+    guard widgetFlagIndex + 1 < args.count else {
+        fail("--widget requires a path argument")
+    }
+    widgetPath = args[widgetFlagIndex + 1]
+    args.removeSubrange(widgetFlagIndex...(widgetFlagIndex + 1))
+}
+
 guard args.count >= 2 else {
-    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>]")
+    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>] [--widget <path.widget>]")
 }
 
 let machine = Machine()
@@ -361,6 +373,23 @@ if let diskPath {
         print("lisadbg — inserted disk image \(diskPath) (\(image.blockCount) blocks)")
     } catch {
         fail("cannot load disk image \(diskPath): \(error)")
+    }
+}
+
+if let widgetPath {
+    let url = URL(fileURLWithPath: widgetPath)
+    do {
+        let image: WidgetImage
+        if FileManager.default.fileExists(atPath: url.path) {
+            image = try WidgetImage(contentsOf: url)
+            print("lisadbg — attached Widget image \(widgetPath) (\(image.blockCount) blocks)")
+        } else {
+            image = try WidgetImage(createBlankAt: url)
+            print("lisadbg — created blank Widget image \(widgetPath) (\(image.blockCount) blocks)")
+        }
+        machine.bus.widget.attach(image)
+    } catch {
+        fail("cannot attach Widget image \(widgetPath): \(error)")
     }
 }
 
@@ -459,10 +488,19 @@ while let line = readLine(strippingNewline: true) {
         }
         monitor.symbols?.baseOffset = addr
         print("      symbol base offset set to $\(String(format: "%06X", addr))")
+    case .widgetCreate(let path):
+        let url = URL(fileURLWithPath: path)
+        do {
+            let image = try WidgetImage(createBlankAt: url)
+            machine.bus.widget.attach(image)
+            print("      created + attached blank Widget image \(path) (\(image.blockCount) blocks, \(image.blockCount * WidgetImage.bytesPerBlock) bytes)")
+        } catch {
+            print("      widget create: \(error)")
+        }
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | sym <hexaddr> | symbase <hexaddr> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

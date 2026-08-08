@@ -51,6 +51,8 @@ private enum Command {
     case debug((Machine) -> Void)
     case insertFloppy(URL)
     case ejectFloppy
+    case attachWidget(URL)
+    case detachWidget
     case shutdown
 }
 
@@ -292,6 +294,23 @@ public final class EmulationController {
     /// (per `FloppyController.eject()`) if nothing is currently inserted.
     public func ejectFloppy() { shared.mailbox.post(.ejectFloppy) }
 
+    /// Posts a mailbox command that attaches a Widget hard-disk image at `url`
+    /// ON THE EMULATION THREAD via `Machine.bus.widget.attach(_:)` -- the
+    /// hard-disk counterpart of `insertFloppy(url:)` (M5 Task 2). If the file
+    /// does not exist, an all-zero blank Widget-10 image is CREATED there on
+    /// demand (docs/hardware-notes.md §10.10 creation policy); an existing
+    /// file is opened and validated. Unlike the floppy's read-only session
+    /// overlay, Widget writes PERSIST to this file (write-back, §10.10). An
+    /// open/create failure is caught on the emulation thread and reported via
+    /// `onDiskError` (the same surface `insertFloppy` uses), never thrown
+    /// across the mailbox boundary. Asynchronous, like every mailbox command.
+    public func attachWidget(url: URL) { shared.mailbox.post(.attachWidget(url)) }
+
+    /// Symmetric with `attachWidget(url:)`: posts a command that calls
+    /// `Machine.bus.widget.detach()` on the emulation thread. A no-op if no
+    /// Widget is currently attached.
+    public func detachWidget() { shared.mailbox.post(.detachWidget) }
+
     /// Returns the raw 1bpp framebuffer snapshot + dimensions via `Frame`
     /// (PNG-encoding stays app-side, per the plan's Task 1 interfaces).
     /// `completion` fires ON THE EMULATION THREAD, same as `onFrame`/
@@ -454,6 +473,21 @@ public final class EmulationController {
                     }
                 case .ejectFloppy:
                     machine.bus.floppy.eject()
+                case .attachWidget(let url):
+                    do {
+                        let image: WidgetImage
+                        if FileManager.default.fileExists(atPath: url.path) {
+                            image = try WidgetImage(contentsOf: url)
+                        } else {
+                            // Blank-on-demand (§10.10): a fresh Widget is blank.
+                            image = try WidgetImage(createBlankAt: url)
+                        }
+                        machine.bus.widget.attach(image)
+                    } catch {
+                        shared.onDiskError?("Could not open/create Widget image at \(url.path): \(error)")
+                    }
+                case .detachWidget:
+                    machine.bus.widget.detach()
                 case .shutdown:
                     shutdownGate.signal()
                     return

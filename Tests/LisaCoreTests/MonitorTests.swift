@@ -23,6 +23,9 @@ extension MusashiSuites {
             #expect(Monitor.parse("sym") == nil, "sym requires an address argument")
             #expect(Monitor.parse("symbase 500000") == .symbase(0x50_0000))
             #expect(Monitor.parse("symbase") == nil, "symbase requires an address argument")
+            #expect(Monitor.parse("widget create /tmp/hd.widget") == .widgetCreate("/tmp/hd.widget"))
+            #expect(Monitor.parse("widget") == nil, "widget requires a sub-command")
+            #expect(Monitor.parse("widget create") == nil, "widget create requires a path")
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
         }

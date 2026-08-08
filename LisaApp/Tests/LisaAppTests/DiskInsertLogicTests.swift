@@ -41,4 +41,18 @@ struct DiskInsertLogicTests {
         // crash").
         #expect(AppModel.isDC42File(URL(fileURLWithPath: "/tmp/does-not-exist.dc42")))
     }
+
+    // MARK: - M5 Task 2: Widget hard-disk image filter
+
+    @Test func widgetFilterAcceptsWidgetAndImageExtensions() {
+        #expect(AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/HD.widget")))
+        #expect(AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/HD.WIDGET")))
+        #expect(AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/HD.image")))
+    }
+
+    @Test func widgetFilterRejectsFloppyAndOtherExtensions() {
+        #expect(!AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/OS31_Install_1.dc42")))
+        #expect(!AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/notes.txt")))
+        #expect(!AppModel.isWidgetFile(URL(fileURLWithPath: "/tmp/HD")))
+    }
 }

@@ -407,10 +407,12 @@ public final class WidgetDrive {
     private func zeros(_ n: Int) -> [UInt8] { [UInt8](repeating: 0, count: n) }
 
     /// `PROF_INIT`'s device-characteristics stream (PROFASM:1596-1613), read via
-    /// IRA right after the accept handshake: 4 status bytes, 14 skipped, then
-    /// DRIVETYPE at byte 14, 3 skipped, then a 3-byte DISCSIZE at bytes 18-20.
-    /// We report **drivetype 0** (⇒ hdinit resolves **T_Seagate**, single-block,
-    /// PROFILE:283-301 / §10.8) and **discsize = blockCount**.
+    /// IRA right after the accept handshake. Absolute byte offsets into the
+    /// stream (status bytes included, as the code + test index it): 4 status
+    /// bytes (0-3), 14 skipped (4-17), **DRIVETYPE at byte 18**, 3 skipped
+    /// (19-21), **3-byte DISCSIZE at bytes 22-24**. We report **drivetype 0**
+    /// (⇒ hdinit resolves **T_Seagate**, single-block, PROFILE:283-301 / §10.8)
+    /// and **discsize = blockCount**.
     private func deviceInfoStream() -> [UInt8] {
         var s = zeros(25)
         // s[0..3] = 4 OK status bytes (already zero)

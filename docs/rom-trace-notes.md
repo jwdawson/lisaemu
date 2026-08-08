@@ -2424,9 +2424,11 @@ strike-not-erase):
 - **Response codes on PORTA (VIA reg 15, no-handshake)**; the `$55` reply is
   written back there (`DOSHAKE`, PROFASM:1663). **Data/status on IRA (reg 1,
   auto-advancing)**; command bytes out on ORA (reg 1).
-- **`PROF_INIT` device-info** (block `$FFFFFF`) is not a 512+20 block: 4 status,
-  14 skip, **DRIVETYPE @ byte 14**, 3 skip, **3-byte DISCSIZE @ 18-20**
-  (PROFASM:1596-1613) → we answer drivetype 0 + discsize = 19456 (T_Seagate).
+- **`PROF_INIT` device-info** (block `$FFFFFF`) is not a 512+20 block; absolute
+  offsets into the IRA stream (status bytes included): 4 status (0-3), 14 skip
+  (4-17), **DRIVETYPE @ byte 18**, 3 skip (19-21), **3-byte DISCSIZE @ bytes
+  22-24** (PROFASM:1596-1613) → we answer drivetype 0 + discsize = 19456
+  (T_Seagate).
 - **Read byte ORDER** (NEW_CMD, PROFASM:150-159): **status (4, S6) FIRST**, then
   header (20) + data (512, S7). **Write byte ORDER** (S10, PROFASM:687-707):
   **header (20, WRHDR) FIRST**, then data (512, WRDATA); the driver then does a
@@ -2446,23 +2448,35 @@ path, PROFILE:271/298) → **"Please insert the Lisa Office System 2 micro
 diskette"** — the first media swap.
 
 **BOUNDARY — the floppy media-change / remount attention (documented, not
-faked).** At the "insert disk 2" prompt the installer's process **blocks**: the
-OS scheduler idles (`$2E2BF8`) and the installer spins (`$CC4BDC`) with **zero
-I/O** — it is not polling the floppy, the Widget, or any register; it is a
-blocked process awaiting a device **event**. Ejecting the floppy and inserting
-disk 2 through the real `FloppyController.eject()`/`insert()` path (presence
-bits `DISKIN`/`DISKSTAT`, the same path `EmulationController` uses) does **not**
-wake it, and neither does a raised floppy **completion** interrupt. The exact
-unsatisfiable condition: **a mid-run floppy media change must raise a disk
-eject/insert *attention* interrupt that wakes the blocked OS Sony-driver
-process so the FS remounts the new volume** (the installer's main loop "always
-attempts remount" and verifies the diskette name, APIN-OFFICE:27,201). Our
-`FloppyController` models only **command-completion** interrupts (read/write),
-never a media-change attention, and the OS's eject (`unclamp`) is a modeled
-no-op — this was never needed before because every prior milestone booted from
-a single disk present at power-on. Closing it is a **floppy-subsystem** effort
-(eject/insert attention + the OS remount handshake), distinct from the Widget
-HLE this task delivered, and is the M5-follow-on frontier.
+faked; wording corrected in fix round 1).** At the "insert disk 2" prompt the
+installer is in an **app-level `Mount` retry loop behind an `AskAlert`**
+(APIN-OFFICE:~2131-2159): it keeps re-attempting to mount the floppy and
+re-shows the alert until a *new* disk mounts. Observably the OS scheduler idles
+(`$2E2BF8`) and the installer spins (`$CC4BDC`) with **zero hardware I/O** in
+the sampled window — but that is the retry loop between alert dismissals, **not
+a bare spin-poll of a register**; the earlier "blocked process… not a poll"
+phrasing was imprecise. The loop can never succeed because the OS's cached
+`disk_present` never flips for the swapped-in disk. **What flips it at runtime
+is the `bot_in` media-change interrupt, which our `FloppyController` does not
+raise:** the Sony driver's runtime disk-present latch is updated only by
+`DISK_INT` (SONY:469-481 — sets `disk_present := gooddisk` and `KEYPUSHED`
+*even with no pending I/O*), fired off the VIA's separate `bot_done`/`bot_in`
+status bits (SONY:84-90; SONYASM:22-23 "INTERRUPT SOURCE"). The synchronous
+presence probe `ISDISKIN` is explicitly **"Call only during initialization"**
+(SONYASM:431-442, sole caller `hdinit`), so nothing re-reads `DISKIN` at
+runtime — the interrupt is the *only* path. Ejecting/inserting disk 2 through
+the real `FloppyController.eject()`/`insert()` (presence bits only, the same
+path `EmulationController` uses) does not raise it, and neither does a floppy
+**command-completion** interrupt (which is a distinct event; we raise only
+those, for read/write). The exact unsatisfiable condition: **a mid-run floppy
+media change must fire the `bot_in`/`DISKSTAT` media-change interrupt so
+`DISK_INT` updates `disk_present` and the app's `Mount` retry succeeds.** Our
+`FloppyController` models only command-completion interrupts and treats the OS
+eject (`unclamp`) as a no-op — never needed before, because every prior
+milestone booted from a single disk present at power-on. Closing it is a
+**floppy-subsystem** effort (the `bot_in` media-change interrupt + `DISK_INT`
+path), distinct from the Widget HLE this task delivered, and is the M5-follow-on
+frontier.
 
 ### Bottom line (Task 3)
 

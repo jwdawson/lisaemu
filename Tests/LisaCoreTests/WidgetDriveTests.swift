@@ -168,6 +168,30 @@ private final class Harness {
     #expect(longword & 0xC140C000 != 0, "out-of-range block must carry a fatal errstat bit")
 }
 
+// MARK: - Unsupported command bytes are REJECTED, not silently read (review I2)
+
+@Test func unsupportedCommandByteReturnsFatalStatusNotRead() throws {
+    let (image, url) = try scratchWidget(blockCount: 8)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let h = Harness(image: image)
+
+    #expect(h.handshake() == 0x01)
+    // $02 = Formatcmd (a driver op, NOT a wire read/write, §10.4) -- the
+    // canonical "neither 0 nor 1" byte. We advertise single-block T_Seagate, so
+    // this is out of contract and must be rejected, not treated as a read.
+    h.sendCommandBlock(cmd: 0x02, block: 3)
+    // The accept handshake still returns (read-accepted code), but the data
+    // phase is a 4-byte fatal ERRSTAT (§10.5) instead of block data -- and the
+    // command still completes (interrupt raised).
+    #expect(h.handshake() == 0x02)
+    let status = h.readBytes(4)
+    let longword = (UInt32(status[0]) << 24) | (UInt32(status[1]) << 16)
+        | (UInt32(status[2]) << 8) | UInt32(status[3])
+    #expect(longword & 0xC140C000 != 0,
+            "an unsupported command byte must return a fatal ERRSTAT, not read data")
+    #expect(h.completionRaised)
+}
+
 // MARK: - Device-info read: PROF_INIT's characteristics layout (T_Seagate)
 
 @Test func deviceInfoReadAdvertisesSeagateDrivetypeAndDiscsize() throws {

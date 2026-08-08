@@ -1638,10 +1638,11 @@ the HLE now implements:
   write order silently corrupts the block and fails as *"the Lisa could not
   write to the disk"*, not as a status error.
 - **`PROF_INIT` device-info block** (`$FFFFFF`) is NOT a 512+20 block. After the
-  2nd handshake the driver reads (PROFASM:1600-1613): **4 status bytes**, **14
-  skipped**, **DRIVETYPE @ data byte 14**, **3 skipped**, **3-byte DISCSIZE @
-  bytes 18-20** (big-endian). `drivetype 0` + `discsize ∈ (9728,30000]` ⇒
-  T_Seagate single-block (§10.8).
+  2nd handshake the driver reads (PROFASM:1600-1613), at these **absolute byte
+  offsets into the IRA stream** (the 4 status bytes are part of it): **4 status
+  bytes (0-3)**, **14 skipped (4-17)**, **DRIVETYPE @ byte 18**, **3 skipped
+  (19-21)**, **3-byte DISCSIZE @ bytes 22-24** (big-endian). `drivetype 0` +
+  `discsize ∈ (9728,30000]` ⇒ T_Seagate single-block (§10.8).
 
 Response codes come back on **PORTA = VIA reg 15** (`base+$78`, no-handshake),
 one per handshake; data/status stream through **IRA = VIA reg 1** (`base+$8`,

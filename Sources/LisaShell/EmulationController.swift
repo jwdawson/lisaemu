@@ -467,7 +467,12 @@ public final class EmulationController {
                 case .insertFloppy(let url):
                     do {
                         let image = try DC42Image.load(url: url)
-                        machine.bus.floppy.insert(image)
+                        // Mailbox insert happens WHILE the OS is running, so use
+                        // the media-change path: it raises the floppy attention
+                        // interrupt (bot_in) the OS's DISK_INT needs to mount the
+                        // new volume (M5 Task 3 round 2). Bare insert() is only
+                        // for the power-on/pre-boot path (tests, lisadbg --disk).
+                        machine.bus.floppy.insertWhileRunning(image)
                     } catch {
                         shared.onDiskError?("Could not load disk image at \(url.path): \(error)")
                     }

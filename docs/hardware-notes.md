@@ -1667,10 +1667,26 @@ Derivable from source:
 firmware that would report `discsize` is not in this tree (same class as §9
 "Could Not Find" #1). The historically documented Widget-10 geometry is
 **19456 blocks** (× 512 = ~9.96 MB usable), which is what the Task-2 image
-container will present as `discsize`. Any value in `(9728, 30000]` with
-`DRIVETYPE=2` lands the OS on the Widget path; `19456` is the chosen
-representative. If a first-party Widget block count is ever established, it
-swaps in with no logic change as long as it stays in that range.
+container presents as `discsize`. `19456` is the chosen representative; any
+value in `(9728, 30000]` works, swapping in with no logic change.
+
+**Single-block T_Seagate vs multi-block T_Widget — the Task-2 advertisement
+(review fix round 1, I2).** The `DRIVETYPE` byte the controller reports decides
+which command path the OS driver uses: `CMPI.B #2,DRIVETYPE / BLT` — **`DRIVETYPE
+< 2` (Profile=0 or Seagate=1) → single-block** read/write; **`DRIVETYPE == 2`
+(Widget) → multi-block** (`CMD_BUF=$26`, §10.6) (PROFASM:250). The Task-2
+`WidgetDrive` HLE implements the **single-block** path (§10.4) only, so it
+advertises a **10 MB T_Seagate**: a raw `drivetype` byte of `0` with a `discsize`
+in `(9728, 30000]` resolves to `T_Seagate` with `num_bloks := discsize - strt_blok`
+(full 10 MB, PROFILE:288-298) — coherent with single-block I/O at full capacity.
+A 10 MB single-block *T_Profile* is **incoherent** (PROFILE:283-284 forces
+`num_bloks := 9720`, capping at 5 MB), and *T_Widget* (`drivetype ≠ 0`) would
+demand the unimplemented multi-block path. So `WidgetDrive.deviceInfoData`
+reports `discsize` only, leaving the `drivetype` byte 0 → T_Seagate. **Building
+the §10.6 multi-block path + advertising T_Widget is a deferred Task 3+
+enhancement**, needed only if the install is found to require Widget-specific
+behaviour (spare tables, `Formatcmd` widget-format, PROFILE:419); single-block
+read/write/device-info covers `CDMake`→FS `LookUp`/`Mount` (§10.9a).
 
 ### 10.9 Attach-path conditional — the crown jewel
 
@@ -1726,43 +1742,70 @@ identity, exactly as the M4 floppy devrec was.** Two source sites:
 Task 1's INFERRED "the installer scans devrecs/configinfo, and needs a
 PM-created `cd_intdisk`" is **REFUTED**; the OBSERVED mechanism:
 
+*(Line numbers are the `APPS/APIN` copy; the `LISA_OS/APIN` copy is offset ~1
+line lower — e.g. the slot-12 lines are 2999-3000 in APPS, 2998-2999 in
+LISA_OS. Corrected in review fix round 1 — the earlier `3010-3013` cite was the
+unrelated `Port2ID` expansion-slot CASE arm, not the internal disk.)*
+
 1. **The installer builds its own candidate list from machine type — it does
-   NOT read configinfo/PM to discover disks.** `SetDevices` (APIN-OFFICE:3005-
-   3040) switches on `machineType.io_board`: for **`IOpepsi`** (our Lisa 2/10)
-   it hardcodes the internal disk at **slot 12, chan 0** (APIN-OFFICE:3010-3013,
-   `SetDevPos(index,12,0); diskDrvrPos := ProfDloc`); `IOlisa`/`IOlisaLite` get
-   the parallel-port ProFile at slot 11 (APIN-OFFICE:2990-2996). The `io_board`
-   comes from `Mach_Info` (APIN-OFFICE:1672) ← `iomodel` ← the `$FCC031`/
-   `$FCC015` bytes (STARTUP:1746-1748, 1884-1895) we **already model**
-   (`iob_pepsi`).
-2. **The installer creates the devrec itself.** `InitDrivers` (APIN-OFFICE:
-   2882-2951) `CDKill`s every position then `CDMake(err, theDevLoc, …)` each
-   candidate (APIN-OFFICE:2902, 2944-2946). `CDMake` (CD:1366-1428) →
-   `NEW_DEVICE` (CD:898-1104), which for `cd_intdisk` stores the control block
-   in `port_cb_ptrs.via1` (CD:1030) — **no PM entry consulted, no hardware
-   probe; `cd_intdisk` is never refused** (only `cd_paraport` is, CD:1006-1013).
+   NOT read configinfo/PM to discover disks.** `SetDevices` (PROC APIN-OFFICE:
+   2749; the `CASE machineType.io_board` at 2987-3005) hardcodes, for
+   **`IOPepsi`** (our Lisa 2/10), the internal disk at **slot 12, chan 0**:
+   `SetDevPos(index,12,0)` (**APIN-OFFICE:2999**) + `devList[index].diskDrvrPos
+   := ProfDloc` (**APIN-OFFICE:3000**). `IOLisa`/`IOLisaLite` get the
+   parallel-port ProFile at slot 11 instead (2991/2993). **The internal disk is
+   driven by the ProFile driver (`ProfDloc`)** — the same driver that
+   auto-selects Profile/Seagate/Widget behaviour from the controller-reported
+   `discsize`/`drivetype` (PROFILE:283-301; see §10.8 and the T_Seagate
+   single-block choice in `WidgetDrive.deviceInfoData`). `io_board` comes from
+   `Mach_Info` (APIN-OFFICE:1672) ← `iomodel` ← the `$FCC031`/`$FCC015` bytes
+   (STARTUP:1746-1748, 1884-1895) we **already model** (`iob_pepsi`).
+2. **The installer creates the devrec itself — gated on `hasInfo`.**
+   `InitDrivers` (PROC APIN-OFFICE:2881-2949) `CDKill`s every position (loop
+   2912-2925), then its inner `InstallDrvr` (2889-2904) does the real
+   **`CDMake(err, theDevLoc, drvrList[theListLoc].infoBuf)` (APIN-OFFICE:2899)**
+   — but **only `IF (drvrList[theListLoc].hasInfo)` (APIN-OFFICE:2897)**. The
+   disk loop calls `InstallDrvr(devList[index].diskDrvrPos, …)` (**2946**), itself
+   gated `IF (devList[index].diskDrvrPos > 0)` (2944, comment "isn't driverless
+   or a built-in device (widget)"). `CDMake` (CD:1366-1428) → `NEW_DEVICE`
+   (CD:898-1104), which for `cd_intdisk` stores the control block in
+   `port_cb_ptrs.via1` (CD:1030) — **no PM entry consulted, no hardware probe;
+   `cd_intdisk` is never refused** (only `cd_paraport` is, CD:1006-1013).
+   - **`hasInfo` is a Task-3 navigation dependency (review fix round 1).** It is
+     set TRUE only when `GetDrvrInfo` (PROC APIN-OFFICE:2759) finds the driver's
+     entry while parsing the boot floppy's **`system.cdd`** file
+     (`hasInfo := TRUE`, **APIN-OFFICE:2818**; field decl :345). So the
+     slot-12 `CDMake` fires **only if the installer has loaded the ProFile
+     driver info for `ProfDloc` from `system.cdd`**; if that parse doesn't find
+     it, `InstallDrvr` silently no-ops (no `CDMake`, no devrec, no error). Task 3
+     must confirm the install medium's `system.cdd` carries the ProFile driver
+     entry (and that our FS reads reach `GetDrvrInfo`) before the devrec — and
+     hence any `$FCD801` traffic — can appear.
 3. **Then it tests for a real disk through the FS/driver.** `SetDevices` does
-   `LookUp('-'+devName)` and sets `isDisk` only if `err ≤ 0 AND fsInfo.devT =
-   diskDev` (APIN-OFFICE:3044-3055); `MountInit` then `MountDisk`s each
-   `isDisk` candidate (APIN-OFFICE:3111-3113). The **"can't find a suitable
-   disk"** alert (164 on Pepsi/Widget, 162 otherwise) fires only if the loop
-   ends with `foundOne = FALSE` (APIN-OFFICE:3151-3162).
+   `LookUp` on each candidate and sets `isDisk` only if `err ≤ 0 AND fsInfo.devT
+   = diskDev` (**APIN-OFFICE:3051-3053**); `MountInit` (PROC APIN-OFFICE:2573)
+   then `MountDisk`s each `isDisk` candidate. The **"can't find a suitable
+   disk"** install alert (`LockAlert(installAlert, 162)`, APIN-OFFICE:1425)
+   fires only if the scan ends with `foundOne = FALSE` (decl :2587).
 4. **PM is an OUTPUT of install, not a precondition.** After the user picks a
-   disk, `CheckPMList` (APIN-OFFICE:3141, doc 879-968) queues it so `Finished`
-   → `PMWrite` records "disk present" for the *next* boot's `INIT_CDS`. PM lives
-   in small COPS-adjacent NVRAM (`READ_PMEM`/`WRITE_PMEM`, STARTUP:824-826; low
-   level `W_PARAM_MEM`, source-twiggy:196,260).
+   disk, `CheckPMList` (PROC APIN-OFFICE:880, FORWARD :409; doc 882-885) queues
+   it so `Finished` → `PMWrite` (:1256) records "disk present" for the *next*
+   boot's `INIT_CDS`. PM lives in small COPS-adjacent NVRAM (`READ_PMEM`/
+   `WRITE_PMEM`, STARTUP:824-826; low level `W_PARAM_MEM`, source-twiggy:196,260).
 
 **Bottom line (decides Task 3): NO parameter-memory model is needed to make the
 installer find the disk.** The gate is entirely `Mach_Info.io_board = iob_pepsi`
 (already satisfied by our `$FCC031=$88`/`$FCC015=1`). Task 3 must:
 (a) let the installer reach `SetDevices`/`InitDrivers`/`MountInit` (script the
-"Install" click), and (b) make the **Widget block device at slot-12/`$FCD801`**
-answer `CDMake`→FS `LookUp`/`Mount` correctly (device-info read + block I/O —
-the §10.1-10.7 model this task built). A PM/NVRAM model is a *second-phase*
-concern (so the installed system can `INIT_CDS`-reconstruct and boot next time,
-and so `PMWrite` has somewhere to write) — small (one checksummed `pmem`
-record), but **out of the install-scan critical path**, so not built here.
+"Install" click); (b) ensure `GetDrvrInfo` finds the ProFile driver in the
+install medium's `system.cdd` so `drvrList[ProfDloc].hasInfo` is TRUE — **without
+it the slot-12 `CDMake` silently no-ops** (item 2 above); and (c) make the
+**block device at slot-12/`$FCD801`** answer `CDMake`→FS `LookUp`/`Mount`
+correctly (device-info read + single-block I/O — the §10.1-10.7 model this task
+built, advertised as **T_Seagate** per §10.8). A PM/NVRAM model is a
+*second-phase* concern (so the installed system can `INIT_CDS`-reconstruct and
+boot next time, and so `PMWrite` has somewhere to write) — small (one checksummed
+`pmem` record), but **out of the install-scan critical path**, so not built here.
 *Could-not-find:* `GETNXTCONFIG`'s body (only call sites CD:1775/STARTUP:1447);
 the numeric `$FCC015`/`$FCC031` hardware encoding (only STARTUP decode ranges).
 

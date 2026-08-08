@@ -257,6 +257,75 @@ func click(_ m: Machine) {
     m.run(until: m.cycles + 300_000)
 }
 
+// MARK: - `click <x> <y>` / `type <text>` (M5 Task 3)
+//
+// bootdisk's ROM-cursor steering ($496/$498) goes dead once the OS is running
+// -- the OS keeps its own cursor at physical RAM $3CF0 (MousX/MousY, found by
+// M5 Task 3's install trace). `click` feedback-steers whichever cursor is live,
+// so it drives both the ROM boot menu and the OS/installer UI.
+
+/// The live cursor (x,y): the OS cursor (`MousX`/`MousY`, physical $3CF0) when
+/// it reads plausibly on-screen, else the ROM boot-menu cursor ($496/$498).
+func osCursor(_ m: Machine) -> (Int, Int) {
+    let ox = Int(m.bus.physicalRead16(0x3CF0)), oy = Int(m.bus.physicalRead16(0x3CF2))
+    if ox <= 720 && oy <= 364 && (ox > 0 || oy > 0) { return (ox, oy) }
+    return (Int(m.bus.read16(0x496)), Int(m.bus.read16(0x498)))
+}
+
+/// Feedback-steer the cursor to `(tx,ty)` then press+release the button. The
+/// half-step on X damps the OS mouse driver's 3/2 coarse scaling (LIBHW-MOUSE).
+func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+    for _ in 0..<80 {
+        let (cx, cy) = osCursor(m)
+        let dx = tx - cx, dy = ty - cy
+        if abs(dx) <= 1 && abs(dy) <= 1 { break }
+        m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                             dy: Int8(max(-100, min(100, dy))))
+        m.run(until: m.cycles + 200_000)
+    }
+    click(m)
+}
+
+/// Maps a printable ASCII character to its Lisa keycap + whether Shift is held
+/// (Final-US layout, docs/hardware-notes.md §8 -- the same keycaps as
+/// `LisaShell/KeyMap`, keyed on ASCII here rather than macOS virtual codes).
+func lisaKeycap(for ch: Character) -> (code: UInt8, shift: Bool)? {
+    let lower: [Character: UInt8] = [
+        "a": 0x70, "b": 0x6E, "c": 0x6D, "d": 0x7B, "e": 0x60, "f": 0x69, "g": 0x6A,
+        "h": 0x6B, "i": 0x53, "j": 0x54, "k": 0x55, "l": 0x59, "m": 0x58, "n": 0x6F,
+        "o": 0x5F, "p": 0x44, "q": 0x75, "r": 0x65, "s": 0x76, "t": 0x66, "u": 0x52,
+        "v": 0x6C, "w": 0x77, "x": 0x7A, "y": 0x67, "z": 0x79,
+        "1": 0x74, "2": 0x71, "3": 0x72, "4": 0x73, "5": 0x64, "6": 0x61, "7": 0x62,
+        "8": 0x63, "9": 0x50, "0": 0x51,
+        "-": 0x40, "=": 0x41, "\\": 0x42, "[": 0x56, "]": 0x57, ";": 0x5A, "'": 0x5B,
+        ",": 0x5D, ".": 0x5E, "/": 0x4C, "`": 0x68,
+        " ": 0x5C, "\n": 0x48, "\t": 0x78,
+    ]
+    // Shifted symbols -> the unshifted key's keycap + Shift (US layout).
+    let shifted: [Character: Character] = [
+        "!": "1", "@": "2", "#": "3", "$": "4", "%": "5", "^": "6", "&": "7",
+        "*": "8", "(": "9", ")": "0", "_": "-", "+": "=", "|": "\\", "{": "[",
+        "}": "]", ":": ";", "\"": "'", "<": ",", ">": ".", "?": "/", "~": "`",
+    ]
+    if let c = lower[ch] { return (c, false) }
+    if ch.isLetter, let c = lower[Character(ch.lowercased())] { return (c, true) }
+    if let base = shifted[ch], let c = lower[base] { return (c, true) }
+    return nil
+}
+
+/// Injects `text` as COPS make/break keyboard events (Shift keycap $7E held for
+/// uppercase / shifted symbols). Unmappable characters are skipped.
+func typeText(_ m: Machine, _ text: String) {
+    let shiftKeycap: UInt8 = 0x7E
+    for ch in text {
+        guard let (code, shift) = lisaKeycap(for: ch) else { continue }
+        if shift { m.bus.cops.postKey(code: shiftKeycap, down: true); m.run(until: m.cycles + 100_000) }
+        m.bus.cops.postKey(code: code, down: true);  m.run(until: m.cycles + 150_000)
+        m.bus.cops.postKey(code: code, down: false); m.run(until: m.cycles + 150_000)
+        if shift { m.bus.cops.postKey(code: shiftKeycap, down: false); m.run(until: m.cycles + 100_000) }
+    }
+}
+
 /// Generous default post-click cycle budget: `ROMFloppyBootTests.
 /// bootIntoLoader` needs ~66M cycles (18M POST + 3M menu redraw + 40M to
 /// reach the loaded boot block + 5M to reach the trap-#6 gate) and the
@@ -497,10 +566,17 @@ while let line = readLine(strippingNewline: true) {
         } catch {
             print("      widget create: \(error)")
         }
+    case .click(let x, let y):
+        clickAt(machine, x, y)
+        let (cx, cy) = osCursor(machine)
+        print("      clicked at cursor (\(cx),\(cy)) [target (\(x),\(y))]")
+    case .type(let text):
+        typeText(machine, text)
+        print("      typed \(text.count) character(s)")
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | type <text> | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

@@ -26,6 +26,12 @@ extension MusashiSuites {
             #expect(Monitor.parse("widget create /tmp/hd.widget") == .widgetCreate("/tmp/hd.widget"))
             #expect(Monitor.parse("widget") == nil, "widget requires a sub-command")
             #expect(Monitor.parse("widget create") == nil, "widget create requires a path")
+            // M5 Task 3: click/type scripting primitives.
+            #expect(Monitor.parse("click 615 210") == .click(615, 210))
+            #expect(Monitor.parse("click 615") == nil, "click requires both x and y")
+            #expect(Monitor.parse("click") == nil, "click requires coordinates")
+            #expect(Monitor.parse("type Hello World") == .type("Hello World"))
+            #expect(Monitor.parse("type") == nil, "type requires text")
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
         }

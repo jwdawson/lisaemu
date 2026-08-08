@@ -600,6 +600,18 @@ public final class Bus {
     public func read16(_ a: UInt32) -> UInt16 {
         UInt16(read8(a)) << 8 | UInt16(read8(a &+ 1))
     }
+    /// Raw big-endian 16-bit read straight out of physical RAM, bypassing the
+    /// MMU (unlike `read16`, which translates through the live domain). Debug
+    /// tooling only (`lisadbg`): the OS keeps globals like the mouse location
+    /// (`MousX`/`MousY`) at fixed PHYSICAL addresses written by supervisor/
+    /// domain-0 interrupt code, so a `read16` from the idle (user/domain-1)
+    /// context would translate the same logical address elsewhere. Returns 0
+    /// for out-of-range addresses. No side effects.
+    public func physicalRead16(_ phys: UInt32) -> UInt16 {
+        let i = Int(phys)
+        guard i >= 0, i + 1 < ram.count else { return 0 }
+        return UInt16(ram[i]) << 8 | UInt16(ram[i + 1])
+    }
     public func read32(_ a: UInt32) -> UInt32 {
         UInt32(read16(a)) << 16 | UInt32(read16(a &+ 2))
     }

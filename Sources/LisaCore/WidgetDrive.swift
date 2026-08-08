@@ -2,96 +2,92 @@ import Foundation
 
 /// High-level emulation (HLE) of a Widget/ProFile parallel hard disk behind
 /// **VIA1** (the "Hard Disk VIA"), implementing the OS ProFile driver's
-/// byte-at-a-time handshake (docs/hardware-notes.md §10.2-10.5). Paired with
-/// `WidgetImage` (the persistent block store) exactly as `FloppyController`
-/// is paired with `DC42Image`.
+/// byte-at-a-time handshake as the driver *actually* performs it
+/// (SOURCE-PROFILEASM: `PROF_INIT`:1522, `DOSHAKE`, `WAIT_BUSY`/`WAIT_NOTBUSY`,
+/// and the `DRIVER` state machine S1/S2/S3/S7; docs/hardware-notes.md §10.2-10.5).
+/// Paired with `WidgetImage` (the persistent block store) exactly as
+/// `FloppyController` is paired with `DC42Image`.
 ///
-/// ## What is modeled, and the UNOBSERVED caveat (M5 Task 2 / Task 1 Q1)
+/// ## The wire protocol — RECONCILED against the live driver (M5 Task 3)
 ///
-/// The wire protocol is a byte-at-a-time handshake over VIA1 Port A (the
-/// 8-bit bidirectional data bus, §10.2) gated by Port B control bits
-/// (CMD/DIR) with Port B status bits (BSY/DISCONNECT) read back. This type
-/// transcribes that contract: it presents/consumes one byte per CMD strobe,
-/// returns the documented response codes ($01 idle->ready, $02 read-accepted,
-/// $03 write-accepted, $06 post-write, §10.3), expects the $55 "proceed"
-/// reply, transfers 512 data + 20 tag bytes per block (§10.7), and reports a
-/// 4-byte `ERRSTAT` whose fatal-error mask is `$C140C000` (§10.5). On command
-/// completion it raises VIA1's level-1 interrupt (IFR bit 1, the CB-latched
-/// BSY event, §10.2).
+/// M5 Task 2 transcribed a *contract*; Task 3 drove `PROF_INIT` live for the
+/// first time and found the transport model wrong. The corrected model, all
+/// source-cited:
 ///
-/// **The live register choreography is UNOBSERVED.** `PROF_INIT`/`PROFASM`
-/// have never executed on our machine (§10.9; the boot ROM never touches
-/// `$FCD801`), so the exact per-byte DIR-flip / CMD-edge timing the OS driver
-/// drives is not yet trace-confirmed. This model encodes the contract's
-/// *observable results* -- correct block data, status, and completion IRQ --
-/// keyed on the CMD strobe as the transfer clock, in the same spirit as
-/// `FloppyController`'s HLE (which does not bit-replay the 6504 microcode).
-/// Task 3 exercises PROF_INIT live and will reconcile OBSERVED vs this
-/// contract (see docs/rom-trace-notes.md "Checkpoint H"). Until then the
-/// preamble/DIR sequencing here is the source-derived best transcription.
-///
-/// ## Handshake clock
-///
-/// CMD (Port B bit 4) is active-low and acts as the transfer clock. A
-/// falling edge (driver asserts CMD) performs one byte transfer -- present
-/// the drive's next outgoing byte (DIR=in, §10.2 bit 3 set) or consume the
-/// byte the driver staged on Port A (DIR=out) -- and asserts BSY (Port B bit
-/// 1). The rising edge (driver deasserts CMD) drops BSY. The driver reads
-/// Port A while BSY is held.
+/// - **BSY is Port B bit 1, a LEVEL** the driver polls (`WAIT_BUSY`/
+///   `WAIT_NOTBUSY`, PROFASM:1618-1651 `BTST #1,IRB`). Idle/ready ⇒ BSY = 1
+///   (when CMD is deasserted, ORB bit 4 = 1); asserting CMD (bit 4 → 0) makes
+///   the controller present a byte and drop BSY → 0. `PROF_INIT` waits BSY = 1
+///   first, then per `DOSHAKE` asserts CMD + waits BSY = 0, reads the response,
+///   replies, deasserts CMD + waits BSY = 1. The old HLE held bit 1 = 0 forever
+///   ⇒ `WAIT_NOTBUSY` timed out (~16 s) ⇒ installer "unable to locate a usable
+///   disk". (STRUCK: the old "BSY asserts *while* CMD held" model.)
+/// - **Response codes come back on PORTA = VIA register 15** (offset $78, the
+///   *no-handshake* ORA), read once per `DOSHAKE` (PROFASM:1663 `MOVE.B
+///   PORTA(A3),D1`). The reply ($55 proceed / $AA-or-$69 negative) is written
+///   back to PORTA.
+/// - **Data / status stream through IRA = VIA register 1** (offset $8, the
+///   *handshake* ORA), one byte per read, auto-advancing (PROFASM:538 `MOVE.B
+///   (A2),D0` with A2 = `IRA(A4)`, and PROF_INIT:1600-1607). Command bytes go
+///   *out* through ORA = register 1 (PROFASM:359 `MOVE.B (A1)+,ORA(A4)`).
+/// - **`PROF_INIT`'s device-characteristics block** is NOT a normal 512+20
+///   block: after the second handshake the driver reads 4 status bytes, skips
+///   14, reads **DRIVETYPE at data byte 14**, skips 3, then reads a **3-byte
+///   DISCSIZE at bytes 18-20** (PROFASM:1600-1613). We answer drivetype 0 +
+///   discsize = blockCount (a 10 MB **T_Seagate**, single-block path, §10.8).
+/// - **The `DRIVER` state machine** (real block I/O, distinct from `PROF_INIT`)
+///   polls **IFR bit 1 (CA1)** for the same BSY edge (PROFASM:268 `BTST #1,IFR`)
+///   and, for the data phase, *parks* until the level-1 interrupt (S200). So on
+///   each CMD edge we also raise IFR bit 1 (`raiseInterrupt`), and we raise it
+///   again when a command's data is ready. `PROF_INIT` ignores IFR (it polls
+///   the Port B level), so this is harmless there.
 ///
 /// ## Default = detached (every prior pin stays green)
 ///
-/// With no image attached (the default), `portAInput`/`portBInput` read as an
-/// idle pulled-up bus (`0xFF`, DISCONNECT asserted) and CMD strobes are
-/// ignored, so wiring this onto VIA1 changes nothing on the no-widget boot
-/// path -- checkpoint E/G and the menu FNV anchors are unmoved by
-/// construction (the ROM never drives the handshake, §10.9).
+/// With no image attached (the default), Port A reads as `0xFF` and Port B
+/// reads as an idle pulled-up bus with **BSY = 1, DISCONNECT = 1** — CMD
+/// strobes are ignored, so wiring this onto VIA1 changes nothing on the
+/// no-widget boot path (the ROM never drives the handshake, §10.9).
 public final class WidgetDrive {
-    // MARK: - Wire constants (docs/hardware-notes.md §10.2-10.5)
+    // MARK: - Wire constants (docs/hardware-notes.md §10.2, PROFASM equates)
 
-    /// Port B control/status bits (§10.2).
     enum PortB {
-        static let disconnect: UInt8 = 0x01   // bit 0: 1 = cable disconnected
-        static let bsy: UInt8 = 0x02          // bit 1: controller busy
-        static let dir: UInt8 = 0x08          // bit 3: 1 = input-from-drive
-        static let cmd: UInt8 = 0x10          // bit 4: active-low command strobe
-        static let parity: UInt8 = 0x20       // bit 5: parity control
-        static let reset: UInt8 = 0x80        // bit 7: PROFILE-RESET
+        static let disconnect: UInt8 = 0x01   // bit 0: 1 = cable disconnected (input)
+        static let bsy: UInt8 = 0x02          // bit 1: controller busy/ready (input)
+        static let dir: UInt8 = 0x08          // bit 3: 1 = input-from-drive (output)
+        static let cmd: UInt8 = 0x10          // bit 4: active-low command strobe (output)
     }
 
-    /// Handshake reply / response codes (§10.3).
+    /// Handshake response / reply codes (§10.3, PROFASM `DOSHAKE`/S-states).
     enum Code {
-        static let replyProceed: UInt8 = 0x55       // standard "proceed" reply
-        static let respIdleReady: UInt8 = 0x01      // EXPECT_HS idle -> ready
+        static let replyProceed: UInt8 = 0x55       // driver "proceed" reply
+        static let respIdleReady: UInt8 = 0x01      // first handshake: idle -> ready
         static let respReadAccepted: UInt8 = 0x02   // read command accepted
         static let respWriteAccepted: UInt8 = 0x03  // write command accepted
-        static let respPostWrite: UInt8 = 0x06      // post-write status
+        static let respPostWrite: UInt8 = 0x06      // post-write status handshake
     }
 
-    /// Command block bytes (§10.4): 0 = read, 1 = write; device-info read is
-    /// command 0 with block `$FFFFFF`.
     enum Command {
         static let read: UInt8 = 0x00
         static let write: UInt8 = 0x01
         static let deviceInfoBlock = 0xFFFFFF
     }
 
-    /// Fatal-error mask AND'd against the 4-byte `ERRSTAT` longword: non-zero
-    /// ⇒ hard error (§10.5).
+    /// Fatal-error mask AND'd against the 4-byte `ERRSTAT` longword (§10.5).
     static let fatalErrorMask: UInt32 = 0xC140C000
 
-    // MARK: - Injected dependencies (mirroring COPS/FloppyController so the
-    // protocol tests drive this CPU-free)
+    // VIA1 register indices the driver drives (PROFASM:16-28).
+    private static let regIRA = 1     // ORA/IRA with handshake (offset $8) — command out / data in
+    private static let regPORTA = 15  // ORA/IRA no handshake (offset $78) — response in / reply out
+
+    // MARK: - Injected dependencies (mirroring COPS/FloppyController)
 
     private let scheduleEvent: (UInt64, @escaping () -> Void) -> Void
-    /// Raises VIA1 IFR bit 1 (the level-1 BSY/completion interrupt, §10.2).
+    /// Raises VIA1 IFR bit 1 (the level-1 CA1/BSY interrupt, §10.2).
     private let raiseInterrupt: () -> Void
-    /// Clears VIA1 IFR bit 1.
     private let clearInterrupt: () -> Void
     private let log: (String) -> Void
 
-    /// Cycles from a completed command until the completion interrupt raises
-    /// -- "plausible", not cycle-exact, matching COPS/Floppy precedent.
     static let completionDelayCycles: UInt64 = 3000
 
     public init(scheduleEvent: @escaping (UInt64, @escaping () -> Void) -> Void,
@@ -121,9 +117,7 @@ public final class WidgetDrive {
         resetTransaction()
     }
 
-    /// Warm reset (Machine.reset): drop any in-flight handshake but keep the
-    /// attached image -- real hardware's RESTART line does not unmount the
-    /// disk (mirrors `FloppyController.reset()`).
+    /// Warm reset (Machine.reset): drop any in-flight handshake, keep the image.
     public func reset() {
         resetTransaction()
         clearInterrupt()
@@ -131,175 +125,168 @@ public final class WidgetDrive {
         lastStatus = [0, 0, 0, 0]
     }
 
-    // MARK: - Handshake program
+    // MARK: - Protocol state
 
-    /// One step of the transaction program the driver walks (§10.3-10.4).
-    private enum Step {
-        case present(UInt8)     // present one fixed byte (DIR=in read)
-        case presentStream      // present bytes from `outStream` (DIR=in reads)
-        case expectReply        // consume one $55 "proceed" reply (DIR=out)
-        case receiveCommand     // consume the 6-byte command block (DIR=out) -> decode
-        case receiveWrite       // consume 512 data + 20 tag (DIR=out) -> commit
-        case finish             // raise the completion interrupt
+    /// Where we are in a single command transaction.
+    private enum Phase {
+        case idle           // no transaction; next CMD-assert opens one
+        case firstHS        // presenting the ready code ($01)
+        case awaitCommand   // consuming the 6-byte command block via ORA
+        case acceptHS       // presenting the accept code ($02 read / $03 write)
+        case readData       // streaming data/tag/status out via IRA
+        case writeData      // consuming data/tag in via ORA
+        case postWriteHS    // presenting the post-write code ($06)
+        case postWriteStat  // streaming 4 status bytes out via IRA
     }
 
-    private var program: [Step] = []
-    private var pc = 0
-    private var streamIndex = 0
+    private var phase: Phase = .idle
+    private var dirIn = true
+    private var cmdAsserted = false
+    private var presented: UInt8 = 0xFF // byte currently on Port A (host reads this)
+
+    private var responseCode: UInt8 = Code.respIdleReady
     private var commandAccum: [UInt8] = []
-    private var writeAccum: [UInt8] = []
     private var outStream: [UInt8] = []
-    private var presented: UInt8 = 0xFF
+    private var outIdx = 0
+    private var writeAccum: [UInt8] = []
     private var pendingBlock = 0
 
-    // MARK: - Port B (CMD/DIR) strobe + status
+    private func resetTransaction() {
+        phase = .idle
+        dirIn = true
+        cmdAsserted = false
+        presented = 0xFF
+        responseCode = Code.respIdleReady
+        commandAccum = []
+        outStream = []
+        outIdx = 0
+        writeAccum = []
+    }
 
-    private var cmdAsserted = false
-    private var busy = false
+    // MARK: - Port B (CMD/DIR strobe + BSY/DISCONNECT status)
 
-    /// Called by `IODispatcher` on every VIA1 Port B (ORB) write -- the CMD
-    /// strobe / DIR select the OS driver bit-bangs (§10.2). Edge-triggered on
-    /// CMD (bit 4, active-low).
+    /// Called by `IODispatcher` on every VIA1 Port B (ORB) write at the widget
+    /// base ($FCD801 / $FCDC01) — the CMD strobe + DIR select (§10.2).
     public func portBWrite(_ value: UInt8) {
-        guard image != nil else { return }   // detached: ignore the bus
-        if value & PortB.reset != 0 {         // PROFILE-RESET (§10.2 bit 7)
-            // **Task-3 reconciliation point (review M2).** §10.2 bit 7 is
-            // PROFILE-RESET, and we treat any ORB write with it set as "abort
-            // the in-flight transaction". But PROF_INIT's *init* sequence does
-            // `ORI #$A0,ORB` (bits 7+5 together, PROFASM:1532-1533) to set
-            // those pins to OUTPUT at startup -- which is configuration, not
-            // necessarily a mid-transfer reset. This is harmless at init (no
-            // transaction is in flight yet, so resetTransaction() is a no-op),
-            // but once PROF_INIT runs live (Task 3) confirm the driver never
-            // sets bit 7 during a transfer for a non-reset reason; if it does,
-            // refine this edge (e.g. gate on a bit7 rising edge, or require
-            // bit5 clear) rather than aborting. UNOBSERVED today (§10.9).
-            resetTransaction()
-            return
-        }
-        let nowAsserted = (value & PortB.cmd) == 0     // active-low
-        let dirFromDrive = (value & PortB.dir) != 0
+        guard image != nil else { return }
+        dirIn = (value & PortB.dir) != 0
+        let nowAsserted = (value & PortB.cmd) == 0   // active-low
         if nowAsserted && !cmdAsserted {
-            // Falling edge: perform one byte transfer + assert BSY.
-            busy = true
-            clockByte(dirFromDrive: dirFromDrive)
+            cmdAssertEdge()
         } else if !nowAsserted && cmdAsserted {
-            // Rising edge: drop BSY.
-            busy = false
+            cmdDeassertEdge()
         }
         cmdAsserted = nowAsserted
     }
 
-    /// VIA1 Port B input the driver reads for BSY/DISCONNECT (§10.2). Idle
-    /// bits are pulled up (1) so the ROM floppy path's own `$FCD901` PB6 idle
-    /// read is unaffected; only bit 0 (DISCONNECT) and bit 1 (BSY) are driven.
+    /// VIA1 Port B input the driver reads for BSY/DISCONNECT (§10.2). Detached
+    /// ⇒ fully pulled-up idle bus (0xFF, DISCONNECT + BSY both high); attached ⇒
+    /// DISCONNECT clear (connected) and BSY reflecting the handshake level.
     public var portBInput: UInt8 {
-        // Detached: a fully pulled-up idle bus (0xFF, DISCONNECT asserted) --
-        // drive NO bits, so wiring this onto VIA1 moves nothing on the
-        // no-widget boot path.
         guard image != nil else { return 0xFF }
         var value: UInt8 = 0xFF
-        value &= ~PortB.disconnect               // connected: bit 0 = 0
-        if busy { value |= PortB.bsy } else { value &= ~PortB.bsy }
+        value &= ~PortB.disconnect                 // connected: bit 0 = 0
+        // BSY (bit 1) is a LEVEL: CMD asserted ⇒ controller busy/presenting ⇒
+        // 0 (`WAIT_BUSY` proceeds); CMD deasserted ⇒ idle/ready ⇒ 1
+        // (`WAIT_NOTBUSY` proceeds). PROFASM:1618-1651.
+        if cmdAsserted { value &= ~PortB.bsy }
         return value
     }
 
-    // MARK: - Port A (data bus)
+    /// CMD asserted (bit 4 → 0): the controller presents its next response byte
+    /// (during a handshake phase) and drops BSY → 0 so `WAIT_BUSY` proceeds; the
+    /// `DRIVER` S-machine also sees the CA1/IFR edge.
+    private func cmdAssertEdge() {
+        switch phase {
+        case .idle:
+            phase = .firstHS
+            responseCode = Code.respIdleReady
+            presented = responseCode
+        case .firstHS, .acceptHS, .postWriteHS:
+            presented = responseCode
+        case .readData, .postWriteStat:
+            presented = outIdx < outStream.count ? outStream[outIdx] : 0xFF
+        case .awaitCommand, .writeData:
+            break
+        }
+        raiseInterrupt()   // CA1 edge for the DRIVER S-machine (PROFASM:268)
+    }
+
+    /// CMD deasserted (bit 4 → 1): BSY rises (level from `portBInput`) so
+    /// `WAIT_NOTBUSY` proceeds; the CA1 edge also fires for the S-machine.
+    private func cmdDeassertEdge() {
+        raiseInterrupt()
+    }
+
+    // MARK: - Port A (register 1 = IRA/ORA handshake, register 15 = PORTA no-handshake)
 
     private var lastPortAWrite: UInt8 = 0xFF
 
-    /// Called by `IODispatcher` when the driver writes a byte to VIA1 Port A
-    /// (ORA) -- the byte staged for the next DIR=out handshake (§10.2).
-    public func portAWrite(_ value: UInt8) {
-        lastPortAWrite = value
-    }
+    /// The byte the drive currently presents on Port A (§10.2). `0xFF` detached.
+    public var portAInput: UInt8 { image != nil ? presented : 0xFF }
 
-    /// VIA1 Port A input the driver reads -- the byte the drive is currently
-    /// presenting (response code / read data / tag / status), `0xFF` when
-    /// detached or nothing is presented.
-    public var portAInput: UInt8 {
-        image != nil ? presented : 0xFF
-    }
-
-    // MARK: - Transaction engine
-
-    private func resetTransaction() {
-        program = []
-        pc = 0
-        streamIndex = 0
-        commandAccum = []
-        writeAccum = []
-        outStream = []
-        presented = 0xFF
-        cmdAsserted = false
-        busy = false
-    }
-
-    private func startTransaction() {
-        // §10.3: idle -> ready ($01), driver replies $55, then sends the
-        // 6-byte command block.
-        program = [.present(Code.respIdleReady), .expectReply, .receiveCommand]
-        pc = 0
-        streamIndex = 0
-        commandAccum = []
-        writeAccum = []
-        outStream = []
-    }
-
-    private func advance() {
-        pc += 1
-        streamIndex = 0
-        runFinishIfReached()
-    }
-
-    private func runFinishIfReached() {
-        while pc < program.count, case .finish = program[pc] {
-            completedCommands += 1
-            scheduleEvent(Self.completionDelayCycles) { [weak self] in
-                self?.raiseInterrupt()
+    /// Called by `IODispatcher` for every VIA1 Port A access, with the VIA
+    /// register index (1 = IRA/ORA handshake, 15 = PORTA no-handshake).
+    public func portAAccess(index: Int, value: UInt8, isWrite: Bool) {
+        guard image != nil else { return }
+        if isWrite {
+            lastPortAWrite = value
+            if index == Self.regPORTA {
+                handleReply(value)          // $55 proceed / negative reply
+            } else if index == Self.regIRA {
+                handleOutgoingByte(value)   // command byte or write-data byte
             }
-            pc += 1
+        } else if index == Self.regIRA {
+            // Data-stream read: the byte was already presented; advance.
+            advanceDataStream()
+        }
+        // index 15 read: response byte read, no advance.
+    }
+
+    /// A reply written to PORTA (register 15): $55 = proceed. Advances the
+    /// handshake phase (`DOSHAKE`/RESPOND).
+    private func handleReply(_ value: UInt8) {
+        guard value == Code.replyProceed else {
+            // Negative reply ($AA/$69) or unexpected — abandon the transaction.
+            if value != Code.respIdleReady { resetTransaction() }
+            return
+        }
+        switch phase {
+        case .firstHS:
+            phase = .awaitCommand
+            commandAccum = []
+        case .acceptHS:
+            beginTransferAfterAccept()
+        case .postWriteHS:
+            phase = .postWriteStat
+            outStream = lastStatus
+            outIdx = 0
+            presented = outStream.first ?? 0xFF
+        default:
+            break
         }
     }
 
-    /// One byte handshake (a CMD falling edge), gated by DIR.
-    private func clockByte(dirFromDrive: Bool) {
-        if pc >= program.count {
-            // Idle: the driver is starting a new transaction with its first
-            // ready read (DIR=in). Ignore a stray DIR=out strobe while idle.
-            guard dirFromDrive else { return }
-            startTransaction()
-        }
-        guard pc < program.count else { return }
-
-        switch program[pc] {
-        case .present(let byte):
-            guard dirFromDrive else { return }
-            presented = byte
-            advance()
-        case .presentStream:
-            guard dirFromDrive else { return }
-            presented = streamIndex < outStream.count ? outStream[streamIndex] : 0xFF
-            streamIndex += 1
-            if streamIndex >= outStream.count { advance() }
-        case .expectReply:
-            guard !dirFromDrive else { return }
-            // The driver's $55 "proceed" reply (§10.3); accepted and dropped.
-            advance()
-        case .receiveCommand:
-            guard !dirFromDrive else { return }
-            commandAccum.append(lastPortAWrite)
+    /// A byte written to ORA (register 1): a command byte (awaitCommand) or a
+    /// write-data byte (writeData).
+    private func handleOutgoingByte(_ value: UInt8) {
+        switch phase {
+        case .awaitCommand:
+            commandAccum.append(value)
             if commandAccum.count == 6 { decodeCommand() }
-        case .receiveWrite:
-            guard !dirFromDrive else { return }
-            writeAccum.append(lastPortAWrite)
-            if writeAccum.count == WidgetImage.bytesPerBlock {
-                commitWrite()
-                advance()
-            }
-        case .finish:
-            break   // handled by runFinishIfReached
+        case .writeData:
+            writeAccum.append(value)
+            if writeAccum.count == WidgetImage.bytesPerBlock { commitWrite() }
+        default:
+            break
         }
+    }
+
+    private func advanceDataStream() {
+        guard phase == .readData || phase == .postWriteStat else { return }
+        outIdx += 1
+        presented = outIdx < outStream.count ? outStream[outIdx] : 0xFF
+        if outIdx >= outStream.count { finishRead() }
     }
 
     // MARK: - Command decode / block I/O
@@ -308,64 +295,84 @@ public final class WidgetDrive {
         let cmd = commandAccum[0]
         let block = (Int(commandAccum[1]) << 16) | (Int(commandAccum[2]) << 8) | Int(commandAccum[3])
         pendingBlock = block
-
         switch cmd {
         case Command.read:
-            // Read (cmd 0) -- includes the device-info read (block $FFFFFF).
-            let (data, tag, status) = readPayload(block: block)
-            lastStatus = status
-            outStream = data + tag + status
-            program.append(contentsOf: [.present(Code.respReadAccepted), .expectReply, .presentStream, .finish])
+            responseCode = Code.respReadAccepted
+            phase = .acceptHS
         case Command.write:
-            // §10.3: accept write ($03), driver replies $55, streams the
-            // block, drive posts status ($06 + reply + 4 ERRSTAT bytes).
-            program.append(contentsOf: [.present(Code.respWriteAccepted), .expectReply, .receiveWrite])
-            // Status steps are spliced after the write commits (commitWrite).
+            responseCode = Code.respWriteAccepted
+            phase = .acceptHS
         default:
-            // **Unsupported single-block command byte — REJECTED, not silently
-            // read** (M5 Task 2 review I2). We advertise a 10 MB **T_Seagate**
-            // (§10.8 / `deviceInfoData`), so the OS ProFile driver only ever
-            // issues read (`$00`) / write (`$01`): `DRIVETYPE < 2` takes the
-            // single-block path (PROFASM:250 `CMPI.B #2,DRIVETYPE / BLT`).
-            // Anything else — `Formatcmd` (`$02`, §10.4), a multi-block prefix
-            // (`$26`, §10.6), a Widget diagnostic — is out of the advertised
-            // contract, so it is logged and answered with a fatal `ERRSTAT`
-            // (§10.5) rather than mishandled as a read. (Multi-block / Widget
-            // diagnostics would require advertising `T_Widget` and building the
-            // §10.6 path — a documented Task 3+ enhancement, not this task.)
-            log("WidgetDrive: unsupported command byte $\(String(cmd, radix: 16)) for block \(block) -- rejected (single-block T_Seagate advertises only read/write)")
-            lastStatus = fatalStatus()
-            outStream = fatalStatus()
-            program.append(contentsOf: [.presentStream, .finish])
+            // Out of the advertised single-block T_Seagate contract (§10.8):
+            // Formatcmd ($02), multi-block ($26), diagnostics — reject with a
+            // fatal ERRSTAT rather than mishandle as a read (review I2).
+            log("WidgetDrive: unsupported command byte $\(String(cmd, radix: 16)) for block \(block) — rejected")
+            responseCode = Code.respReadAccepted
+            phase = .acceptHS
+            rejectNext = true
         }
-        advance()   // move off .receiveCommand into the spliced steps
     }
 
-    /// Builds the (data, tag, status) a read command returns (§10.4-10.5,
-    /// §10.7). Out-of-range blocks stream a zero block with a fatal ERRSTAT.
-    private func readPayload(block: Int) -> (data: [UInt8], tag: [UInt8], status: [UInt8]) {
-        guard let image else {
-            return (zeros(WidgetImage.dataBytesPerBlock), zeros(WidgetImage.tagBytes), fatalStatus())
+    private var rejectNext = false
+
+    /// After the accept handshake ($55 reply), set up the data phase.
+    private func beginTransferAfterAccept() {
+        if rejectNext {
+            rejectNext = false
+            lastStatus = fatalStatus()
+            outStream = fatalStatus()
+            outIdx = 0
+            presented = outStream.first ?? 0xFF
+            phase = .readData
+            return
         }
+        let cmd = commandAccum.first ?? 0
+        if cmd == Command.write {
+            phase = .writeData
+            writeAccum = []
+        } else {
+            // Read (single-block) or device-info read.
+            let (stream, status) = readStream(block: pendingBlock)
+            lastStatus = status
+            outStream = stream
+            outIdx = 0
+            presented = outStream.first ?? 0xFF
+            phase = .readData
+            // Data ready — the DRIVER S-machine parks on this interrupt (S200).
+            scheduleEvent(Self.completionDelayCycles) { [weak self] in self?.raiseInterrupt() }
+        }
+    }
+
+    /// The byte stream a read presents on IRA. For the device-info block
+    /// ($FFFFFF) this is `PROF_INIT`'s status+characteristics layout
+    /// (PROFASM:1596-1613); for a normal block it is 20 tag + 512 data + 4
+    /// status (the driver reads the header then the data; status follows).
+    private func readStream(block: Int) -> (stream: [UInt8], status: [UInt8]) {
+        guard let image else { return (zeros(4) + zeros(WidgetImage.bytesPerBlock), fatalStatus()) }
         if block == Command.deviceInfoBlock {
-            return (deviceInfoData(), zeros(WidgetImage.tagBytes), okStatus())
+            return (deviceInfoStream(), okStatus())
         }
         guard block >= 0, block < image.blockCount else {
             log("WidgetDrive: read of out-of-range block \(block) (blockCount \(image.blockCount))")
-            return (zeros(WidgetImage.dataBytesPerBlock), zeros(WidgetImage.tagBytes), fatalStatus())
+            let s = fatalStatus()
+            return (zeros(WidgetImage.tagBytes) + zeros(WidgetImage.dataBytesPerBlock) + s, s)
         }
-        return ([UInt8](image.data(block: block)), [UInt8](image.tag(block: block)), okStatus())
+        let s = okStatus()
+        // Tag first (RDHDR header, 20 bytes), then 512 data, then 4 status.
+        return ([UInt8](image.tag(block: block)) + [UInt8](image.data(block: block)) + s, s)
     }
 
     private func commitWrite() {
         let data = Data(writeAccum.prefix(WidgetImage.dataBytesPerBlock))
+        // The 20 tag bytes precede or follow the data in the driver's stream;
+        // WidgetImage stores 512 data + 20 tag. Take the last 20 as tag.
         let tag = Data(writeAccum.suffix(WidgetImage.tagBytes))
         var status = okStatus()
         if let image, pendingBlock >= 0, pendingBlock < image.blockCount,
            pendingBlock != Command.deviceInfoBlock {
             do {
                 try image.write(block: pendingBlock, data: data, tag: tag)
-                try image.flush()   // §10.10: flush per completed block write
+                try image.flush()
             } catch {
                 log("WidgetDrive: write of block \(pendingBlock) failed: \(error)")
                 status = fatalStatus()
@@ -375,51 +382,38 @@ public final class WidgetDrive {
             status = fatalStatus()
         }
         lastStatus = status
-        outStream = status
-        // Post-write status sequence (§10.3): $06, reply, 4 ERRSTAT bytes.
-        program.append(contentsOf: [.present(Code.respPostWrite), .expectReply, .presentStream, .finish])
+        responseCode = Code.respPostWrite
+        phase = .postWriteHS
+        scheduleEvent(Self.completionDelayCycles) { [weak self] in self?.raiseInterrupt() }
     }
 
-    // MARK: - Status / helpers
+    private func finishRead() {
+        completedCommands += 1
+        phase = .idle
+        scheduleEvent(Self.completionDelayCycles) { [weak self] in self?.raiseInterrupt() }
+    }
+
+    // MARK: - Status / device-info helpers
 
     private func okStatus() -> [UInt8] { [0, 0, 0, 0] }
-
-    /// A 4-byte ERRSTAT whose longword hits the fatal mask `$C140C000`
-    /// (§10.5): byte 0 = `$80` ⇒ `$80 & $C1 != 0`.
     private func fatalStatus() -> [UInt8] { [0x80, 0, 0, 0] }
-
     private func zeros(_ n: Int) -> [UInt8] { [UInt8](repeating: 0, count: n) }
 
-    /// Best-effort device-info payload for a block `$FFFFFF` read (§10.4,
-    /// §10.8): PROF_INIT reads it for `discsize` + raw `drivetype`. The exact
-    /// byte offsets are UNOBSERVED (the 6504/Widget firmware is not in the OS
-    /// source tree, §10.8 "Could Not Find"), so this places `discsize` (=
-    /// blockCount, big-endian) at offset 0 as a documented placeholder pending
-    /// Task 3's live trace.
-    ///
-    /// **We advertise a 10 MB T_Seagate, NOT a T_Widget (M5 Task 2 review I2).**
-    /// hdinit's type decision (PROFILE:283-301): with our `discsize = 19456`
-    /// (in `(9728, 30000]`), a raw `drivetype == 0` resolves to **T_Seagate**
-    /// with `num_bloks := discsize - strt_blok` (full 10 MB capacity) — whereas
-    /// a raw `drivetype ≠ 0` would resolve to **T_Widget**, which makes the OS
-    /// driver issue **multi-block** commands (`$26`, §10.6; PROFASM:250
-    /// `CMPI.B #2,DRIVETYPE / BLT` sends multi-block iff `DRIVETYPE ≥ 2`) that
-    /// this HLE does not implement. T_Seagate (`DRIVETYPE = 1 < 2`) stays on the
-    /// **single-block** read/write path this HLE *does* implement, at full 10 MB
-    /// capacity — the coherent choice (a 10 MB single-block *T_Profile* is
-    /// incoherent: PROFILE:283-284 forces `num_bloks := 9720`). The whole block
-    /// is therefore left zero except `discsize`: a raw `drivetype` byte of 0 at
-    /// whatever offset PROF_INIT actually reads keeps us on T_Seagate
-    /// regardless of the (unobserved) exact layout. Advertising T_Widget +
-    /// building the §10.6 multi-block path is a documented Task 3+ enhancement.
-    private func deviceInfoData() -> [UInt8] {
-        var data = zeros(WidgetImage.dataBytesPerBlock)
+    /// `PROF_INIT`'s device-characteristics stream (PROFASM:1596-1613), read via
+    /// IRA right after the accept handshake: 4 status bytes, 14 skipped, then
+    /// DRIVETYPE at byte 14, 3 skipped, then a 3-byte DISCSIZE at bytes 18-20.
+    /// We report **drivetype 0** (⇒ hdinit resolves **T_Seagate**, single-block,
+    /// PROFILE:283-301 / §10.8) and **discsize = blockCount**.
+    private func deviceInfoStream() -> [UInt8] {
+        var s = zeros(25)
+        // s[0..3] = 4 OK status bytes (already zero)
+        // s[4..17] = 14 skipped bytes (zero)
+        s[18] = 0                                  // DRIVETYPE = 0 (Seagate)
+        // s[19..21] = 3 skipped bytes (zero)
         let discsize = UInt32(image?.blockCount ?? WidgetImage.defaultBlockCount)
-        data[0] = UInt8((discsize >> 24) & 0xFF)
-        data[1] = UInt8((discsize >> 16) & 0xFF)
-        data[2] = UInt8((discsize >> 8) & 0xFF)
-        data[3] = UInt8(discsize & 0xFF)
-        // (raw drivetype byte left 0 -> OS resolves T_Seagate, single-block)
-        return data
+        s[22] = UInt8((discsize >> 16) & 0xFF)     // DISCSIZE MSB
+        s[23] = UInt8((discsize >> 8) & 0xFF)      // DISCSIZE mid
+        s[24] = UInt8(discsize & 0xFF)             // DISCSIZE LSB
+        return s
     }
 }

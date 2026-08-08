@@ -374,10 +374,15 @@ import Testing
     // read passes WidgetDrive.portBInput straight through.)
     #expect(bus.read8(0xFC_DC01) & 0x01 == 0x00)
 
-    // Ready handshake: CMD false->true (DIR=in) on Port B, then read ORA.
+    // Ready handshake (M5 Task 3 transport): CMD false->true (DIR=in) on Port B,
+    // then read the response off PORTA (reg 15, $FCD879 -- the no-handshake ORA
+    // the driver's DOSHAKE actually reads, PROFASM:1663).
     bus.write8(0xFC_D801, 0x18)   // reg 0: CMD false, DIR in
-    bus.write8(0xFC_D801, 0x08)   // reg 0: CMD asserted -> present ready + BSY
-    #expect(bus.read8(0xFC_D809) == 0x01, "ORA (reg 1) should read the $01 idle->ready response")
-    // BSY (Port B bit 1) asserted while CMD is held.
-    #expect(bus.read8(0xFC_DC01) & 0x02 == 0x02)
+    bus.write8(0xFC_D801, 0x08)   // reg 0: CMD asserted -> present ready code, BSY->0
+    #expect(bus.read8(0xFC_D879) == 0x01, "PORTA (reg 15) should read the $01 idle->ready response")
+    // BSY (Port B bit 1) is a LEVEL: 0 while CMD held (controller busy/present),
+    // 1 once CMD is released (idle/ready) -- PROFASM WAIT_BUSY/WAIT_NOTBUSY.
+    #expect(bus.read8(0xFC_DC01) & 0x02 == 0x00, "BSY = 0 while CMD asserted")
+    bus.write8(0xFC_D801, 0x18)   // reg 0: CMD deasserted
+    #expect(bus.read8(0xFC_DC01) & 0x02 == 0x02, "BSY = 1 once CMD deasserts")
 }

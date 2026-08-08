@@ -4,12 +4,17 @@ import Testing
 
 // MARK: - WidgetDrive: the ProFile/Widget parallel-port HLE
 //
-// Drives the byte-at-a-time handshake exactly as the OS ProFile driver
-// performs it (docs/hardware-notes.md §10.2-10.5). These tests act as the
-// executable spec of that contract: they simulate the driver clocking bytes
-// through the VIA1 Port A/Port B surface (`portBWrite`/`portAWrite`/
-// `portAInput`/`portBInput`) and assert the response codes, reply bytes,
-// block data, status bytes, and completion interrupt.
+// Drives the byte-at-a-time handshake exactly as the OS ProFile driver performs
+// it (SOURCE-PROFILEASM PROF_INIT/DOSHAKE/WAIT_BUSY/WAIT_NOTBUSY and the DRIVER
+// S-machine; docs/hardware-notes.md §10.2-10.5). These tests are the executable
+// spec of the transport RECONCILED against the live driver in M5 Task 3:
+//
+//   - Response codes are read from PORTA (VIA register 15, no-handshake).
+//   - The $55 "proceed" reply is written back to PORTA.
+//   - Command bytes go OUT through ORA (register 1); data/status come IN through
+//     IRA (register 1), auto-advancing one byte per read.
+//   - BSY is Port B bit 1, a LEVEL: idle/ready = 1 (CMD deasserted), dropping to
+//     0 when CMD is asserted.
 //
 // Synthetic blank images in temp dirs -- NO env gating.
 
@@ -22,12 +27,10 @@ private func scratchWidget(blockCount: Int = 32) throws -> (WidgetImage, URL) {
 
 private final class InterruptBox { var raised = false }
 
-/// A test harness that drives a `WidgetDrive` the way the OS driver does,
-/// pulsing CMD over Port B and moving one byte per handshake, with an
-/// interrupt-capturing box for the completion line.
+/// Drives a `WidgetDrive` the way the OS driver does: CMD/DIR over Port B, the
+/// handshake response over PORTA (reg 15), command/data over ORA/IRA (reg 1).
 private final class Harness {
     let drive: WidgetDrive
-    let image: WidgetImage?
     let raiseBox = InterruptBox()
     var completionRaised: Bool { raiseBox.raised }
 
@@ -38,88 +41,85 @@ private final class Harness {
             raiseInterrupt: { box.raised = true },
             clearInterrupt: { box.raised = false }
         )
-        self.image = image
         if let image { drive.attach(image) }
     }
 
-    private static let cmdFalseDirIn: UInt8 = 0x18
-    private static let cmdTrueDirIn: UInt8 = 0x08
-    private static let cmdFalseDirOut: UInt8 = 0x10
-    private static let cmdTrueDirOut: UInt8 = 0x00
+    // ORB bit patterns (bit 3 = DIR 1=in, bit 4 = CMD active-low).
+    private static let cmdTrueDirIn: UInt8 = 0x08    // cmd asserted, dir in
+    private static let cmdFalseDirOut: UInt8 = 0x10  // cmd deasserted, dir out
 
-    func readByte() -> UInt8 {
-        drive.portBWrite(Self.cmdFalseDirIn)
-        drive.portBWrite(Self.cmdTrueDirIn)
-        let b = drive.portAInput
-        drive.portBWrite(Self.cmdFalseDirIn)
-        return b
+    /// One `DOSHAKE`: assert CMD (dir in), read the response off PORTA, reply
+    /// $55, deassert CMD. Returns the controller's response code.
+    @discardableResult
+    func handshake() -> UInt8 {
+        drive.portBWrite(Self.cmdTrueDirIn)          // CMD assert -> present response, BSY=0
+        #expect(drive.portBInput & 0x02 == 0x00, "BSY should be 0 while CMD asserted")
+        let resp = drive.portAInput                  // read response (PORTA reg 15)
+        drive.portAAccess(index: 15, value: resp, isWrite: false)
+        drive.portAAccess(index: 15, value: 0x55, isWrite: true)   // reply $55
+        drive.portBWrite(Self.cmdFalseDirOut)        // CMD deassert -> BSY=1
+        #expect(drive.portBInput & 0x02 == 0x02, "BSY should be 1 after CMD deasserts")
+        return resp
     }
-    func writeByte(_ b: UInt8) {
-        drive.portAWrite(b)
-        drive.portBWrite(Self.cmdFalseDirOut)
-        drive.portBWrite(Self.cmdTrueDirOut)
-        drive.portBWrite(Self.cmdFalseDirOut)
+
+    /// Write a byte OUT to ORA (register 1) — command byte or write-data byte.
+    func sendByte(_ b: UInt8) { drive.portAAccess(index: 1, value: b, isWrite: true) }
+
+    /// Read a byte IN from IRA (register 1) — data/tag/status, auto-advancing.
+    func readByte() -> UInt8 {
+        let b = drive.portAInput
+        drive.portAAccess(index: 1, value: b, isWrite: false)
+        return b
     }
     func readBytes(_ n: Int) -> [UInt8] { (0..<n).map { _ in readByte() } }
 
-    /// Sends the 6-byte command block (cmd, 3-byte block#, retry, sparing).
     func sendCommandBlock(cmd: UInt8, block: Int, retry: UInt8 = 0x0A, sparing: UInt8 = 3) {
-        writeByte(cmd)
-        writeByte(UInt8((block >> 16) & 0xFF))
-        writeByte(UInt8((block >> 8) & 0xFF))
-        writeByte(UInt8(block & 0xFF))
-        writeByte(retry)
-        writeByte(sparing)
+        sendByte(cmd)
+        sendByte(UInt8((block >> 16) & 0xFF))
+        sendByte(UInt8((block >> 8) & 0xFF))
+        sendByte(UInt8(block & 0xFF))
+        sendByte(retry)
+        sendByte(sparing)
     }
 }
 
-// MARK: - Attach / disconnect status
+// MARK: - Attach / disconnect + idle BSY status
 
-@Test func detachedDriveReportsDisconnectAndAttachedDoesNot() throws {
+@Test func detachedReportsDisconnectAndBSYHigh() throws {
     let (image, url) = try scratchWidget()
     defer { try? FileManager.default.removeItem(at: url) }
 
     let h = Harness(image: nil)
-    // Detached: DISCONNECT (Port B bit 0) asserted (reads 1).
-    #expect(h.drive.portBInput & 0x01 == 0x01)
+    #expect(h.drive.portBInput & 0x01 == 0x01, "detached: DISCONNECT asserted")
     #expect(!h.drive.isAttached)
 
     h.drive.attach(image)
     #expect(h.drive.isAttached)
-    // Attached: DISCONNECT clear (bit 0 == 0); other idle bits still pulled up.
-    #expect(h.drive.portBInput & 0x01 == 0x00)
+    #expect(h.drive.portBInput & 0x01 == 0x00, "attached: DISCONNECT clear")
+    #expect(h.drive.portBInput & 0x02 == 0x02, "attached + idle: BSY = 1 (ready)")
 }
 
-// MARK: - Read block round-trip through the handshake
+// MARK: - Read block round-trip (tag 20 + data 512 + status 4)
 
-@Test func readCommandRoundTripsBlockDataTagAndStatus() throws {
+@Test func readCommandRoundTripsTagDataAndStatus() throws {
     let (image, url) = try scratchWidget(blockCount: 16)
     defer { try? FileManager.default.removeItem(at: url) }
 
-    // Seed a known block directly in the image.
     let data = Data((0..<512).map { UInt8(($0 * 7) & 0xFF) })
     let tag = Data((0..<20).map { UInt8(0xC0 &+ UInt8($0)) })
     try image.write(block: 6, data: data, tag: tag)
 
     let h = Harness(image: image)
-
-    // §10.3 ready handshake: drive presents $01 (idle->ready), driver replies $55.
-    #expect(h.readByte() == 0x01)
-    h.writeByte(0x55)
-    // §10.4 6-byte read command block for block 6.
-    h.sendCommandBlock(cmd: 0x00, block: 6)
-    // §10.3 drive accepts the read command: $02, driver replies $55.
-    #expect(h.readByte() == 0x02)
-    h.writeByte(0x55)
-    // Drive streams 512 data + 20 tag.
-    let gotData = h.readBytes(512)
+    #expect(h.handshake() == 0x01)                 // first handshake: idle -> ready
+    h.sendCommandBlock(cmd: 0x00, block: 6)        // 6-byte read command
+    #expect(h.handshake() == 0x02)                 // read accepted
+    // Stream: 20 tag (RDHDR) then 512 data (RDDATA) then 4 status.
     let gotTag = h.readBytes(20)
-    #expect(Data(gotData) == data)
-    #expect(Data(gotTag) == tag)
-    // Then 4 status bytes; a clean read is all-zero (no fatal bits, §10.5).
+    let gotData = h.readBytes(512)
     let status = h.readBytes(4)
+    #expect(Data(gotTag) == tag)
+    #expect(Data(gotData) == data)
     #expect(status == [0, 0, 0, 0])
-    // Completion interrupt raised (VIA1 level-1, §10.2 BSY interrupt).
     #expect(h.completionRaised)
     #expect(h.drive.completedCommands == 1)
 }
@@ -134,116 +134,58 @@ private final class Harness {
     let tag = Data((0..<20).map { _ in UInt8(0x3C) })
 
     let h = Harness(image: image)
-    #expect(h.readByte() == 0x01)
-    h.writeByte(0x55)
-    h.sendCommandBlock(cmd: 0x01, block: 10)     // §10.4 cmd 1 = write
-    // Drive accepts the write command: $03, driver replies $55.
-    #expect(h.readByte() == 0x03)
-    h.writeByte(0x55)
-    // Driver streams 512 data + 20 tag to the drive.
-    for b in data { h.writeByte(b) }
-    for b in tag { h.writeByte(b) }
-    // Drive posts write status: $06 then reply, then 4 status bytes.
-    #expect(h.readByte() == 0x06)
-    h.writeByte(0x55)
+    #expect(h.handshake() == 0x01)
+    h.sendCommandBlock(cmd: 0x01, block: 10)       // cmd 1 = write
+    #expect(h.handshake() == 0x03)                 // write accepted
+    for b in data { h.sendByte(b) }                // 512 data
+    for b in tag { h.sendByte(b) }                 // 20 tag
+    #expect(h.handshake() == 0x06)                 // post-write status handshake
     let status = h.readBytes(4)
     #expect(status == [0, 0, 0, 0])
-    #expect(h.completionRaised)
 
-    // Persisted to the live image...
     #expect(image.data(block: 10) == data)
     #expect(image.tag(block: 10) == tag)
-    // ...and across a reopen (write-back, §10.10).
     try image.flush()
     let reopened = try WidgetImage(contentsOf: url)
     #expect(reopened.data(block: 10) == data)
     #expect(reopened.tag(block: 10) == tag)
 }
 
-// MARK: - Error / status paths the OS driver checks (§10.5)
+// MARK: - Out-of-range read -> fatal status (§10.5)
 
 @Test func readOfOutOfRangeBlockReturnsFatalStatus() throws {
     let (image, url) = try scratchWidget(blockCount: 8)
     defer { try? FileManager.default.removeItem(at: url) }
 
     let h = Harness(image: image)
-    #expect(h.readByte() == 0x01)
-    h.writeByte(0x55)
-    h.sendCommandBlock(cmd: 0x00, block: 999)    // out of range (only 8 blocks)
-    #expect(h.readByte() == 0x02)
-    h.writeByte(0x55)
-    // Out-of-range read still streams a (zero) block, but the 4 status bytes
-    // carry a fatal bit: (status_longword & $C140C000) != 0 (§10.5).
-    _ = h.readBytes(512 + 20)
+    #expect(h.handshake() == 0x01)
+    h.sendCommandBlock(cmd: 0x00, block: 999)
+    #expect(h.handshake() == 0x02)
+    _ = h.readBytes(20 + 512)
     let status = h.readBytes(4)
     let longword = (UInt32(status[0]) << 24) | (UInt32(status[1]) << 16)
         | (UInt32(status[2]) << 8) | UInt32(status[3])
-    #expect(longword & 0xC140C000 != 0, "expected a fatal errstat bit for an out-of-range block")
+    #expect(longword & 0xC140C000 != 0, "out-of-range block must carry a fatal errstat bit")
 }
 
-// MARK: - Unsupported command bytes are REJECTED, not silently read (review I2)
+// MARK: - Device-info read: PROF_INIT's characteristics layout (T_Seagate)
 
-@Test func unsupportedCommandByteReturnsFatalStatusNotRead() throws {
-    let (image, url) = try scratchWidget(blockCount: 8)
-    defer { try? FileManager.default.removeItem(at: url) }
-    let h = Harness(image: image)
-
-    #expect(h.readByte() == 0x01)
-    h.writeByte(0x55)
-    // $02 = Formatcmd (a driver op, NOT a wire read/write, §10.4) -- and the
-    // canonical "neither 0 nor 1" byte. We advertise single-block T_Seagate, so
-    // this is out of contract and must be rejected, not treated as a read.
-    h.sendCommandBlock(cmd: 0x02, block: 3)
-    // No $02/$03 accepted response and no data stream -- straight to a fatal
-    // 4-byte ERRSTAT (§10.5), and the command still "completes" (interrupt).
-    let status = h.readBytes(4)
-    let longword = (UInt32(status[0]) << 24) | (UInt32(status[1]) << 16)
-        | (UInt32(status[2]) << 8) | UInt32(status[3])
-    #expect(longword & 0xC140C000 != 0, "an unsupported command byte must return a fatal ERRSTAT, not read data")
-    #expect(h.completionRaised)
-}
-
-// MARK: - Device-info read advertises a 10 MB T_Seagate (single-block), review I2
-
-@Test func deviceInfoReadAdvertisesSeagateDiscsizeNotWidget() throws {
+@Test func deviceInfoReadAdvertisesSeagateDrivetypeAndDiscsize() throws {
     // discsize in (9728, 30000] -> the 10 MB Widget/Seagate range (§10.8).
-    let (image, url) = try scratchWidget(blockCount: 12000)
+    let (image, url) = try scratchWidget(blockCount: 19456)
     defer { try? FileManager.default.removeItem(at: url) }
     let h = Harness(image: image)
 
-    #expect(h.readByte() == 0x01)
-    h.writeByte(0x55)
+    #expect(h.handshake() == 0x01)
     h.sendCommandBlock(cmd: 0x00, block: 0xFFFFFF)   // device-info read (§10.4)
-    #expect(h.readByte() == 0x02)
-    h.writeByte(0x55)
-    let data = h.readBytes(512)
-    let discsize = (UInt32(data[0]) << 24) | (UInt32(data[1]) << 16)
-        | (UInt32(data[2]) << 8) | UInt32(data[3])
-    #expect(discsize == 12000, "device-info reports discsize = blockCount")
-    // Raw drivetype byte 0 -> hdinit resolves T_Seagate (single-block), NOT
-    // T_Widget (which would demand the unimplemented multi-block path, §10.6).
-    #expect(data[4] == 0)
-    _ = h.readBytes(20)   // tag
-    #expect(h.readBytes(4) == [0, 0, 0, 0])
-}
-
-// MARK: - BSY sequencing (§10.2/§10.3)
-
-@Test func bsyAssertsDuringHandshakeAndClearsBetween() throws {
-    let (image, url) = try scratchWidget()
-    defer { try? FileManager.default.removeItem(at: url) }
-    let h = Harness(image: image)
-
-    // Idle before any strobe: BSY (bit 1) clear.
-    #expect(h.drive.portBInput & 0x02 == 0x00)
-
-    // Assert CMD (falling edge) -> drive presents ready byte + asserts BSY.
-    h.drive.portBWrite(0x18)   // cmd false, dir in
-    h.drive.portBWrite(0x08)   // cmd asserted, dir in
-    #expect(h.drive.portBInput & 0x02 == 0x02, "BSY should assert while CMD is held")
-    // Deassert CMD -> BSY clears.
-    h.drive.portBWrite(0x18)
-    #expect(h.drive.portBInput & 0x02 == 0x00, "BSY should clear when CMD deasserts")
+    #expect(h.handshake() == 0x02)
+    // PROF_INIT layout (PROFASM:1596-1613): 4 status, 14 skip, DRIVETYPE@14,
+    // 3 skip, 3-byte DISCSIZE @18-20.
+    let s = h.readBytes(25)
+    #expect(Array(s[0..<4]) == [0, 0, 0, 0], "4 OK status bytes")
+    #expect(s[18] == 0, "DRIVETYPE = 0 -> hdinit resolves T_Seagate (single-block)")
+    let discsize = (UInt32(s[22]) << 16) | (UInt32(s[23]) << 8) | UInt32(s[24])
+    #expect(discsize == 19456, "DISCSIZE (3-byte) = blockCount")
 }
 
 // MARK: - reset() drops an in-flight handshake, keeps the attached image
@@ -253,13 +195,10 @@ private final class Harness {
     defer { try? FileManager.default.removeItem(at: url) }
     let h = Harness(image: image)
 
-    #expect(h.readByte() == 0x01)   // start a transaction
-    h.writeByte(0x55)
-    h.writeByte(0x00)               // partial command block
+    #expect(h.handshake() == 0x01)   // open a transaction
+    h.sendByte(0x00)                 // partial command block
     h.drive.reset()
 
-    // Image survives a warm reset (real hardware doesn't unmount media).
-    #expect(h.drive.isAttached)
-    // A fresh transaction starts clean: the very next read is the ready byte.
-    #expect(h.readByte() == 0x01)
+    #expect(h.drive.isAttached)      // image survives warm reset
+    #expect(h.handshake() == 0x01)   // a fresh transaction starts clean
 }

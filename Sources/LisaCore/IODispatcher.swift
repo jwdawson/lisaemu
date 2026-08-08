@@ -140,8 +140,11 @@ final class IODispatcher {
         // pre-M5 default -- see `WidgetDrive`'s "Default = detached" note.
         via1.portAInput = { [weak self] in self?.widget.portAInput ?? 0xFF }
         via1.portBInput = { [weak self] in self?.widget.portBInput ?? 0xFF }
-        via1.onPortAAccess = { [weak self] _, value, isWrite in
-            if isWrite { self?.widget.portAWrite(value) }
+        // Widget Port A is register-index-aware (M5 Task 3): reg 1 = IRA/ORA
+        // handshake (command out / data in), reg 15 = PORTA no-handshake
+        // (response in / reply out) — see WidgetDrive's doc comment.
+        via1.onPortAAccess = { [weak self] index, value, isWrite in
+            self?.widget.portAAccess(index: index, value: value, isWrite: isWrite)
         }
         via2.portBInput = { [weak self] in
             guard let self else { return 0xFF }

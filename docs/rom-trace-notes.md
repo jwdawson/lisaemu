@@ -2473,15 +2473,50 @@ media change must fire the `bot_in`/`DISKSTAT` media-change interrupt so
 `DISK_INT` updates `disk_present` and the app's `Mount` retry succeeds.** Our
 `FloppyController` models only command-completion interrupts and treats the OS
 eject (`unclamp`) as a no-op — never needed before, because every prior
-milestone booted from a single disk present at power-on. Closing it is a
-**floppy-subsystem** effort (the `bot_in` media-change interrupt + `DISK_INT`
-path), distinct from the Widget HLE this task delivered, and is the M5-follow-on
-frontier.
+milestone booted from a single disk present at power-on. ~~Closing it is a
+follow-on frontier.~~ **RESOLVED in round 2 (below).**
+
+### Checkpoint H (M5 Task 3 round 2) — the media-change swap; install COMPLETES
+
+The round-1 "boundary" was in-scope floppy work, now implemented and driven to
+completion (hardware-notes §9 media-change; `FloppyController`):
+
+- **`bot_in` media-change attention.** `insertWhileRunning(_:)` raises a level-1
+  floppy interrupt with `int_stat` = `bot_int|bot_in` (no `bot_done`); the OS's
+  `DISK_INT` (SONY:469-481) sets `disk_present := gooddisk` + `KEYPUSHED`, waking
+  the installer's blocked `Mount` retry so it mounts the new volume. The mailbox
+  `insertFloppy` uses this path; bare `insert(_:)` stays the power-on-quiet path
+  so every boot pin is unmoved. The OS-commanded eject (`excmd` `unclamp`, SONY
+  `dskunclamp`:679-688) now actually removes the media and completes with
+  `bot_done` (the other half — struck the old no-op).
+- **Boot-disk write-session retention.** The very last install step reinserts
+  the boot disk; `boot_remount` (FSINIT2:466-468) compares the reinserted disk's
+  MDDF `overmount_stamp`/`mountinfo` to the in-memory boot MDDF, and a pristine
+  `.dc42` carries the OLD stamp → `E_BT_REMOUNT` (1144). A real diskette retains
+  the boot-time writes physically; `FloppyController.exportSessionOverlay()`/
+  `importSessionOverlay(_:)` model that — snapshot the boot disk's write session
+  before the swaps, restore it on reinsert. `boot_remount` then re-verifies and
+  the install finalizes (write boot tracks + `system.=` files).
+
+**OBSERVED (narrative, screenshots `m5-install-01..08`).** Install click →
+disk found → OK → initialize → Don't Share → **whole 19456-block disk erased +
+Office System 1 copied** → swaps **2,3,4,5** each via the real media-change path
+(`insertWhileRunning` → `bot_in` → `DISK_INT` mounts → the OS reads+copies each,
+floppy reads climb ~700/disk, Widget write-commands past 24 000) → **reinsert
+boot disk** (session restored) → boot tracks + `system.=` written →
+**"The Lisa Office System software has been installed"** (alert 128,
+APIN-OFFICE:2282). The installed 10 MB image (bootable; block 0 = `4EFA…` boot
+block) is left at `~/Development/LisaImages/OS31-installed.widget` for Task 4.
+`checkpointJ` pins the media-change integration (disk-2 mount+read after the
+swap — the exact round-1 hang); the full run stays narrative (too long/stateful
+for CI).
 
 ### Bottom line (Task 3)
 
-The Widget hard-disk HLE is proven end to end for a single-disk session:
-`PROF_INIT` finds it, the disk initializes (19456 blocks, persisted), and the
-Office System copies onto it until the install needs disk 2. `checkpointI` pins
-the disk-found precursor; the install completes up to the floppy media-change
-boundary above.
+The Widget hard-disk HLE + the floppy media-change subsystem carry the Office
+System install **to completion**: `PROF_INIT` finds the Widget, the disk
+initializes (19456 blocks, persisted), Office System 1-5 copy across five real
+disk swaps, the boot disk reinserts and re-verifies, and the installer reports
+"software has been installed" — leaving a bootable 10 MB image for Task 4.
+`checkpointI` pins the disk-found precursor and `checkpointJ` the first media-
+change swap; the full multi-swap run stays narrative (screenshots).

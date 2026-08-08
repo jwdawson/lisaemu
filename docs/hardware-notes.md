@@ -1140,16 +1140,28 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
   SONYASM:127-131,396-400). not_issued=1809 (driver resends the packet —
   twiggy:1520-1525), vererr=1821, read_err=1823, write_err=1824
   (SONY.TEXT:39-42).
-- **`unclamp` (sub-command 2) — modeled as a benign no-op (M3 Task 3 doc
-  note).** `FloppyController` doesn't implement `unclamp` (it falls into the
-  same unsupported-sub-command path as `format`/`verify`/etc., answering
-  `notIssued`/DISKERR 9); this is harmless because the only observed caller
-  is the loader's `shutdown`/eject teardown (source-ldmicro:184-203):
-  `unclamp` → `clristat ($85)` → `clrmask ($87)`/parm `$88`, waiting ONLY on
-  the VIA2-PB4 completion line and never reading DISKERR — confirmed live by
-  the M2 Task 6 trace (this doc's "Boot-ROM read sequence — Task 6" bullet,
-  above, and rom-trace-notes.md "Sanity-negative sweep"). See
-  `FloppyController.SubCommand.unclamp`'s doc comment for the mirrored note.
+- **`unclamp` (sub-command 2) — now an OS-commanded EJECT (M5 Task 3 round 2).**
+  ~~Modeled as a benign no-op (M3 Task 3): it fell into the unsupported-sub-
+  command path, answering `notIssued`/DISKERR 9.~~ **Superseded:** the loader's
+  teardown only waits on the VIA2-PB4 completion line (still true), but the OS
+  installer's `dskunclamp` (SONY:679-688) issues `unclamp` to physically EJECT
+  the media mid-run and then sets `disk_present := nodisk`. `FloppyController`
+  now removes the disk on `unclamp` and completes with a `bot_done` interrupt.
+  See `FloppyController.SubCommand.unclamp`'s doc comment.
+- **Media-change attention (M5 Task 3 round 2).** A disk inserted while the OS
+  is running raises a level-1 floppy interrupt with `int_stat` = `bot_int|bot_in`
+  (no `bot_done`); the OS's `DISK_INT` (SONY:469-481) reads `bot_in` and sets
+  `disk_present := gooddisk` + `KEYPUSHED`, waking a process blocked on a disk
+  (e.g. the installer's `Mount` retry at an "insert disk N" prompt). This is the
+  ONLY runtime path that flips the cached presence — the synchronous `ISDISKIN`
+  probe is init-only (SONYASM:431-442). `FloppyController.insertWhileRunning(_:)`
+  raises it (the mailbox `insertFloppy` path); bare `insert(_:)` is the power-on
+  path and raises nothing. `DISKSTAT` `bot_in` is thus an interrupt-EVENT bit
+  (cleared by `clristat`), not a presence mirror — `DISKIN ($41)` is the
+  persistent presence cell. A diskette's writes are retained across an
+  eject/reinsert of the SAME disk via `export/importSessionOverlay` (so the boot
+  disk's MDDF `overmount_stamp` survives for `boot_remount`, FSINIT2:466-468);
+  the `.dc42` file is still never mutated.
 - **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
   change).** The busy-rejection guard (`FloppyController.commandInFlight`)
   only spans the command-decode delay, not the SEPARATE completion-wait

@@ -590,3 +590,26 @@ private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeSch
     #expect(floppy.read(FloppyController.Cell.diskStat) & 0x10 == 0, "clristat clears bot_in")
     #expect(level1() == false, "clristat drops the completion line")
 }
+
+@Test func exportedSessionOverlayRestoresRetainedWritesOnReinsert() {
+    let (floppy, scheduler, _) = makeController()
+    let image = makeSyntheticImage()
+    floppy.insert(image)
+    // The OS writes a block (e.g. the boot MDDF's overmount_stamp).
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0,
+                       data: [UInt8](repeating: 0xEE, count: 512),
+                       tag: [UInt8](repeating: 0xDD, count: 12))
+    let saved = floppy.exportSessionOverlay()
+    #expect(saved.count == 1, "one block written this session")
+
+    // Swap disks (each insert clears the overlay), then reinsert THIS disk...
+    floppy.insertWhileRunning(makeSyntheticImage())
+    floppy.insertWhileRunning(image)
+    // ...and restore its retained write session (models the physical medium).
+    floppy.importSessionOverlay(saved)
+    issueRead(floppy, scheduler, track: 2, sector: 5, side: 0)
+    let readBack = (0..<512).map { floppy.read(FloppyController.Cell.diskData + 1 + 2 * $0) }
+    #expect(readBack == [UInt8](repeating: 0xEE, count: 512),
+            "the reinserted disk retains its earlier writes (boot_remount can re-verify the MDDF)")
+    #expect(floppy.blocksWritten == 1)
+}

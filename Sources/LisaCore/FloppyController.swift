@@ -299,6 +299,28 @@ public final class FloppyController {
     /// does NOT (a warm reboot does not un-write a real floppy's media).
     private var sessionOverlay: [Int: (data: [UInt8], tag: [UInt8])] = [:]
 
+    /// **Snapshot / restore the write session for one physical diskette (M5
+    /// Task 3 round 2).** A real diskette retains the blocks the OS wrote to it
+    /// (e.g. the boot-time `overmount_stamp`/`mountinfo` written into the boot
+    /// disk's MDDF) when it is ejected and later reinserted. The session overlay
+    /// is per-drive and cleared on every `insert(_:)`, so a caller driving a
+    /// multi-diskette flow (the installer's disk swaps) must snapshot the
+    /// leaving disk's overlay and restore it when that SAME physical disk is
+    /// reinserted -- otherwise the pristine `.dc42` returns the OLD MDDF stamp
+    /// and the OS's `boot_remount` fails with E_BT_REMOUNT (1144, FSINIT2:466-
+    /// 468). Modeling the medium, not mutating the `.dc42`.
+    public func exportSessionOverlay() -> [Int: (data: [UInt8], tag: [UInt8])] {
+        sessionOverlay
+    }
+    /// Restore a previously-`exportSessionOverlay()`'d write session onto the
+    /// currently-inserted diskette (call AFTER the `insert`/`insertWhileRunning`
+    /// that put the disk back). Also restores `blocksWritten` so the write
+    /// counter reflects the retained session.
+    public func importSessionOverlay(_ overlay: [Int: (data: [UInt8], tag: [UInt8])]) {
+        sessionOverlay = overlay
+        blocksWritten = overlay.count
+    }
+
     /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
     /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
     /// `clristat`/`enabstat`/`clrmask`/`goaway` as well as `excmd`'s

@@ -192,10 +192,16 @@ Lisa_Office_System_3.1/`).
 
 ### Boot the installed system (scripted, in `lisadbg`)
 
+> A boot **WRITES** to whatever Widget path you pass here (the OS marks the
+> LFS in-use) -- copy `OS31-installed.widget` first and boot the copy, never
+> the original.
+
 ```
+cp ~/Development/LisaImages/OS31-installed.widget /tmp/lisa-boot.widget
+
 LISAEMU_ROM_DIR=~/Development/LisaROMs \
 swift run -c release lisadbg --rom ~/Development/LisaROMs \
-    --widget ~/Development/LisaImages/OS31-installed.widget   # boot a COPY
+    --widget /tmp/lisa-boot.widget
 ```
 
 Then, at the prompt, drive the boot menu and click through:

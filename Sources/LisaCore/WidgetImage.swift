@@ -42,6 +42,10 @@ public final class WidgetImage {
         case sizeNotBlockAligned(size: Int, bytesPerBlock: Int)
         /// `createBlankAt` was asked for a non-positive block count.
         case invalidBlockCount(Int)
+        /// `guardCreatable` found a file already at the target path --
+        /// `createBlankAt` would zero-truncate it (see `guardCreatable`'s
+        /// doc comment). Carries the path for the caller's error message.
+        case alreadyExists(path: String)
     }
 
     /// 512 payload bytes per block (§10.7).
@@ -81,6 +85,24 @@ public final class WidgetImage {
         self.url = url
         self.blockCount = blockCount
         self.handle = try FileHandle(forUpdating: url)
+    }
+
+    /// Refuses to proceed if a file already exists at `url` -- an opt-in
+    /// pre-flight check for callers that create-then-attach a blank image
+    /// from a bare path a user typed (e.g. `lisadbg`'s `widget create
+    /// <path>` command). `createBlankAt` itself stays overwrite-always (the
+    /// app's *File ▸ Create Blank Widget Image…* NSSavePanel already gets
+    /// its own overwrite confirmation from the panel, so a second guard
+    /// there would be redundant); this lets a bare-path command surface add
+    /// the same protection without changing `createBlankAt`'s semantics.
+    /// Pointed at a live install (e.g. `OS31-installed.widget`), an
+    /// unguarded `createBlankAt` would silently zero-truncate it.
+    ///
+    /// - Throws: `Error.alreadyExists` if `url` already names a file.
+    public static func guardCreatable(at url: URL, fileManager: FileManager = .default) throws {
+        if fileManager.fileExists(atPath: url.path) {
+            throw Error.alreadyExists(path: url.path)
+        }
     }
 
     /// Opens an existing image file, validating its size strictly.

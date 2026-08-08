@@ -146,3 +146,47 @@ private func scratchURL(_ name: String = "widget") -> URL {
     let image = try WidgetImage(contentsOf: url)
     #expect(image.blockCount == 40)
 }
+
+/// M5 final review: `lisadbg`'s `widget create <path>` command must refuse
+/// to clobber a file that's already there -- pointed at a genuine install
+/// (e.g. `OS31-installed.widget`), an unguarded `createBlankAt` would
+/// silently zero-truncate it (a boot WRITES; this command shouldn't
+/// destroy). `guardCreatable` is the pre-flight check the command surface
+/// calls before `createBlankAt`; it leaves `createBlankAt` itself
+/// unchanged (the app's NSSavePanel path still relies on
+/// overwrite-after-confirmation).
+@Test func guardCreatableRejectsAnExistingFile() throws {
+    let url = scratchURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+    // Simulate a real installed image: non-trivial content, not a blank
+    // WidgetImage-created file.
+    let precious = Data((0..<1024).map { UInt8($0 & 0xFF) })
+    try precious.write(to: url)
+
+    var caught: WidgetImage.Error?
+    do {
+        try WidgetImage.guardCreatable(at: url)
+    } catch let error as WidgetImage.Error {
+        caught = error
+    }
+    #expect(caught == .alreadyExists(path: url.path))
+
+    // The guard must not itself touch the file.
+    let survived = try Data(contentsOf: url)
+    #expect(survived == precious)
+}
+
+/// The mirror case: no file at the target path yet, so the guard is a
+/// silent no-op and the normal create-blank path proceeds.
+@Test func guardCreatableAllowsAFreshPath() throws {
+    let url = scratchURL()
+    defer { try? FileManager.default.removeItem(at: url) }
+    #expect(!FileManager.default.fileExists(atPath: url.path))
+
+    #expect(throws: Never.self) {
+        try WidgetImage.guardCreatable(at: url)
+    }
+
+    // Still nothing on disk -- guarding creates nothing itself.
+    #expect(!FileManager.default.fileExists(atPath: url.path))
+}

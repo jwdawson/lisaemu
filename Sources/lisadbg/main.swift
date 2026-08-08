@@ -567,9 +567,15 @@ while let line = readLine(strippingNewline: true) {
     case .widgetCreate(let path):
         let url = URL(fileURLWithPath: path)
         do {
+            // Refuse to clobber an existing file (e.g. a genuine installed
+            // Widget image) -- `WidgetImage(createBlankAt:)` itself always
+            // overwrites, so this bare-path command surface guards first.
+            try WidgetImage.guardCreatable(at: url)
             let image = try WidgetImage(createBlankAt: url)
             machine.bus.widget.attach(image)
             print("      created + attached blank Widget image \(path) (\(image.blockCount) blocks, \(image.blockCount * WidgetImage.bytesPerBlock) bytes)")
+        } catch WidgetImage.Error.alreadyExists(let existingPath) {
+            print("      widget create: a file already exists at \(existingPath) -- remove it first or pick a new path (widget create never overwrites)")
         } catch {
             print("      widget create: \(error)")
         }

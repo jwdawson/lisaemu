@@ -163,6 +163,17 @@ public final class WidgetDrive {
     public func portBWrite(_ value: UInt8) {
         guard image != nil else { return }   // detached: ignore the bus
         if value & PortB.reset != 0 {         // PROFILE-RESET (§10.2 bit 7)
+            // **Task-3 reconciliation point (review M2).** §10.2 bit 7 is
+            // PROFILE-RESET, and we treat any ORB write with it set as "abort
+            // the in-flight transaction". But PROF_INIT's *init* sequence does
+            // `ORI #$A0,ORB` (bits 7+5 together, PROFASM:1532-1533) to set
+            // those pins to OUTPUT at startup -- which is configuration, not
+            // necessarily a mid-transfer reset. This is harmless at init (no
+            // transaction is in flight yet, so resetTransaction() is a no-op),
+            // but once PROF_INIT runs live (Task 3) confirm the driver never
+            // sets bit 7 during a transfer for a non-reset reason; if it does,
+            // refine this edge (e.g. gate on a bit7 rising edge, or require
+            // bit5 clear) rather than aborting. UNOBSERVED today (§10.9).
             resetTransaction()
             return
         }
@@ -299,17 +310,33 @@ public final class WidgetDrive {
         pendingBlock = block
 
         switch cmd {
+        case Command.read:
+            // Read (cmd 0) -- includes the device-info read (block $FFFFFF).
+            let (data, tag, status) = readPayload(block: block)
+            lastStatus = status
+            outStream = data + tag + status
+            program.append(contentsOf: [.present(Code.respReadAccepted), .expectReply, .presentStream, .finish])
         case Command.write:
             // §10.3: accept write ($03), driver replies $55, streams the
             // block, drive posts status ($06 + reply + 4 ERRSTAT bytes).
             program.append(contentsOf: [.present(Code.respWriteAccepted), .expectReply, .receiveWrite])
             // Status steps are spliced after the write commits (commitWrite).
         default:
-            // Read (cmd 0) -- includes the device-info read (block $FFFFFF).
-            let (data, tag, status) = readPayload(block: block)
-            lastStatus = status
-            outStream = data + tag + status
-            program.append(contentsOf: [.present(Code.respReadAccepted), .expectReply, .presentStream, .finish])
+            // **Unsupported single-block command byte — REJECTED, not silently
+            // read** (M5 Task 2 review I2). We advertise a 10 MB **T_Seagate**
+            // (§10.8 / `deviceInfoData`), so the OS ProFile driver only ever
+            // issues read (`$00`) / write (`$01`): `DRIVETYPE < 2` takes the
+            // single-block path (PROFASM:250 `CMPI.B #2,DRIVETYPE / BLT`).
+            // Anything else — `Formatcmd` (`$02`, §10.4), a multi-block prefix
+            // (`$26`, §10.6), a Widget diagnostic — is out of the advertised
+            // contract, so it is logged and answered with a fatal `ERRSTAT`
+            // (§10.5) rather than mishandled as a read. (Multi-block / Widget
+            // diagnostics would require advertising `T_Widget` and building the
+            // §10.6 path — a documented Task 3+ enhancement, not this task.)
+            log("WidgetDrive: unsupported command byte $\(String(cmd, radix: 16)) for block \(block) -- rejected (single-block T_Seagate advertises only read/write)")
+            lastStatus = fatalStatus()
+            outStream = fatalStatus()
+            program.append(contentsOf: [.presentStream, .finish])
         }
         advance()   // move off .receiveCommand into the spliced steps
     }
@@ -364,11 +391,27 @@ public final class WidgetDrive {
     private func zeros(_ n: Int) -> [UInt8] { [UInt8](repeating: 0, count: n) }
 
     /// Best-effort device-info payload for a block `$FFFFFF` read (§10.4,
-    /// §10.8): PROF_INIT reads it for `drivetype` + `discsize`. The exact
+    /// §10.8): PROF_INIT reads it for `discsize` + raw `drivetype`. The exact
     /// byte offsets are UNOBSERVED (the 6504/Widget firmware is not in the OS
     /// source tree, §10.8 "Could Not Find"), so this places `discsize` (=
-    /// blockCount, big-endian) at offset 0 and `drivetype` = 2 (Widget) at
-    /// offset 4 as a documented placeholder pending Task 3's live trace.
+    /// blockCount, big-endian) at offset 0 as a documented placeholder pending
+    /// Task 3's live trace.
+    ///
+    /// **We advertise a 10 MB T_Seagate, NOT a T_Widget (M5 Task 2 review I2).**
+    /// hdinit's type decision (PROFILE:283-301): with our `discsize = 19456`
+    /// (in `(9728, 30000]`), a raw `drivetype == 0` resolves to **T_Seagate**
+    /// with `num_bloks := discsize - strt_blok` (full 10 MB capacity) — whereas
+    /// a raw `drivetype ≠ 0` would resolve to **T_Widget**, which makes the OS
+    /// driver issue **multi-block** commands (`$26`, §10.6; PROFASM:250
+    /// `CMPI.B #2,DRIVETYPE / BLT` sends multi-block iff `DRIVETYPE ≥ 2`) that
+    /// this HLE does not implement. T_Seagate (`DRIVETYPE = 1 < 2`) stays on the
+    /// **single-block** read/write path this HLE *does* implement, at full 10 MB
+    /// capacity — the coherent choice (a 10 MB single-block *T_Profile* is
+    /// incoherent: PROFILE:283-284 forces `num_bloks := 9720`). The whole block
+    /// is therefore left zero except `discsize`: a raw `drivetype` byte of 0 at
+    /// whatever offset PROF_INIT actually reads keeps us on T_Seagate
+    /// regardless of the (unobserved) exact layout. Advertising T_Widget +
+    /// building the §10.6 multi-block path is a documented Task 3+ enhancement.
     private func deviceInfoData() -> [UInt8] {
         var data = zeros(WidgetImage.dataBytesPerBlock)
         let discsize = UInt32(image?.blockCount ?? WidgetImage.defaultBlockCount)
@@ -376,7 +419,7 @@ public final class WidgetDrive {
         data[1] = UInt8((discsize >> 16) & 0xFF)
         data[2] = UInt8((discsize >> 8) & 0xFF)
         data[3] = UInt8(discsize & 0xFF)
-        data[4] = 2   // drivetype = T_Widget (§10.8)
+        // (raw drivetype byte left 0 -> OS resolves T_Seagate, single-block)
         return data
     }
 }

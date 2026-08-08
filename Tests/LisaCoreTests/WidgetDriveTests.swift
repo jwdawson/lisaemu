@@ -181,6 +181,52 @@ private final class Harness {
     #expect(longword & 0xC140C000 != 0, "expected a fatal errstat bit for an out-of-range block")
 }
 
+// MARK: - Unsupported command bytes are REJECTED, not silently read (review I2)
+
+@Test func unsupportedCommandByteReturnsFatalStatusNotRead() throws {
+    let (image, url) = try scratchWidget(blockCount: 8)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let h = Harness(image: image)
+
+    #expect(h.readByte() == 0x01)
+    h.writeByte(0x55)
+    // $02 = Formatcmd (a driver op, NOT a wire read/write, §10.4) -- and the
+    // canonical "neither 0 nor 1" byte. We advertise single-block T_Seagate, so
+    // this is out of contract and must be rejected, not treated as a read.
+    h.sendCommandBlock(cmd: 0x02, block: 3)
+    // No $02/$03 accepted response and no data stream -- straight to a fatal
+    // 4-byte ERRSTAT (§10.5), and the command still "completes" (interrupt).
+    let status = h.readBytes(4)
+    let longword = (UInt32(status[0]) << 24) | (UInt32(status[1]) << 16)
+        | (UInt32(status[2]) << 8) | UInt32(status[3])
+    #expect(longword & 0xC140C000 != 0, "an unsupported command byte must return a fatal ERRSTAT, not read data")
+    #expect(h.completionRaised)
+}
+
+// MARK: - Device-info read advertises a 10 MB T_Seagate (single-block), review I2
+
+@Test func deviceInfoReadAdvertisesSeagateDiscsizeNotWidget() throws {
+    // discsize in (9728, 30000] -> the 10 MB Widget/Seagate range (§10.8).
+    let (image, url) = try scratchWidget(blockCount: 12000)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let h = Harness(image: image)
+
+    #expect(h.readByte() == 0x01)
+    h.writeByte(0x55)
+    h.sendCommandBlock(cmd: 0x00, block: 0xFFFFFF)   // device-info read (§10.4)
+    #expect(h.readByte() == 0x02)
+    h.writeByte(0x55)
+    let data = h.readBytes(512)
+    let discsize = (UInt32(data[0]) << 24) | (UInt32(data[1]) << 16)
+        | (UInt32(data[2]) << 8) | UInt32(data[3])
+    #expect(discsize == 12000, "device-info reports discsize = blockCount")
+    // Raw drivetype byte 0 -> hdinit resolves T_Seagate (single-block), NOT
+    // T_Widget (which would demand the unimplemented multi-block path, §10.6).
+    #expect(data[4] == 0)
+    _ = h.readBytes(20)   // tag
+    #expect(h.readBytes(4) == [0, 0, 0, 0])
+}
+
 // MARK: - BSY sequencing (§10.2/§10.3)
 
 @Test func bsyAssertsDuringHandshakeAndClearsBetween() throws {

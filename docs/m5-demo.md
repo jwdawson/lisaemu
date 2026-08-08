@@ -60,11 +60,12 @@ journey, screen by screen (`~/Development/LisaEmu-artifacts/m5-install-*.png`):
    startup software copies from the floppy to the Widget (floppy reads climb into
    the thousands; Widget write commands past 20 000), then: *"Please insert the
    Lisa Office System 2 micro diskette"* — **the first media swap.**
-5. **Five real disk swaps** (`m5-install-06`). Disks **2, 3, 4, 5** each go in
+5. **Four more disk swaps** (`m5-install-06`). Disks **2, 3, 4, 5** each go in
    through the **real floppy media-change path** — eject the old disk, insert the
    new one, and the Sony driver's `bot_in` media-change interrupt wakes the
    installer's blocked mount so it reads and copies each disk (~700 floppy reads
-   per disk).
+   per disk). (Step 6 below adds a fifth, final media change — reinserting the
+   boot disk.)
 6. **Reinsert the boot disk, and finish** (`m5-install-07`, `-08`). The last step
    reinserts install disk 1; the boot-disk **write session is retained** across
    the swap so `boot_remount` re-verifies the volume, the boot tracks + `system.=`

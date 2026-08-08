@@ -238,9 +238,11 @@ Milestones (each a demo):
    off the Widget (see the M3-Widget note above) carries all the way to the
    **Office System desktop** — menu bar **Desk / File/Print / Edit /
    Housekeeping** and icons **Preferences · Wastebasket · Clipboard · Internal
-   Hard Disk** — with **mouse and keyboard live**: a first-boot modal is
+   Hard Disk** — with **the mouse live**: a first-boot modal is
    dismissed by an on-screen click (a modal answered by a mouse event), and the
-   OS cursor is steered live via the COPS input channel. The screenshot is
+   OS cursor is steered live via the COPS input channel. (Keyboard-at-desktop is
+   not exercised in the record; only mouse interaction is demonstrated.) The
+   screenshot is
    `~/Development/LisaEmu-artifacts/m5-boot-06-desktop.png`; pinned behaviourally
    by `ROMWidgetBootTests.checkpointK`. **One clause of this line's "clock live"
    remains honestly unmet:** no RTC (COPS real-time clock) is modeled, so the

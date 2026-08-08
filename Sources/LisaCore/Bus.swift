@@ -580,6 +580,18 @@ public final class Bus {
     /// `cops.reset()`/`videoTiming.reset()` -- the inserted disk, if any,
     /// survives (see `FloppyController.reset()`'s doc comment).
     public var floppy: FloppyController { io.floppy }
+    /// HLE Widget/ProFile parallel hard disk (M5 Task 2), owned by
+    /// `IODispatcher` and wired to `via1`'s ports + VIA1 IFR bit 1 (the
+    /// completion interrupt) -- see `WidgetDrive`'s type doc comment.
+    /// `Machine.reset()` calls `widget.reset()` (after clearing its own event
+    /// queue) to drop any in-flight handshake; the attached image, if any,
+    /// survives (mirrors `floppy`).
+    public var widget: WidgetDrive { io.widget }
+    /// Diagnostic: accesses to the OS ProFile/Widget driver's VIA1 region
+    /// (`$FCD801`/`$FCDC01`/`$FCDC05`, §10.1) -- the M5 Task 1 Q1 live-probe
+    /// seam. 0 until the OS driver first drives the Widget (Task 3).
+    public var widgetRegionAccesses: Int { io.widgetRegionAccesses }
+    public var firstWidgetRegionAccessCycle: UInt64? { io.firstWidgetRegionAccessCycle }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }
@@ -587,6 +599,18 @@ public final class Bus {
 
     public func read16(_ a: UInt32) -> UInt16 {
         UInt16(read8(a)) << 8 | UInt16(read8(a &+ 1))
+    }
+    /// Raw big-endian 16-bit read straight out of physical RAM, bypassing the
+    /// MMU (unlike `read16`, which translates through the live domain). Debug
+    /// tooling only (`lisadbg`): the OS keeps globals like the mouse location
+    /// (`MousX`/`MousY`) at fixed PHYSICAL addresses written by supervisor/
+    /// domain-0 interrupt code, so a `read16` from the idle (user/domain-1)
+    /// context would translate the same logical address elsewhere. Returns 0
+    /// for out-of-range addresses. No side effects.
+    public func physicalRead16(_ phys: UInt32) -> UInt16 {
+        let i = Int(phys)
+        guard i >= 0, i + 1 < ram.count else { return 0 }
+        return UInt16(ram[i]) << 8 | UInt16(ram[i + 1])
     }
     public func read32(_ a: UInt32) -> UInt32 {
         UInt32(read16(a)) << 16 | UInt32(read16(a &+ 2))

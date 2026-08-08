@@ -514,5 +514,191 @@ extension MusashiSuites {
             #expect(fb.reduce(0) { $0 + $1.nonzeroBitCount } == 60107,
                     "installer-dialog set-pixel count; got \(fb.reduce(0) { $0 + $1.nonzeroBitCount })")
         }
+
+        // M5 Task 2 -- Q1 live $FCD801 probe + the M2-precedent boot-menu
+        // watch, in one test. Attaches a Widget hard disk and boots the SAME
+        // window as checkpointG. Two assertions:
+        //  (1) The OS ProFile/Widget driver never drives the `$FCD801`/`$FCDC01`
+        //      region on the boot-to-installer path -- `widgetRegionAccesses`
+        //      stays 0 -- confirming §10.9 live: PROF_INIT never runs because
+        //      no `cd_intdisk` devrec exists (attaching hardware alone does not
+        //      create the devrec). This is the OBSERVED-vs-contract record the
+        //      Task 1 Q1 hand-off asked for, and the Task 3 frontier anchor
+        //      (the moment it first goes non-zero).
+        //  (2) The installer dialog is BYTE-IDENTICAL with a Widget attached
+        //      (same FNV as checkpointG) -- so attaching a Widget does NOT move
+        //      the boot menu / installer UI (unlike the M2 floppy-devrec
+        //      precedent). No re-anchoring needed; documented here + in
+        //      docs/rom-trace-notes.md "Checkpoint H prep".
+        @Test func checkpointH_widgetAttachedDoesNotDriveTheRegionOrMoveTheInstaller() throws {
+            let m = try bootIntoLoader()
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("checkpointH-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let widget = try WidgetImage(createBlankAt: url, blockCount: 512)
+            m.bus.widget.attach(widget)
+
+            var steps = 0
+            while steps < 10_000_000 && !m.halted {
+                _ = m.step(); steps += 1
+            }
+
+            #expect(!m.halted, "the OS runs live through the window with a Widget attached -- no halt")
+            #expect(m.bus.widgetRegionAccesses == 0,
+                    "OBSERVED: the OS/ROM never touches the $FCD801/$FCDC01 Widget region on the boot-to-installer path (PROF_INIT never runs, §10.9); got \(m.bus.widgetRegionAccesses) access(es), first at cycle \(String(describing: m.bus.firstWidgetRegionAccessCycle))")
+            #expect(m.bus.widget.completedCommands == 0,
+                    "OBSERVED: no Widget command completes -- the driver never handshakes")
+
+            // The installer dialog is unchanged by attaching a Widget.
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fnv1a(fb) == 0x04a1_9e4e_b597_04f4,
+                    "attaching a Widget must not move the installer dialog; got \(String(format: "0x%016llx", fnv1a(fb)))")
+        }
+
+        /// The live OS cursor position (MousX/MousY at physical RAM $3CF0,
+        /// found by M5 Task 3's install trace). Once the OS is running the ROM
+        /// cursor cells ($496/$498) are dead, so the boot-menu `moveCursor`
+        /// above cannot steer the installer -- this reads the OS's own cursor.
+        private func osCursor(_ m: Machine) -> (Int, Int) {
+            (Int(m.bus.physicalRead16(0x3CF0)), Int(m.bus.physicalRead16(0x3CF2)))
+        }
+        /// Feedback-steer the OS cursor to `(tx,ty)` then click (the half-step
+        /// on X damps the OS mouse driver's 3/2 coarse scaling, LIBHW-MOUSE).
+        private func osClick(_ m: Machine, _ tx: Int, _ ty: Int) {
+            for _ in 0..<80 {
+                let (cx, cy) = osCursor(m)
+                let dx = tx - cx, dy = ty - cy
+                if abs(dx) <= 1 && abs(dy) <= 1 { break }
+                m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                                     dy: Int8(max(-100, min(100, dy))))
+                m.run(until: m.cycles + 200_000)
+            }
+            click(m)
+        }
+
+        /// **Checkpoint I (M5 Task 3) -- the installer's disk scan FINDS the
+        /// Widget.** The furthest STABLE, deterministic install state pinned for
+        /// CI: the full install (initialize + copy + five disk swaps) is too
+        /// long and too stateful to pin, and stalls at the floppy media-change
+        /// boundary (docs/rom-trace-notes.md "Checkpoint H"), so those stages
+        /// are narrative. This anchors the precursor: with a blank Widget
+        /// attached, clicking "Install" drives the OS ProFile driver's
+        /// `PROF_INIT` live for the first time; its device-info handshake
+        /// completes against `WidgetDrive` (§10.2-10.5, reconciled in Task 3),
+        /// and the installer advances from "unable to locate a usable disk" to
+        /// "use the disk attached to the internal connector?". This is the
+        /// end-to-end proof of the WidgetDrive protocol rework.
+        @Test func checkpointI_installClickFindsTheWidgetDisk() throws {
+            let m = try bootIntoLoader()
+            var steps = 0
+            while steps < 10_000_000 && !m.halted { _ = m.step(); steps += 1 }
+            // Sanity: we are at the installer dialog (same anchor as G/H).
+            #expect(fnv1a(m.bus.framebufferSnapshot()) == 0x04a1_9e4e_b597_04f4)
+
+            // Attach a blank Widget-10 in a temp dir (Apple-derived install data
+            // never enters the repo -- a synthetic all-zero image, removed here).
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("checkpointI-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let widget = try WidgetImage(createBlankAt: url, blockCount: 19456)
+            m.bus.widget.attach(widget)
+
+            // Click "Install" (screen pixel ~615,210) via the OS cursor.
+            osClick(m, 615, 210)
+            // Run until PROF_INIT drives the Widget region and the scan settles.
+            var lastFNV: UInt64 = 0, idle = 0
+            for _ in 0..<60 {
+                m.run(until: m.cycles + 5_000_000)
+                let f = fnv1a(m.bus.framebufferSnapshot())
+                idle = (f == lastFNV) ? idle + 1 : 0
+                lastFNV = f
+                if idle >= 6 && m.bus.widget.completedCommands >= 2 { break }
+                if m.halted { break }
+            }
+
+            #expect(!m.halted, "the OS runs live through the Install scan -- no halt")
+            // PROF_INIT ran live: the OS ProFile driver drove $FCD801 and its
+            // device-info handshake completed (was 0/0 on the boot path, G/H).
+            #expect(m.bus.widgetRegionAccesses > 0,
+                    "PROF_INIT drives the $FCD801 region on the Install scan")
+            #expect(m.bus.widget.completedCommands >= 2,
+                    "the device-info handshake completes; got \(m.bus.widget.completedCommands)")
+            // THE ANCHOR: the "use the disk attached to the internal connector?"
+            // dialog -- the installer FOUND the Widget (contrast the pre-rework
+            // "unable to locate a usable disk").
+            #expect(fnv1a(m.bus.framebufferSnapshot()) == 0xb2a6_195e_6a53_2849,
+                    "disk-found dialog FNV; got \(String(format: "0x%016llx", fnv1a(m.bus.framebufferSnapshot())))")
+        }
+
+        /// Runs 5M-cycle bursts until the screen AND all disk I/O are stable, or
+        /// `maxBursts` elapse. The activity term prevents stopping on a static
+        /// "Wait" dialog while a long erase/copy is still running underneath.
+        private func settleInstaller(_ m: Machine, maxBursts: Int) {
+            var lastFNV: UInt64 = 0
+            var lastAct = 0, idle = 0
+            for _ in 0..<maxBursts {
+                m.run(until: m.cycles + 5_000_000)
+                let f = fnv1a(m.bus.framebufferSnapshot())
+                let act = m.bus.widget.completedCommands + m.bus.floppy.blocksRead + m.bus.floppy.writeAttempts
+                idle = (f == lastFNV && act == lastAct) ? idle + 1 : 0
+                lastFNV = f; lastAct = act
+                if idle >= 12 || m.halted { break }
+            }
+        }
+
+        /// **Checkpoint J (M5 Task 3 round 2) -- the floppy media-change swap
+        /// mounts the next disk.** Pins the round-2 subsystem: after the whole
+        /// disk initializes and Office System 1 copies to the Widget, the
+        /// installer prompts for disk 2; inserting it through the REAL media-
+        /// change path (`insertWhileRunning`, which raises the `bot_in` attention
+        /// the OS's `DISK_INT` needs, SONY:469-481) makes the OS mount and READ
+        /// disk 2 -- the exact step that hung in round 1 (blocked `Mount` retry,
+        /// no attention). The full install (all five swaps + reinsert + "software
+        /// installed") stays narrative (too long/stateful for CI, screenshots
+        /// m5-install-*); this pins the stable precursor that proves the swap
+        /// works end to end. Longer than G/H/I (drives the real erase+copy), but
+        /// env-gated like them.
+        @Test func checkpointJ_floppyMediaChangeSwapMountsTheNextDisk() throws {
+            let diskDir = fDiskDir!
+            let disk2Path = diskDir + "/Lisa_Office_System_3.1/682-0097-B_Office_System_3.1_2/682-0097-B_Office_System_3.1_2.dc42"
+            // This checkpoint needs the full 5-disk Office System set, not just
+            // the boot disk G/H/I use. If it isn't present, no-op rather than
+            // fail (the swap subsystem is also covered by FloppyControllerTests).
+            guard FileManager.default.fileExists(atPath: disk2Path) else { return }
+
+            let m = try bootIntoLoader()
+            var steps = 0
+            while steps < 10_000_000 && !m.halted { _ = m.step(); steps += 1 }
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("checkpointJ-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: url) }
+            m.bus.widget.attach(try WidgetImage(createBlankAt: url, blockCount: 19456))
+
+            osClick(m, 615, 210); settleInstaller(m, maxBursts: 40)   // Install (scan)
+            osClick(m, 615, 118); settleInstaller(m, maxBursts: 40)   // use this disk? OK
+            osClick(m, 615, 170); settleInstaller(m, maxBursts: 40)   // not initialized -> Continue
+            osClick(m, 615, 70);  settleInstaller(m, maxBursts: 300)  // Don't Share -> erase + copy disk 1
+
+            #expect(!m.halted, "the OS runs live through erase + disk-1 copy")
+            let readsBeforeSwap = m.bus.floppy.blocksRead
+            #expect(readsBeforeSwap > 1000,
+                    "Office System 1 was copied off the floppy before the swap; got \(readsBeforeSwap)")
+
+            // THE ROUND-2 STEP: insert disk 2 through the real media-change path.
+            let disk2 = try DC42Image.load(url: URL(fileURLWithPath: disk2Path))
+            m.bus.floppy.insertWhileRunning(disk2)
+            m.run(until: m.cycles + 3_000_000)          // let DISK_INT run (bot_in)
+            osClick(m, 615, 118)                         // Continue
+            settleInstaller(m, maxBursts: 60)
+
+            #expect(!m.halted, "the OS runs live through the disk-2 mount + copy")
+            // The media change woke the OS: it mounted disk 2 and READ it (in
+            // round 1 this stayed frozen -- the Mount retry never woke).
+            #expect(m.bus.floppy.blocksRead > readsBeforeSwap + 300,
+                    "disk 2 was mounted and read after the media-change attention; \(readsBeforeSwap) -> \(m.bus.floppy.blocksRead)")
+            // (The OS then unclamps/ejects disk 2 to prompt for disk 3, so
+            // isInserted is legitimately false by here -- the read climb above
+            // is the proof the media change woke the mount.)
+        }
     }
 }

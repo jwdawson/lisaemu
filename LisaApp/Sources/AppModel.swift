@@ -200,6 +200,28 @@ final class AppModel {
         controller?.ejectFloppy()
     }
 
+    // MARK: - Widget hard disk (M5 Task 2): File > Attach/Detach Widget Disk…
+
+    /// File > Attach Widget Disk… -- passthrough to `EmulationController
+    /// .attachWidget(url:)`. Unlike the floppy, a Widget image persists writes
+    /// to its file (write-back, §10.10); a missing path is created as a blank
+    /// on demand.
+    func attachWidget(url: URL) {
+        controller?.attachWidget(url: url)
+    }
+
+    /// File > Detach Widget Disk…
+    func detachWidget() {
+        controller?.detachWidget()
+    }
+
+    /// Pure predicate behind the Widget open/drop filter -- a `.widget`
+    /// (or `.image`) file. Mirrors `isDC42File`.
+    nonisolated static func isWidgetFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ext == "widget" || ext == "image"
+    }
+
     /// Dismisses `diskError`'s alert (`ScreenView.swift`) -- see that
     /// property's doc comment for why it's dismissible, unlike
     /// `startupError`.

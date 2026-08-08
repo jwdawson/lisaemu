@@ -11,4 +11,7 @@ LisaApp/LisaApp.xcodeproj/
 # inline `info.properties` at generate time -- generated output, not
 # hand-authored, same as the .xcodeproj above.
 LisaApp/Info.plist
+# App-icon / image assets stay local until image provenance + Apple-logo
+# trademark concerns are resolved (see M5 Task 5 review); kept on disk untracked.
+LisaApp/Media.xcassets/
 .swiftpm/

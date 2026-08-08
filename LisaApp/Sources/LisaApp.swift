@@ -41,6 +41,23 @@ struct LisaEmuApp: App {
                 Button("Eject") {
                     model.ejectFloppy()
                 }
+
+                Divider()
+
+                // M5 Task 2: the Widget hard disk. "Choose" opens an existing
+                // image; "Create Blank" makes a fresh Widget-10 image and
+                // attaches it (the installer then formats-and-populates it).
+                // Widget writes PERSIST to the file (write-back, §10.10) --
+                // unlike the floppy's read-only session overlay.
+                Button("Choose Widget Image…") {
+                    presentChooseWidgetPanel()
+                }
+                Button("Create Blank Widget Image…") {
+                    presentCreateWidgetPanel()
+                }
+                Button("Detach Widget") {
+                    model.detachWidget()
+                }
             }
             CommandGroup(after: .saveItem) {
                 Button("Save Screenshot…") {
@@ -127,6 +144,46 @@ struct LisaEmuApp: App {
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
             model.insertFloppy(url: url)
+        }
+    }
+
+    /// File > Choose Widget Image… (M5 Task 2): opens an existing `.widget`
+    /// hard-disk image and attaches it. Same `UTType(filenameExtension:)`
+    /// pattern as `presentInsertDiskPanel`.
+    @MainActor
+    private func presentChooseWidgetPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [UTType(filenameExtension: "widget") ?? .data]
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            model.attachWidget(url: url)
+        }
+    }
+
+    /// File > Create Blank Widget Image… (M5 Task 2): `NSSavePanel` for a
+    /// destination path; `attachWidget(url:)` then CREATES an all-zero blank
+    /// Widget-10 image there on demand (§10.10) and attaches it. Default
+    /// directory is the same repo-sibling artifacts dir screenshots use --
+    /// never inside the repo (Global Constraint: never commit images).
+    @MainActor
+    private func presentCreateWidgetPanel() {
+        let artifactsDir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Development/LisaEmu-artifacts")
+        try? FileManager.default.createDirectory(at: artifactsDir, withIntermediateDirectories: true)
+
+        let panel = NSSavePanel()
+        panel.directoryURL = artifactsDir
+        panel.nameFieldStringValue = "LisaEmu-Widget.widget"
+        panel.allowedContentTypes = [UTType(filenameExtension: "widget") ?? .data]
+        panel.canCreateDirectories = true
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            // A brand-new path -> attachWidget creates the blank on demand.
+            model.attachWidget(url: url)
         }
     }
 }

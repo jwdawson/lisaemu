@@ -845,6 +845,64 @@ extension LisaShellMusashiSuites {
             let sawActivity = waitForStatus(controller) { $0.diskActivity }
             #expect(sawActivity, "diskActivity should flip true once the floppy finishes processing the nulcmd go-byte")
         }
+
+        // MARK: M5 Task 2 -- attachWidget/detachWidget through the mailbox seam
+
+        /// A raw N x 532-byte all-zero Widget image file (512 data + 20 tag
+        /// per block), written by hand -- LisaShellTests can't reach
+        /// `LisaCore.WidgetImage` through its non-`@testable import LisaCore`,
+        /// so this mirrors `makeSyntheticDC42File`'s hand-built-bytes shape.
+        private func makeBlankWidgetFile(blockCount: Int = 4) throws -> URL {
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("EmulationControllerWidgetTests-\(UUID().uuidString).widget")
+            try Data(count: blockCount * 532).write(to: url)
+            return url
+        }
+
+        @Test
+        func attachWidgetOpensExistingImageAndDetachReleasesIt() throws {
+            let controller = try makeController()
+            let widgetURL = try makeBlankWidgetFile()
+            defer { try? FileManager.default.removeItem(at: widgetURL) }
+
+            controller.attachWidget(url: widgetURL)
+            #expect(controller.debugSync { $0.bus.widget.isAttached },
+                    "attachWidget(url:) should attach the image to the live Machine's WidgetDrive")
+
+            controller.detachWidget()
+            #expect(controller.debugSync { !$0.bus.widget.isAttached },
+                    "detachWidget() should release the image")
+        }
+
+        @Test
+        func attachWidgetCreatesBlankImageOnDemandWhenFileIsMissing() throws {
+            let controller = try makeController()
+            let widgetURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("EmulationControllerWidgetTests-new-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: widgetURL) }
+            #expect(!FileManager.default.fileExists(atPath: widgetURL.path))
+
+            controller.attachWidget(url: widgetURL)   // path does not exist -> blank on demand (§10.10)
+            #expect(controller.debugSync { $0.bus.widget.isAttached })
+            #expect(FileManager.default.fileExists(atPath: widgetURL.path),
+                    "a missing Widget path should be created as an all-zero blank image (§10.10)")
+            let size = try FileManager.default.attributesOfItem(atPath: widgetURL.path)[.size] as? Int
+            #expect(size == 19456 * 532, "the on-demand blank should be the default Widget-10 geometry")
+        }
+
+        @Test
+        func attachedWidgetSurvivesReset() throws {
+            let controller = try makeController()
+            let widgetURL = try makeBlankWidgetFile()
+            defer { try? FileManager.default.removeItem(at: widgetURL) }
+
+            controller.attachWidget(url: widgetURL)
+            #expect(controller.debugSync { $0.bus.widget.isAttached })
+
+            controller.reset()   // warm reset -- media survives by construction
+            #expect(controller.debugSync { $0.bus.widget.isAttached },
+                    "an attached Widget must survive reset() (same warm-reset design as the floppy)")
+        }
     }
 }
 

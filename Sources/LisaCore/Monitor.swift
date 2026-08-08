@@ -14,6 +14,19 @@ public struct Monitor {
         /// 2's relocation model; see `LinkmapSymbols.swift`'s doc comment
         /// "base-offset story").
         case symbase(UInt32)
+        /// `widget create <path>` (M5 Task 2) -- creates a fresh all-zero
+        /// Widget-10 hard-disk image at `<path>` and attaches it, so the
+        /// installer can format-and-populate a blank disk (§10.10).
+        case widgetCreate(String)
+        /// `click <x> <y>` (M5 Task 3) -- feedback-steer the cursor to screen
+        /// pixel `(x,y)` and press/release the mouse button. Unlike `bootdisk`'s
+        /// ROM-menu clicks (which steer the ROM cursor cells `$496`/`$498`),
+        /// this drives the OS's own cursor once the OS is running -- see
+        /// lisadbg's `osCursor`/`clickAt`.
+        case click(Int, Int)
+        /// `type <text>` (M5 Task 3) -- injects `text` as COPS keyboard
+        /// make/break events (with Shift for uppercase / shifted symbols).
+        case type(String)
         case quit, help
     }
 
@@ -60,6 +73,20 @@ public struct Monitor {
                     return .sym(a)
         case "symbase": guard let a = hex(1) else { return nil }
                         return .symbase(a)
+        case "widget":
+            // `widget create <path>` -- only sub-command today.
+            guard parts.count >= 3, parts[1] == "create" else { return nil }
+            // Rejoin the tail so paths containing spaces survive the split.
+            let path = parts[2...].joined(separator: " ")
+            return .widgetCreate(path)
+        case "click":
+            // Decimal screen pixel coordinates (unlike the hex address args).
+            guard parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]),
+                  x >= 0, y >= 0 else { return nil }
+            return .click(x, y)
+        case "type":
+            guard parts.count >= 2 else { return nil }
+            return .type(parts[1...].joined(separator: " "))
         case "q": return .quit
         case "?": return .help
         default:  return nil

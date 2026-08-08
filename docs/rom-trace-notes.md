@@ -1752,7 +1752,7 @@ above (evidence + citations).
 |---|---|---|
 | **OQ1** | Does SLIM/SORG register programming target the CURRENT (active) domain, or an "inactive domain" per the original M1a hardware-notes transcription? | **ANSWERED** (M3 Task 2) — the CURRENT (active) domain, source-established (`initmmutil`/`do_an_mmu` both establish-then-program). The "inactive domain" reading is refuted; hardware-notes.md §1 carries the strike-through. See "OQ1 status" above. |
 | **OQ1′** | Checkpoint D's domain-1 crossover: how does `do_an_mmu`'s own code stay reachable the instant it switches the live context into an empty domain? | **RESOLVED** (M3 Task 4) — supervisor-mode code EXECUTION always translates through domain 0, regardless of the context latch; the latch only gates user-mode accesses. Implemented as `Bus.translationDomain`. Supersedes the Task 2 "per-domain vs. global segment presence" framing — it is neither, it is supervisor-vs-user. See "Kernel push (M3 Task 4)" above. |
-| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | ~~**OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet.~~ **ANSWERED (M4 Task 4 round 5)** — forces domain 0, same as execution. Captured live at Checkpoint G: ~1.02 M supervisor data accesses (kernel-stack pushes, SYSGLOBAL + autovector reads inside ISRs) with the latch at 1 to segments domain 1 maps ABSENT, every one resolved via domain 0; a latch-following model could not survive the first interrupt during user execution (fatal-on-supervisor-fault rule, SOURCE-EXCEPRES:227-232). Residual falsifier (a both-present-differing supervisor data access) documented in "Checkpoint G … OQ1″ — ANSWERED (round 5)". |
+| **OQ1″** | Does supervisor **DATA** access (not code execution) to a user domain follow the context latch, or also force domain 0? | ~~**OPEN**, registered M3 Task 4 review. No traced path exercises supervisor data access to a non-zero domain yet.~~ **ANSWERED (M4 Task 4 round 5)** — forces domain 0, same as execution. Captured live at Checkpoint G: ~1.02 M supervisor data accesses (kernel-stack pushes, SYSGLOBAL + autovector reads inside ISRs) with the latch at 1 to segments domain 1 maps ABSENT, every one resolved via domain 0; a latch-following model could not survive the first interrupt during user execution (fatal-on-supervisor-fault rule, SOURCE-EXCEPRES:227-232). Residual falsifier (a both-present-differing supervisor data access) documented in "Checkpoint G … OQ1″ — ANSWERED (round 5)". **M5 close (Task 5):** the Widget-boot run (Checkpoint K) exercised no both-present-differing supervisor data access either, so the falsifier stays UNOBSERVED and the row stands — see "Checkpoint K … Boundary / carry-forward". |
 | **OQ2** | How does the ROM reach ROM/special space (segments 125-127) in translated mode — exact SLIM/SORG values? | **ANSWERED** (M1b Task 5) — seg 127 (prom) SLIM `$F00`/nibble `$F`; seg 126 (iospace) SLIM `$901`/nibble `$9`; seg 125 (screen) left absent at setup-drop. See "Answers to the Task 5 open questions" above. Unrelated to M3's MMU work; listed here only for a complete OQ roster at milestone close. |
 | **OQ3** | Does board-ID `$C031 == 0x00` send POST down a sane (non-error) path? | **ANSWERED** (M1b Task 5) — yes, the pre-Pepsi path, benign. See "Answers to the Task 5 open questions" above; unrelated to M3, listed for completeness. |
 
@@ -2294,3 +2294,363 @@ changes (processes exist); user-mode execution with domain latch 1 (OQ1″);
 `blocksWritten == writeAttempts` (session write-through, nothing dropped);
 `blocksRead >= 600`; and the framebuffer equals the installer-dialog anchor
 (FNV `0x04a19e4eb59704f4`, 60,107 set px).
+
+## Checkpoint H prep (M5 Task 1) — the installer's disk scan finds no hard disk
+
+Goal: confirm, live, the ProFile/Widget **attach-path conditional** derived in
+docs/hardware-notes.md §10.9 — does the OS ever build a hard-disk devrec or
+probe the parallel/Widget VIA on our machine today? Method: a scratch harness
+(reusing `checkpointG`'s boot-to-installer mechanism) single-stepped the
+boot-to-installer window (10 M instructions after the loader gate) and drained
+`Bus.ioTrace` per step, histogramming every I/O-space offset the CPU touched
+with the PC that touched it. The harness and its two throwaway instrumentation
+hooks (`Bus.clearIOTraceScratch`) were reverted before commit; the numbers
+below are reproduced from that run.
+
+**Scope caveat (honest boundary).** This window reaches the installer **dialog**
+(idle, waiting for a click), the same anchor `checkpointG` pins. Scripted
+mouse-clicking "Install" is Task 3 (not built yet), so the *post-click* scan
+is not itself driven here. But the **attach decision** — whether a hard-disk
+devrec exists to be found — is made at BOOT_IO_INIT/config time, inside this
+window. That is what is observed.
+
+### OBSERVED (instruction-level trace)
+
+- **Machine-identity reads.** `$FCC031` read 5× and `$FCC015` read 1× during
+  the OS phase (e.g. PC `$520688`/`$52067E` and `$2628D8`). These are
+  BOOT_IO_INIT + MACH_INFO reading the identity bytes (hardware-notes §10.9,
+  STARTUP:1876-1891, CD:644-648). Values served: `$FCC031 = $88`,
+  `$FCC015 = 1` ⇒ the OS decodes `iomodel = iob_pepsi` (Lisa 2/10).
+- **Expansion-slot probe (CARDS_EQUIPPED).** The low-select slot-ident windows
+  `$FC0001`, `$FC4001`, `$FC8001` were each read from PC `$2618D6`/`$2618F6`
+  (EXISTS_CARD then GET_ID_FIELD over slots 0/1/2, CD:563-571). All returned
+  the unmapped-I/O `0xFF` ⇒ no expansion cards, so no slot-based ProFile.
+- **The built-in ProFile driver window is NEVER touched.** `$FCD801`
+  (PROFASM `HWBASE`) and `$FCDC01`/`$FCDC05` (`HWSTATUS`/`hwddrb`) — the exact
+  addresses PROFILE hdinit computes for the built-in port (hardware-notes
+  §10.1, PROFILE:253-256) — recorded **zero** accesses across the whole
+  window (`anyBuiltinCtl = false`). **PROF_INIT / PROFASM never execute.**
+  This is the decisive confirmation: no hard-disk handshake is ever issued.
+- **VIA1 (`$FCD901` mirror) *is* accessed — but not as ProFile.** Offset
+  `$D901`+ saw heavy traffic, dominated by `IFR` (`$D969`, ~9 k reads at PC
+  `$5208B8`) and `IER` (`$D971`, PC `$5208CA/$5208F4`) — the signature of the
+  OS's **level-1 interrupt servicing** on VIA1 (§5), *not* the ProFile
+  handshake. The handshake's distinguishing register pattern — `DDRA`
+  (`$D919`) direction flips, `PORTA` (`$D979`) byte exchanges, `T2CH`
+  (`$D949`) disconnect timer — is essentially absent (`$D919` 4×, `$D979` 1×,
+  `$D949` 0×). The other `$D901` traffic is the ROM/loader **floppy** boot
+  handshake reading PB6 (PC `$FE1E24`, `$1000BE`), already documented in §9
+  (`disk_control` idle bit) — likewise not ProFile.
+
+### INFERRED (source reading, hardware-notes §10.9) — one part REFUTED by M5 Task 2
+
+- No `PROF_INIT` runs because **no `cd_intdisk` (or `cd_paraport`) hard-disk
+  devrec is built** on the boot/STARTUP path: on `iob_pepsi` the external
+  parallel port is refused (`cdnoparaport`, CD:1006-1013), and the BOOT_IO_INIT
+  builtin loop creates only Twiggy floppy devrecs, never a hard disk
+  (STARTUP:1950-2006). *(This much stands.)*
+- ~~The internal-disk devrec is created only from a parameter-memory
+  `cd_intdisk` entry (CD:1030); therefore the installer's "can't find a
+  suitable disk" is the app scanning `configinfo` for a `diskdev` target.~~
+  **REFUTED (M5 Task 2, Task-1 Q2; struck, not erased).** See hardware-notes
+  §10.9a: the installer does **not** read configinfo/PM to find disks — it
+  builds a candidate list from `machineType.io_board` (slot 12 for `IOpepsi`,
+  APIN-OFFICE:3005-3040), **`CDMake`s the `cd_intdisk` devrec itself** with zero
+  PM (APIN-OFFICE:2944-2946 → CD:1366-1428 → NEW_DEVICE CD:1030), then tests via
+  FS `LookUp`/`Mount` (APIN-OFFICE:3044-3055, 3111-3113). PM is an *output* of a
+  completed install (`CheckPMList`/`PMWrite`, APIN-OFFICE:3141), consumed only
+  by the *next* boot's `INIT_CDS` (CD:1758-1935). So no PM model is needed for
+  the installer to find the disk.
+
+### Checkpoint H (M5 Task 2) — OBSERVED with a Widget attached
+
+`ROMFloppyBootTests.checkpointH_widgetAttachedDoesNotDriveTheRegionOrMoveThe
+Installer` boots the checkpoint-G window **with a `WidgetDrive` + blank
+`WidgetImage` attached** on VIA1 (decode now widened to `$FCD801`/`$FCDC01`/
+`$FCDC05`). OBSERVED:
+
+- `bus.widgetRegionAccesses == 0` and `bus.widget.completedCommands == 0`: the
+  OS/ROM **still never touches the `$FCD801`/`$FCDC01` region** on the boot-to-
+  installer-*dialog* path, even with a Widget present. Attaching hardware alone
+  does not provoke `PROF_INIT` — consistent with §10.9a (the driver is built +
+  driven by the installer's `CDMake`/`Mount` scan, which runs on the *Install
+  click*, not before). The `$FCD801` mirror the driver drives is therefore
+  **still UNOBSERVED**; `IODispatcher.firstWidgetRegionAccessCycle` will capture
+  it the first time Task 3's scripted Install reaches the scan.
+- The installer dialog is **byte-identical** with a Widget attached (FNV
+  `0x04a19e4eb59704f4`, same as checkpoint G). Attaching a Widget does **not**
+  move the boot menu / installer UI — no re-anchoring needed (contrast the M2
+  floppy-devrec precedent, where a new boot device *did* move the menu).
+
+### Bottom line
+
+The live branch matches the derived conditional: **identity `$88`/`1` →
+`iob_pepsi` → no ProFile devrec on the boot path → no `$FCD801` probe → the
+installer dialog draws.** Closing this (Checkpoint H proper) needs only (a) the
+Widget device model answering §10.1-10.7 at `$FCD801` (**M5 Task 2, done**) and
+(b) driving the installer far enough to run its own `SetDevices`/`CDMake`/
+`MountInit` scan (**Task 3** — the Install click). It does **not** need a
+parameter-memory model (the refuted half above).
+
+### Checkpoint H (M5 Task 3) — the install DRIVEN; disk found; the swap boundary
+
+Task 3 scripted the **Install** click for the first time (via the OS cursor —
+see below) with a blank Widget attached, and drove the installer as far as the
+evidence-grounded device allows. Anchored by `checkpointI_installClickFindsThe
+WidgetDisk` (the stable precursor); the stages past it are **narrative**
+(screenshots at `~/Development/LisaEmu-artifacts/m5-install-*.png`).
+
+**Driving the OS UI (OBSERVED).** The ROM boot-menu cursor cells `$496`/`$498`
+that `bootdisk`/`moveCursor` steer go **dead once the OS runs** (they read
+`$FFFF`). The OS keeps its live cursor at **physical RAM `$3CF0`** (`MousX`
+high word / `MousY` low word, LIBHW-MOUSE `MouseLocation`), clamped to
+`[0,719]×[0,363]`, **scaled 3/2 coarse on X** (found by homing + differential
+RAM scan). Feedback-steering that global (halve the X step) places the cursor
+on any installer button; the mouse button is COPS keycap `$06`. This is the
+`click <x> <y>` primitive added to `lisadbg`.
+
+**The scan, RECONCILED (OBSERVED → device fix).** The Install click runs the OS
+ProFile driver's `PROF_INIT` **live for the first time** (first `$FCD801` touch
+at cycle ≈154.7 M). Against the M5 Task 2 HLE it spun **1.5 M region accesses,
+0 completions**, then the installer alerted **"unable to locate a usable
+disk… the internal disk was not ready in time"**. Root cause — the Task-2 HLE
+transcribed a *contract* whose transport diverged from what the driver actually
+does. Traced against SOURCE-PROFILEASM and reconciled (hardware-notes §10.2-10.5,
+strike-not-erase):
+
+- **BSY = Port B bit 1, a LEVEL** the driver polls (`WAIT_BUSY`/`WAIT_NOTBUSY`,
+  PROFASM:1618-1651): idle/ready = 1 (CMD deasserted), 0 when CMD asserted. (The
+  old model held it 0 forever → `WAIT_NOTBUSY`'s ~16 s spin.)
+- **Response codes on PORTA (VIA reg 15, no-handshake)**; the `$55` reply is
+  written back there (`DOSHAKE`, PROFASM:1663). **Data/status on IRA (reg 1,
+  auto-advancing)**; command bytes out on ORA (reg 1).
+- **`PROF_INIT` device-info** (block `$FFFFFF`) is not a 512+20 block; absolute
+  offsets into the IRA stream (status bytes included): 4 status (0-3), 14 skip
+  (4-17), **DRIVETYPE @ byte 18**, 3 skip (19-21), **3-byte DISCSIZE @ bytes
+  22-24** (PROFASM:1596-1613) → we answer drivetype 0 + discsize = 19456
+  (T_Seagate).
+- **Read byte ORDER** (NEW_CMD, PROFASM:150-159): **status (4, S6) FIRST**, then
+  header (20) + data (512, S7). **Write byte ORDER** (S10, PROFASM:687-707):
+  **header (20, WRHDR) FIRST**, then data (512, WRDATA); the driver then does a
+  **read-back verify** (S13/S1, PROFASM:167-168).
+
+With those fixed, `PROF_INIT`'s device-info handshake **completes** and the
+installer FINDS the disk: **"Do you want to use the disk attached to the
+internal connector?"** (`checkpointI`, disk-found FNV `0xb2a6195e6a532849`).
+
+**Install stages driven (OBSERVED, narrative).** OK → *"disk … not initialized …
+Continue"* → *"use part of the disk with MacWorks? Don't Share"* → **the whole
+19456-block disk is erased/initialized** (all writes persist to the image; the
+read-back verify passes) → the **Office System startup software is copied from
+the floppy to the Widget** (floppy reads climb into the thousands, Widget write
+commands past 20 000, interleaved 5:1 per the T_Seagate `remap_interleave`
+path, PROFILE:271/298) → **"Please insert the Lisa Office System 2 micro
+diskette"** — the first media swap.
+
+**BOUNDARY — the floppy media-change / remount attention (documented, not
+faked; wording corrected in fix round 1).** At the "insert disk 2" prompt the
+installer is in an **app-level `Mount` retry loop behind an `AskAlert`**
+(APIN-OFFICE:~2131-2159): it keeps re-attempting to mount the floppy and
+re-shows the alert until a *new* disk mounts. Observably the OS scheduler idles
+(`$2E2BF8`) and the installer spins (`$CC4BDC`) with **zero hardware I/O** in
+the sampled window — but that is the retry loop between alert dismissals, **not
+a bare spin-poll of a register**; the earlier "blocked process… not a poll"
+phrasing was imprecise. The loop can never succeed because the OS's cached
+`disk_present` never flips for the swapped-in disk. **What flips it at runtime
+is the `bot_in` media-change interrupt, which our `FloppyController` does not
+raise:** the Sony driver's runtime disk-present latch is updated only by
+`DISK_INT` (SONY:469-481 — sets `disk_present := gooddisk` and `KEYPUSHED`
+*even with no pending I/O*), fired off the VIA's separate `bot_done`/`bot_in`
+status bits (SONY:84-90; SONYASM:22-23 "INTERRUPT SOURCE"). The synchronous
+presence probe `ISDISKIN` is explicitly **"Call only during initialization"**
+(SONYASM:431-442, sole caller `hdinit`), so nothing re-reads `DISKIN` at
+runtime — the interrupt is the *only* path. Ejecting/inserting disk 2 through
+the real `FloppyController.eject()`/`insert()` (presence bits only, the same
+path `EmulationController` uses) does not raise it, and neither does a floppy
+**command-completion** interrupt (which is a distinct event; we raise only
+those, for read/write). The exact unsatisfiable condition: **a mid-run floppy
+media change must fire the `bot_in`/`DISKSTAT` media-change interrupt so
+`DISK_INT` updates `disk_present` and the app's `Mount` retry succeeds.** Our
+`FloppyController` models only command-completion interrupts and treats the OS
+eject (`unclamp`) as a no-op — never needed before, because every prior
+milestone booted from a single disk present at power-on. ~~Closing it is a
+follow-on frontier.~~ **RESOLVED in round 2 (below).**
+
+### Checkpoint H (M5 Task 3 round 2) — the media-change swap; install COMPLETES
+
+The round-1 "boundary" was in-scope floppy work, now implemented and driven to
+completion (hardware-notes §9 media-change; `FloppyController`):
+
+- **`bot_in` media-change attention.** `insertWhileRunning(_:)` raises a level-1
+  floppy interrupt with `int_stat` = `bot_int|bot_in` (no `bot_done`); the OS's
+  `DISK_INT` (SONY:469-481) sets `disk_present := gooddisk` + `KEYPUSHED`, waking
+  the installer's blocked `Mount` retry so it mounts the new volume. The mailbox
+  `insertFloppy` uses this path; bare `insert(_:)` stays the power-on-quiet path
+  so every boot pin is unmoved. The OS-commanded eject (`excmd` `unclamp`, SONY
+  `dskunclamp`:679-688) now actually removes the media and completes with
+  `bot_done` (the other half — struck the old no-op).
+- **Boot-disk write-session retention.** The very last install step reinserts
+  the boot disk; `boot_remount` (FSINIT2:466-468) compares the reinserted disk's
+  MDDF `overmount_stamp`/`mountinfo` to the in-memory boot MDDF, and a pristine
+  `.dc42` carries the OLD stamp → `E_BT_REMOUNT` (1144). A real diskette retains
+  the boot-time writes physically; `FloppyController.exportSessionOverlay()`/
+  `importSessionOverlay(_:)` model that — snapshot the boot disk's write session
+  before the swaps, restore it on reinsert. `boot_remount` then re-verifies and
+  the install finalizes (write boot tracks + `system.=` files).
+
+**OBSERVED (narrative, screenshots `m5-install-01..08`).** Install click →
+disk found → OK → initialize → Don't Share → **whole 19456-block disk erased +
+Office System 1 copied** → swaps **2,3,4,5** each via the real media-change path
+(`insertWhileRunning` → `bot_in` → `DISK_INT` mounts → the OS reads+copies each,
+floppy reads climb ~700/disk, Widget write-commands past 24 000) → **reinsert
+boot disk** (session restored) → boot tracks + `system.=` written →
+**"The Lisa Office System software has been installed"** (alert 128,
+APIN-OFFICE:2282). The installed 10 MB image (bootable; block 0 = `4EFA…` boot
+block) is left at `~/Development/LisaImages/OS31-installed.widget` for Task 4.
+`checkpointJ` pins the media-change integration (disk-2 mount+read after the
+swap — the exact round-1 hang); the full run stays narrative (too long/stateful
+for CI).
+
+### Bottom line (Task 3)
+
+The Widget hard-disk HLE + the floppy media-change subsystem carry the Office
+System install **to completion**: `PROF_INIT` finds the Widget, the disk
+initializes (19456 blocks, persisted), Office System 1-5 copy across five real
+disk swaps, the boot disk reinserts and re-verifies, and the installer reports
+"software has been installed" — leaving a bootable 10 MB image for Task 4.
+`checkpointI` pins the disk-found precursor and `checkpointJ` the first media-
+change swap; the full multi-swap run stays narrative (screenshots).
+
+## Checkpoint K (M5 Task 4) — THE DESKTOP: the installed OS boots off the Widget ⭐
+
+The spec's M4 north star, reached over the Widget: the **installed** Office
+System (`~/Development/LisaImages/OS31-installed.widget`, built by the Task 3
+installer) boots from the hard disk through the boot ROM's OWN parallel-port
+boot path — a code path never before exercised on our machine — all the way to
+the Office System desktop (menu bar + icons) with live mouse. Reproduce with
+`swift run -c release lisadbg --rom ~/Development/LisaROMs --widget <copy>.widget`
+then the `click`/`g`/`sc` sequence in docs/m5-demo.md; pinned by
+`ROMWidgetBootTests.checkpointK_romBootsInstalledOSOffTheWidget` (env-gated on
+`LISAEMU_ROM_DIR` + `LISAEMU_WIDGET_DIR`).
+
+### The ROM boots ProFile-family disks through `prof_entry` ($FE1F70), base $FCD901
+
+The ROM does not auto-boot (checkpoint C): STARTUP FROM → device item. The boot
+device jump table (`$FE0090`) resolves **prof_entry = `$FE1F70`** (vs twig_entry
+= `$FE1D76` for Sony/floppy). `prof_entry` is the ROM's own ProFile parallel
+read routine, and it drives the parallel port at VIA1 base **`$FCD901`** (stride
+8) — NOT the OS driver's `$FCD801` (§10.1). Disassembly (the citation source is
+OBSERVED ROM behaviour; the .BIN is genuine):
+
+```
+FE1FF0: (setup) A3 = $FCDD81 (VIA2): ORB2|=$A0, DDRB2|=$A0
+        A0 = $FCD901 (VIA1): PCR($60) masked; DDRA($18)=0 (PORTA all input=data
+        bus); PORTB bits 3,4 driven (bit4=CMD active-low, bit3=DIR); DDRB($10) set
+FE1F82: btst #1,(A0)      ; poll BSY = VIA1 PORT B bit 1  (== §10.2 BSY!)
+FE2048: (send command)    ; command block staged at RAM $304, response read back
+FE1FC6: andi.l #$c140c000 ; the SAME ProFile ERRSTAT error mask WidgetDrive uses
+FE2032: move.b ($8,A0)... ; read data bytes off PORTA reg 1 ($FCD909)
+```
+
+So the ROM speaks the **same** ProFile wire protocol as the OS `PROFASM` driver
+(BSY on PORT B bit 1, CMD/DIR strobe, `$C140C000` status mask) — just through
+the `$FCD901` alias, which `viaRegisterIndex` already decodes to the same
+physical VIA1 register file as `$FCD801`. Data and BSY *reads* therefore already
+reached `WidgetDrive` (same VIA instance, PORTA/PORTB inputs wired to the drive).
+
+### The one divergence, root-caused and fixed: the $FCD901 Port-B WRITE forward
+
+`WidgetDrive`'s CMD/DIR strobe is driven by PORT-B (ORB, register 0) **writes**,
+which `IODispatcher` forwards to `widget.portBWrite`. That forward was gated to
+`$FCD801`/`$FCDC01` only — the `$FCD901` alias was **excluded** (a Task-3 guard,
+"the Widget must not react to floppy-path Port B traffic"). That exclusion also
+silently blocked the ROM's legitimate boot probe: the ROM bit-banged CMD at
+`$FCD901`, the strobe never reached the drive, BSY never answered, and
+`prof_entry` timed out (error `$50`/`$51` at `$FE1F7E`/`$FE1F8C`). **Observed
+symptom (the one this fix moves):** STARTUP FROM listed only the floppy (⌘2); after
+the fix the **Internal Hard Disk (⌘1)** appears in that device list.
+**Decoupling note (M5 Task 5):** this fix changes the **menu-time** device
+listing (the `$FCD901` boot probe run when you open STARTUP FROM), and *only*
+that. It does **not** touch the **POST-time** power-on boot menu, whose
+crossed-out ProFile icon labelled **"42"** (the no-boot-device indicator, §"The
+screen: the classic Lisa startup menu…") is drawn before any STARTUP FROM
+selection and remains unchanged — the M5 power-on menu framebuffer `m5-boot-01`
+is **byte-identical to the M1b anchor** (FNV `0xd09234d25516d0b8`, 78,100 set px,
+crossed-out "42" and all). Earlier phrasing that paired "STARTUP FROM lists only
+the floppy" with "the main-menu ProFile icon stayed crossed-out" as a single
+symptom conflated the two probes; only the menu-time listing is a function of
+this change. **Fix** (evidence-gated, `IODispatcher
+.isWidgetPortBOffset`): forward PORT-B (index-0) writes for the `$FCD901` alias
+too — they are the *same physical register* on real hardware, so writing CMD/DIR
+through either base drives the same pins. The floppy path only *reads* VIA1 PB6
+(`$FE1E04`, DDR-masked input) and never writes the CMD bit, and the forward is a
+no-op while the Widget is detached — so the no-widget floppy checkpoints (E/G,
+menu/loader anchors) and the widget-attached install (I/J) are all unmoved
+(full matrix green). TDD: `IODispatcherTests
+.widgetPortBStrobeRoutesThroughTheROMParallelBaseD901` (the alias reaches the
+drive) + `...ForwardIgnoresNonPortBVia1Offsets` (DDR/timer writes never phantom-
+strobe CMD).
+
+### OBSERVED — the whole boot, off the hard disk
+
+After the fix, STARTUP FROM lists the **hard disk (⌘1)** above the floppy (⌘2)
+(`m5-boot-02-device-list.png`). Clicking it:
+
+1. **`prof_entry` reads block 0** off the Widget and JMPs into the LFS boot
+   block, exactly as the floppy path does for its `4E FA …` block — the OS
+   loader then pulls its code + the LFS off the Widget: `completedCommands`
+   climbs into the **hundreds** of single-block ProFile reads (~669 by the time
+   the loader hands to the OS, ~1400 by the desktop), every one served by
+   `WidgetDrive`. PC leaves ROM into loaded RAM/translated code (`$2Exxxx`,
+   `$46xxxx` `[NEWSEG1.*]`, `$52xxxx`, `$C8xxxx`) — **the 22 app Linkmaps now
+   resolve LIVE** (`[NEWSEG1.DOPAGEBR]`, `[lmfiler.DOCCONSI]`, `[fpelems.RANDOMX]`
+   …): spec §4's UNIT.PROC overlay finally has data (the merged-table ambiguity
+   minor did NOT bite — names resolve cleanly).
+2. **OS boot progress** (the hourglass, `m5-boot-03`).
+3. The OS reaches its UI layer and draws a genuine Office System dialog:
+   **"The startup disk was in use when the Lisa failed … Don't Check / Power
+   Off"** (`m5-boot-04-dirty-volume-dialog.png`) — the normal dirty-volume
+   (unclean-shutdown) warning, expected because a boot marks the LFS volume
+   in-use (and this is a fresh copy). Clicking **Don't Check** (live OS cursor,
+   MousX/MousY `$3CF0`) skips the scavenger and boots on.
+4. **THE DESKTOP** (`m5-boot-06-desktop.png`): the Desktop Manager draws the
+   menu bar **Desk / File/Print / Edit / Housekeeping** and the desktop icons
+   **Preferences, Wastebasket, Clipboard, Internal Hard Disk** (the last is the
+   Widget itself). A first-boot **"Note: The Lisa clock/calendar is not set
+   properly"** dialog draws (`m5-boot-05`, no RTC set); **clicking its OK button
+   dismisses it** — proving **live mouse** (a modal dialog answered by a click).
+
+**Exit bar MET.** The Office System desktop is drawn from a Widget boot with
+mouse live. The screen has left the boot-menu anchor
+(FNV ≠ `0xd09234d25516d0b8`); the boot runs live with no halt.
+
+### Boundary / carry-forward
+
+- The dirty-volume + clock-note dialogs are genuine OS first-boot notices, not
+  emulator faults — dismissed by the documented clicks. A future nicety: seed a
+  clean `overmount`/RTC so they don't appear, but that is content-shaping, not a
+  boot blocker.
+- No RTC (COPS clock) is modeled, hence the clock note; orthogonal to the boot.
+- **OQ1″ residual falsifier — still not surfaced (M5 Task 5 check).** The Widget
+  boot runs `prof_entry` in supervisor/domain-0 and the OS across domains 0/2,
+  but it exercised **no** supervisor DATA access to a segment mapped
+  present-but-different across domains (the one event class that could distinguish
+  forced-domain-0 from latch-following — see "Checkpoint G … OQ1″ — ANSWERED
+  (round 5)"). So the residual falsifier row **stands**: OQ1″ remains ANSWERED
+  (forced domain 0), with the both-present-differing case still the documented
+  revisit point for `Bus.translationDomain` if ever observed.
+- `checkpointK` pins the robust behavioural proof (hundreds of Widget reads +
+  booted code outside ROM + screen left the menu), not an exact desktop FNV: the
+  desktop is reached only after two click-through dialogs whose feedback-loop
+  timing makes an exact-cycle framebuffer anchor fragile for CI. The desktop
+  itself is the narrative artifact (`m5-boot-06`, docs/m5-demo.md).
+
+**Standing frontier at M5 close.** Checkpoint K is this document's current
+frontier statement: the Office System **desktop is drawn from a Widget boot with
+the mouse live** — the spec's M4 ⭐, reached. What lies beyond it is not a stalled
+boundary but unexercised surface: the desktop's apps (Filer operations, launching
+LisaWrite/LisaDraw — the Linkmaps now resolve live to annotate them), a modeled
+RTC so the clock/calendar note stops appearing (the north star's "working clock"
+clause, the natural M6 headline), and the multi-block/`T_Widget` protocol path
+(§10.6, unimplemented by design). See `docs/m5-demo.md` for the full milestone
+walkthrough and the M6 candidate roster.

@@ -212,14 +212,25 @@ public final class FloppyController {
         static let write: UInt8 = 24
     }
 
-    /// DISKSTAT (`$5F`) bits actually driven by this model: bit7 `bot_int`,
-    /// bit6 `bot_done` (hardware-notes.md §9; Sony uses the "bot" nibble
-    /// only). Set together on `excmd` completion, cleared together by
-    /// `clristat`.
-    private static let diskStatIntDoneBits: UInt8 = 0xC0
-    /// DISKSTAT bit4 `bot_in` -- kept in sync with disk-presence for
+    /// DISKSTAT (`$5F`) = the 6504's `int_stat` record (SONY:84-90, packed
+    /// MSB-first): bit7 `bot_int` (an interrupt occurred), bit6 `bot_done` (an
+    /// I/O request completed), bit5 `unused` (SONY has no button), bit4 `bot_in`
+    /// (a disk is present). The OS's `DISK_INT` reads this byte on every level-1
+    /// floppy interrupt (SONY:469-481). `DISKSTAT $5F` is "INTERRUPT SOURCE"
+    /// (SONYASM:22-23).
+    /// I/O completion sets bot_int+bot_done together (`excmd` read/write/unclamp).
+    private static let diskStatIntDoneBits: UInt8 = 0xC0   // bot_int | bot_done
+    /// DISKSTAT bit4 `bot_in` -- disk-present. Set on the media-change
+    /// (`insertWhileRunning`) attention and kept in sync with disk-presence for
     /// fidelity, alongside the dedicated DISKIN cell.
-    private static let diskStatInBit: UInt8 = 0x10
+    private static let diskStatInBit: UInt8 = 0x10         // bot_in
+    /// bit7 `bot_int` alone -- the "an interrupt occurred" flag, ORed with
+    /// `bot_in` for a media-change attention (no `bot_done`, since a media
+    /// change is not an I/O-request completion).
+    private static let diskStatIntBit: UInt8 = 0x80        // bot_int
+    /// Every interrupt-source bit `clristat` must clear (bot_int+bot_done+bot_in;
+    /// bit5 unused). The `notop` drive-select nibble (bits 3-0) is preserved.
+    private static let diskStatInterruptBits: UInt8 = 0xD0
 
     /// Cycles from a DISKCMD go-byte write until it is decoded
     /// (`processGoByte`) -- "plausible", not cycle-exact, matching `COPS`'s
@@ -288,6 +299,28 @@ public final class FloppyController {
     /// does NOT (a warm reboot does not un-write a real floppy's media).
     private var sessionOverlay: [Int: (data: [UInt8], tag: [UInt8])] = [:]
 
+    /// **Snapshot / restore the write session for one physical diskette (M5
+    /// Task 3 round 2).** A real diskette retains the blocks the OS wrote to it
+    /// (e.g. the boot-time `overmount_stamp`/`mountinfo` written into the boot
+    /// disk's MDDF) when it is ejected and later reinserted. The session overlay
+    /// is per-drive and cleared on every `insert(_:)`, so a caller driving a
+    /// multi-diskette flow (the installer's disk swaps) must snapshot the
+    /// leaving disk's overlay and restore it when that SAME physical disk is
+    /// reinserted -- otherwise the pristine `.dc42` returns the OLD MDDF stamp
+    /// and the OS's `boot_remount` fails with E_BT_REMOUNT (1144, FSINIT2:466-
+    /// 468). Modeling the medium, not mutating the `.dc42`.
+    public func exportSessionOverlay() -> [Int: (data: [UInt8], tag: [UInt8])] {
+        sessionOverlay
+    }
+    /// Restore a previously-`exportSessionOverlay()`'d write session onto the
+    /// currently-inserted diskette (call AFTER the `insert`/`insertWhileRunning`
+    /// that put the disk back). Also restores `blocksWritten` so the write
+    /// counter reflects the retained session.
+    public func importSessionOverlay(_ overlay: [Int: (data: [UInt8], tag: [UInt8])]) {
+        sessionOverlay = overlay
+        blocksWritten = overlay.count
+    }
+
     /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
     /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
     /// `clristat`/`enabstat`/`clrmask`/`goaway` as well as `excmd`'s
@@ -334,14 +367,36 @@ public final class FloppyController {
         self.image = image
         window[Cell.diskIn] = 1
         window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
-        window[Cell.diskStat] |= Self.diskStatInBit
+        // DISKIN ($41) is the persistent presence cell. DISKSTAT bit4 `bot_in`
+        // is NOT a presence mirror -- it is the media-change INTERRUPT bit,
+        // raised only by `insertWhileRunning` and cleared by `clristat` (SONY
+        // int_stat is event bits read on the level-1 interrupt). Setting it on
+        // a bare power-on insert would make every later I/O completion carry a
+        // stale bot_in and spuriously re-trigger DISK_INT's gooddisk/KEYPUSHED.
     }
 
     public func eject() {
         image = nil
         window[Cell.diskIn] = 0
         window[Cell.diskFlg] = 0
-        window[Cell.diskStat] &= ~Self.diskStatInBit
+    }
+
+    /// **Insert a disk while the machine is running (M5 Task 3 round 2).** Sets
+    /// presence like `insert(_:)`, then raises the **media-change attention**
+    /// the OS waits on: a level-1 floppy interrupt with `int_stat` = `bot_int` +
+    /// `bot_in` (no `bot_done`). The OS's `DISK_INT` (SONY:469-481) sees `bot_in`
+    /// and sets `disk_present := gooddisk` + `KEYPUSHED`, which wakes an app
+    /// blocked in a `Mount` retry loop (e.g. the installer's "insert disk N"
+    /// prompt) so it re-reads and mounts the new volume. This is the runtime
+    /// counterpart of the OS-commanded eject (`unclamp`, `performExCmd`), and the
+    /// path the mailbox `insertFloppy` uses while the OS is up.
+    ///
+    /// Bare `insert(_:)` deliberately does NOT raise this: it is the power-on
+    /// path (a disk already present at boot), where the ROM expects no
+    /// attention -- so every boot test (checkpoint E/G/H/I) stays unmoved.
+    public func insertWhileRunning(_ image: DC42Image) {
+        insert(image)
+        raiseInterruptAfterDelay(intStatBits: Self.diskStatIntBit | Self.diskStatInBit)
     }
 
     /// 800 blocks/side (`SNYSNGL`, hardware-notes.md §9) -- a single-sided
@@ -369,7 +424,8 @@ public final class FloppyController {
         if let image {
             window[Cell.diskIn] = 1
             window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
-            window[Cell.diskStat] |= Self.diskStatInBit
+            // DISKSTAT bot_in is an interrupt-event bit, not a presence mirror
+            // (see insert(_:)); a warm reset leaves it clear (window is zeroed).
         }
     }
 
@@ -409,7 +465,10 @@ public final class FloppyController {
             performExCmd()
             return   // performExCmd clears DISKCMD itself once staging is read
         case .clristat:
-            window[Cell.diskStat] &= ~Self.diskStatIntDoneBits
+            // "Clear all current interrupts" (SONY DISK_INT:466). Clears every
+            // int_stat source bit -- bot_int+bot_done AND bot_in (the media-
+            // change bit), preserving the notop drive-select nibble.
+            window[Cell.diskStat] &= ~Self.diskStatInterruptBits
             dropCompletionLine()
         case .enabstat, .clrmask, .goaway, .nulcmd, .seek, .none:
             break   // state-flag-only effects not otherwise modeled (or an
@@ -443,9 +502,21 @@ public final class FloppyController {
         case .writedisk:
             writeAttempts += 1
             performWrite(track: Int(trak), sector: Int(sec), side: Int(head))
+        case .unclamp:
+            // **OS-commanded eject (M5 Task 3 round 2).** The Sony driver's
+            // `dskunclamp` (SONY:679-688) queues an `unclamp` request and sets
+            // `disk_present := nodisk` itself; the controller physically ejects
+            // the media. Model both halves: actually remove the disk (was a
+            // no-op before -- the other half of the media-change gap), then
+            // complete the request with a normal bot_done interrupt (bot_in is
+            // now clear -- no disk). (Struck the old "unclamp is a benign no-op"
+            // record; see the SubCommand.unclamp doc + hardware-notes §9.)
+            eject()
+            setError(ErrorCode.none)
+            raiseCompletionLineAfterDelay()
         default:
-            // unclamp/format/verify/formattrk/verifytrk/read_bf/write_bf,
-            // or a byte matching none of them: unsupported in this HLE.
+            // format/verify/formattrk/verifytrk/read_bf/write_bf, or a byte
+            // matching none of them: unsupported in this HLE.
             setError(ErrorCode.notIssued)
             raiseCompletionLineAfterDelay()
         }
@@ -517,9 +588,16 @@ public final class FloppyController {
     }
 
     private func raiseCompletionLineAfterDelay() {
+        raiseInterruptAfterDelay(intStatBits: Self.diskStatIntDoneBits)
+    }
+
+    /// Raise the level-1 floppy interrupt after the completion delay, ORing the
+    /// given `int_stat` bits into DISKSTAT (`bot_int|bot_done` for an I/O
+    /// completion, `bot_int|bot_in` for a media-change attention).
+    private func raiseInterruptAfterDelay(intStatBits: UInt8) {
         scheduleEvent(Self.completionDelayCycles) { [weak self] in
             guard let self else { return }
-            self.window[Cell.diskStat] |= Self.diskStatIntDoneBits
+            self.window[Cell.diskStat] |= intStatBits
             self.completionLineAsserted = true
             self.setLevel1Pending(true)
         }

@@ -73,16 +73,32 @@ final class IODispatcher {
     /// alongside `cops`'s own bit 6 (CRDY).
     let floppy: FloppyController
 
+    /// HLE Widget/ProFile parallel hard disk (M5 Task 2) -- see
+    /// `WidgetDrive`'s type doc comment. Attached behind VIA1 (the Hard Disk
+    /// VIA): Port A (data bus) via `via1.portAInput`/`onPortAAccess`, Port B
+    /// (BSY/DISCONNECT status + CMD/DIR strobe) via `via1.portBInput` and the
+    /// Port-B write forward in `write` below. Detached by default, so it
+    /// changes nothing on the no-widget boot path (docs/hardware-notes.md
+    /// §10.9). Its completion interrupt is VIA1 IFR bit 1 (level 1, §10.2).
+    let widget: WidgetDrive
+
     private var contextBit1 = false
     private var contextBit2 = false
 
+    /// VIA1 IFR bit 1 -- the CB-latched BSY/completion interrupt the Widget
+    /// raises on command completion (docs/hardware-notes.md §10.2). Level 1
+    /// via `bus.via1.irqAsserted`, the same path VIA1 timers use.
+    private static let widgetInterruptFlagBit: UInt8 = 0x02
+
     init(bus: Bus) {
         self.bus = bus
-        // `via2` (not `self`) captured below -- `self` cannot escape into a
-        // closure until every stored property (including `cops`, being
-        // computed right here) has a value; `via2` itself is already fully
-        // initialized (its own default initializer ran before this body).
+        // `via2`/`via1` (not `self`) captured below -- `self` cannot escape
+        // into a closure until every stored property (including `cops`/
+        // `widget`, being computed right here) has a value; the VIA instances
+        // are already fully initialized (their default initializers ran
+        // before this body).
         let via2Ref = via2
+        let via1Ref = via1
         cops = COPS(
             scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
             currentCycle: { [weak bus] in bus?.cycleProvider() ?? 0 },
@@ -107,9 +123,29 @@ final class IODispatcher {
             scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
             setLevel1Pending: { [weak bus] pending in bus?.floppyInterruptHandler(pending) }
         )
+        // Widget HLE on VIA1 -- completion interrupt is VIA1 IFR bit 1
+        // (§10.2), raised/cleared on the same `via1` instance the register
+        // windows route to. No `self` capture yet (same DI reasoning as
+        // `videoTiming`/`floppy` above).
+        widget = WidgetDrive(
+            scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
+            raiseInterrupt: { [weak via1Ref] in via1Ref?.setInterruptFlag(Self.widgetInterruptFlagBit) },
+            clearInterrupt: { [weak via1Ref] in via1Ref?.clearInterruptFlag(Self.widgetInterruptFlagBit) }
+        )
         // `self` is fully initialized as of the line above -- safe to
         // capture from here on.
         via2.portAInput = cops.portAInput
+        // VIA1 Port A/B carry the Widget parallel data bus + status (§10.2).
+        // Detached, these read as an idle pulled-up bus, unchanged from the
+        // pre-M5 default -- see `WidgetDrive`'s "Default = detached" note.
+        via1.portAInput = { [weak self] in self?.widget.portAInput ?? 0xFF }
+        via1.portBInput = { [weak self] in self?.widget.portBInput ?? 0xFF }
+        // Widget Port A is register-index-aware (M5 Task 3): reg 1 = IRA/ORA
+        // handshake (command out / data in), reg 15 = PORTA no-handshake
+        // (response in / reply out) — see WidgetDrive's doc comment.
+        via1.onPortAAccess = { [weak self] index, value, isWrite in
+            self?.widget.portAAccess(index: index, value: value, isWrite: isWrite)
+        }
         via2.portBInput = { [weak self] in
             guard let self else { return 0xFF }
             var value = self.cops.portBInput()
@@ -143,17 +179,79 @@ final class IODispatcher {
             value = currentValue(offset)
             applyLatch(offset)
         }
+        noteWidgetRegionAccess(offset)
         record(offset: offset, value: value, isWrite: false)
         return value
     }
 
     func write(_ offset: UInt32, _ value: UInt8) {
+        noteWidgetRegionAccess(offset)
         if let (via, index) = Self.viaRegisterIndex(offset) {
             viaInstance(via).write(index, value)
+            // Forward the Widget's Port-B control strobe (CMD/DIR, §10.2). The
+            // OS driver bit-bangs it via HWBASE Port B (`$FCD801` reg 0) and
+            // the HWSTATUS mirror (`$FCDC01`) -- NOT the ROM floppy path's
+            // `$FCD901`, which is deliberately excluded here. A no-op while
+            // the Widget is detached.
+            if via == 1, Self.isWidgetPortBOffset(offset, index: index) {
+                widget.portBWrite(value)
+            }
         } else if !applyLatch(offset) {
             applyNonLatchWrite(offset, value)
         }
         record(offset: offset, value: value, isWrite: true)
+    }
+
+    /// The VIA1 Port B (ORB / register 0) offsets that carry the Widget's
+    /// CMD strobe + DIR select (docs/hardware-notes.md §10.1-10.2). All of
+    /// `$FCD801` (OS-driver HWBASE), `$FCD901` (ROM parallel-port base, §3),
+    /// and `$FCDC01` (HWSTATUS mirror) decode to the SAME physical VIA1 PORTB
+    /// register (`viaRegisterIndex` maps them all to `(via:1, index:0)`), so
+    /// on real hardware writing CMD/DIR through any of the three aliases
+    /// drives the same output pins. The OS ProFile/Widget driver bit-bangs
+    /// via `$FCD801`; the boot ROM's own parallel-port boot routine
+    /// (`prof_entry` = `$FE1F70`) bit-bangs via `$FCD901` (`ANDI/ORI` on
+    /// `(A0)` with `A0 = $FCD901`, offsets $18/$10 = DDR, bit 4 = CMD, bit 3 =
+    /// DIR -- docs/rom-trace-notes.md "Checkpoint K"). **M5 Task 4:** the
+    /// `$FCD901` alias was previously excluded (a Task-3 guard against the
+    /// floppy path); that also blocked the ROM's legitimate boot-from-Widget
+    /// probe/read, so the ROM never saw the disk (STARTUP FROM listed only
+    /// the floppy). Forwarding all three is both more faithful (they are one
+    /// register) and what lets the ROM boot the installed OS off the Widget.
+    /// The floppy path only READS VIA1 PB6 (`$FE1E04`, DDR-masked input) and
+    /// never writes the CMD bit, and `widget.portBWrite` is a no-op while the
+    /// Widget is detached -- so the no-widget floppy-boot checkpoints (E/G)
+    /// and the widget-attached install (J) are unaffected (verified in the
+    /// full matrix).
+    private static func isWidgetPortBOffset(_ offset: UInt32, index: Int) -> Bool {
+        if offset == 0xDC01 { return true }
+        guard index == 0 else { return false }
+        if offset >= 0xD801 && offset <= 0xD801 + 15 * 8 { return true }
+        if offset >= 0xD901 && offset <= 0xD901 + 15 * 8 { return true }
+        return false
+    }
+
+    /// Count of accesses (read or write) to the OS ProFile/Widget driver's
+    /// VIA1 region -- the `$FCD801` HWBASE register file and the `$FCDC01`/
+    /// `$FCDC05` HWSTATUS/hwddrb mirrors (docs/hardware-notes.md §10.1). The
+    /// `$FCD901` ROM-floppy mirror is deliberately excluded. **M5 Task 2 live
+    /// probe / Task 1 Q1 seam:** `PROF_INIT`/`PROFASM` have never run on our
+    /// machine (§10.9), so this stays 0 on the boot-to-installer path; the
+    /// first time it goes non-zero is the moment the OS driver actually starts
+    /// driving the Widget (Task 3's frontier). A pure diagnostic -- nothing
+    /// branches on it, exactly like `vsyncResetCount`.
+    private(set) var widgetRegionAccesses = 0
+    /// The `Bus` cycle of the FIRST widget-region access, or `nil` if none yet
+    /// -- pairs with `widgetRegionAccesses` for the Task 3 trace.
+    private(set) var firstWidgetRegionAccessCycle: UInt64?
+
+    private func noteWidgetRegionAccess(_ offset: UInt32) {
+        let inHwbase = offset >= 0xD801 && offset <= 0xD801 + 15 * 8
+        guard inHwbase || offset == 0xDC01 || offset == 0xDC05 else { return }
+        widgetRegionAccesses += 1
+        if firstWidgetRegionAccessCycle == nil {
+            firstWidgetRegionAccessCycle = bus.cycleProvider()
+        }
     }
 
     /// The value a read would currently return -- with NO side effects.
@@ -289,13 +387,30 @@ final class IODispatcher {
     }
 
     /// ROM-observed bases (docs/hardware-notes.md §3): VIA1 = `$D901`,
-    /// stride ×8; VIA2 = `$DD81`, stride ×2. The historical OS-source
-    /// equates ($D801/$DC01) are refuted for the Rev H boot path -- see
-    /// docs/rom-trace-notes.md "Beyond the M1a boundary".
+    /// stride ×8; VIA2 = `$DD81`, stride ×2.
+    ///
+    /// **M5 Task 2 -- the `$D801` VIA1 mirror is now also decoded.** The Rev H
+    /// boot ROM's FLOPPY path uses the `$D901` mirror (which is why `$D801`
+    /// was left unmapped through M4). But the OS ProFile/Widget driver's own
+    /// `HWBASE = $FCD801` register file and `HWSTATUS = $FCDC01` /
+    /// `hwddrb = $FCDC05` mirrors (PROFILE:253-256, LIBHW-DRIVERS:137;
+    /// docs/hardware-notes.md §10.1) are a DIFFERENT code path on the same
+    /// physical 6522 -- a real chip answers `$D101/$D801/$D901/$DC01` as
+    /// mirrors. These are decoded to the SAME `via1` instance so the driver's
+    /// accesses land where `WidgetDrive` is attached (§10.9 "Task-2 action").
+    /// **UNVERIFIED live**: `PROF_INIT` has never run on our machine, so which
+    /// mirror the driver actually drives is not yet trace-confirmed -- Task 3
+    /// reconciles OBSERVED vs this decode (see the `$D801` note in §10.1). The
+    /// `$DC01`/`$DC05` mirrors map to VIA1 Port B (index 0) / DDRB (index 2).
     private static func viaRegisterIndex(_ offset: UInt32) -> (via: Int, index: Int)? {
         if offset >= 0xD901, offset <= 0xD901 + 15 * 8, (offset - 0xD901) % 8 == 0 {
             return (1, Int((offset - 0xD901) / 8))
         }
+        if offset >= 0xD801, offset <= 0xD801 + 15 * 8, (offset - 0xD801) % 8 == 0 {
+            return (1, Int((offset - 0xD801) / 8))
+        }
+        if offset == 0xDC01 { return (1, 0) }   // HWSTATUS = ORB/IRB mirror (§10.1)
+        if offset == 0xDC05 { return (1, 2) }   // hwddrb = DDRB mirror (§10.1)
         if offset >= 0xDD81, offset <= 0xDD81 + 15 * 2, (offset - 0xDD81) % 2 == 0 {
             return (2, Int((offset - 0xDD81) / 2))
         }

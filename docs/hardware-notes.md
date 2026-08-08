@@ -1140,16 +1140,28 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
   SONYASM:127-131,396-400). not_issued=1809 (driver resends the packet —
   twiggy:1520-1525), vererr=1821, read_err=1823, write_err=1824
   (SONY.TEXT:39-42).
-- **`unclamp` (sub-command 2) — modeled as a benign no-op (M3 Task 3 doc
-  note).** `FloppyController` doesn't implement `unclamp` (it falls into the
-  same unsupported-sub-command path as `format`/`verify`/etc., answering
-  `notIssued`/DISKERR 9); this is harmless because the only observed caller
-  is the loader's `shutdown`/eject teardown (source-ldmicro:184-203):
-  `unclamp` → `clristat ($85)` → `clrmask ($87)`/parm `$88`, waiting ONLY on
-  the VIA2-PB4 completion line and never reading DISKERR — confirmed live by
-  the M2 Task 6 trace (this doc's "Boot-ROM read sequence — Task 6" bullet,
-  above, and rom-trace-notes.md "Sanity-negative sweep"). See
-  `FloppyController.SubCommand.unclamp`'s doc comment for the mirrored note.
+- **`unclamp` (sub-command 2) — now an OS-commanded EJECT (M5 Task 3 round 2).**
+  ~~Modeled as a benign no-op (M3 Task 3): it fell into the unsupported-sub-
+  command path, answering `notIssued`/DISKERR 9.~~ **Superseded:** the loader's
+  teardown only waits on the VIA2-PB4 completion line (still true), but the OS
+  installer's `dskunclamp` (SONY:679-688) issues `unclamp` to physically EJECT
+  the media mid-run and then sets `disk_present := nodisk`. `FloppyController`
+  now removes the disk on `unclamp` and completes with a `bot_done` interrupt.
+  See `FloppyController.SubCommand.unclamp`'s doc comment.
+- **Media-change attention (M5 Task 3 round 2).** A disk inserted while the OS
+  is running raises a level-1 floppy interrupt with `int_stat` = `bot_int|bot_in`
+  (no `bot_done`); the OS's `DISK_INT` (SONY:469-481) reads `bot_in` and sets
+  `disk_present := gooddisk` + `KEYPUSHED`, waking a process blocked on a disk
+  (e.g. the installer's `Mount` retry at an "insert disk N" prompt). This is the
+  ONLY runtime path that flips the cached presence — the synchronous `ISDISKIN`
+  probe is init-only (SONYASM:431-442). `FloppyController.insertWhileRunning(_:)`
+  raises it (the mailbox `insertFloppy` path); bare `insert(_:)` is the power-on
+  path and raises nothing. `DISKSTAT` `bot_in` is thus an interrupt-EVENT bit
+  (cleared by `clristat`), not a presence mirror — `DISKIN ($41)` is the
+  persistent presence cell. A diskette's writes are retained across an
+  eject/reinsert of the SAME disk via `export/importSessionOverlay` (so the boot
+  disk's MDDF `overmount_stamp` survives for `boot_remount`, FSINIT2:466-468);
+  the `.dc42` file is still never mutated.
 - **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
   change).** The busy-rejection guard (`FloppyController.commandInFlight`)
   only spans the command-decode delay, not the SEPARATE completion-wait
@@ -1237,6 +1249,22 @@ zone/track/sector/side:
 - **FIND_BOOT decode** (STARTUP:1297-1393): bootdev 1 = internal Sony
   (2/10-class); 0 = internal hard disk (Pepsi) or upper Twiggy; 2 =
   parallel-port ProFile; 3-14 slots.
+- **prof_entry parallel-port boot (M5 Task 4 live trace).** The
+  `prof_entry` (`$FE0090`) jump-table slot resolves to **`$FE1F70`**, the boot
+  ROM's own ProFile parallel read routine. It bit-bangs the parallel port at
+  **VIA1 base `$FCD901`** (stride 8), NOT the OS `PROFASM` driver's `$FCD801`
+  (§10.1): PORT A (`$FCD909`, DDRA=0) is the 8-bit data bus, PORT B carries the
+  CMD strobe (bit 4, active-low) + DIR (bit 3) + BSY (bit 1, input), and the
+  status error mask is the same `$C140C000` `PROFASM` uses. It is therefore the
+  **same ProFile wire protocol** as the OS driver on a different VIA1 alias
+  (`viaRegisterIndex` decodes `$FCD801`/`$FCD901`/`$FCDC01` to one physical
+  register file). Selecting the hard-disk item in STARTUP FROM runs this routine
+  to read block 0 and boot the installed OS off the Widget — see
+  docs/rom-trace-notes.md "Checkpoint K". **Reconciliation (this task):**
+  `IODispatcher` now forwards VIA1 PORT-B (register 0) writes to `WidgetDrive`
+  for the `$FCD901` alias too (was `$FCD801`/`$FCDC01`-only, which blocked the
+  ROM's boot probe and left STARTUP FROM listing only the floppy); §10.2's
+  Port-B strobe applies to all three aliases.
 - **ROM entry points** (LDEQU:59-62): prof_entry=`$FE0090`,
   twig_entry=`$FE0094` (SHARED by Sony — "use same entrypoint as twiggy",
   ldmicro:38-40,301-302,389-390), prom_monitor=`$FE0084`,
@@ -1417,3 +1445,473 @@ zone/track/sector/side:
 - `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
   site found (bracketing a RAM-sizing/checksum routine, result discarded),
   purpose not identified. See §2 "Vertical Retrace" above.
+
+## 10. ProFile/Widget Parallel Hard-Disk Protocol
+
+The contract the M5 Widget HLE (Task 2) is coded against. Every constant is
+cited to the OS's own ProFile driver (`OS/SOURCE-PROFILEASM.TEXT.unix.txt` =
+**PROFASM**, `OS/source-PROFILE.TEXT.unix.txt` = **PROFILE**), the boot
+loader's ProFile path (`OS/source-LDPROF.TEXT.unix.txt` = **LDPROF**,
+`OS/source-LDEQU.TEXT.unix.txt` = **LDEQU**), the hardware-equate library
+(`LIBHW/LIBHW-DRIVERS.TEXT.unix.txt` = **LIBHW-DRIVERS**), and the boot-time
+device-config machinery (`OS/SOURCE-CD.TEXT.unix.txt` = **CD**,
+`OS/SOURCE-STARTUP.TEXT.unix.txt` = **STARTUP**). All paths under
+`~/Development/Lisa_Source/LISA_OS/`. **No Apple-derived binary data is
+reproduced here** — only equates and derived semantics.
+
+### 10.1 Address map (the Hard-Disk VIA)
+
+The parallel port and the built-in hard disk share **VIA1** (the "Hard Disk
+VIA"). Its canonical register-file base is **`$FCD801`**, register stride 8:
+
+- `VIA1 .EQU IOSpace+$D101|$D801` (LIBHW-DRIVERS:137; `IOSpace=$FC0000`,
+  :134). The `$D101|$D801` notation is the 6522's two partial decodes
+  (low-select `$FCD101`, high-select `$FCD801`).
+- **Register offsets** (stride 8; LIBHW-DRIVERS:148-163): `PORTB1=$00`,
+  `PORTA1=$08`, `DDRB1=$10`, `DDRA1=$18`, `T1CL1=$20`, `T1CH1=$28`,
+  `T1LL1=$30`, `T1LH1=$38`, `T2CL1=$40`, `T2CH1=$48`, `SR1=$50`, `ACR1=$58`,
+  `PCR1=$60`, `IFR1=$68`, `IER1=$70`, `IORA1=$78`. PROFASM uses the identical
+  offsets under different names (`IRB/ORB=0, IRA/ORA=8, DDRB=$10, DDRA=$18,
+  T2CL=$40, T2CH=$48, ACR=$58, PCR=$60, IFR=$68, IER=$70, PORTA=$78`,
+  PROFASM:16-28).
+- **The OS driver's built-in-port addressing** (PROFILE hdinit,
+  PROFILE:253-256): `hwbase := iospacemmu*$20000 + $0D801` (= `$FCD801`),
+  `hwstatus := hwbase + $400` (= `$FCDC01`), `hwddrb := hwstatus + 4` (=
+  `$FCDC05`). So PROFASM's `HWBASE` register file is at `$FCD801` and its
+  `HWSTATUS` (a Port-B mirror carrying busy/disconnect/parity) is at
+  `$FCDC01` — a further 6522 mirror (`$D801 + $400`).
+- **`disk_control = $FCD901`** (LDEQU:47, "address of disk-busy status
+  byte"): the loader/ROM read the busy bit via a `$FCD901` mirror of Port B
+  (`BTST #1,(disk_control)`, LDPROF:163-166). This is the same `$FCD901`
+  the Rev-H boot ROM's **floppy** handshake reads for its PB6 idle bit (§9
+  "disk_control idle bit"): one physical VIA, several address mirrors.
+- **Multi-port-card addressing** (external ProFile on an expansion card,
+  PROFILE:247-250): `hwbase := iospacemmu*$20000 + $4000*slot_no + $2001 +
+  $800*iochannel`; `hwstatus := hwbase`; `hwddrb := hwbase + $10`.
+- Slot ident probing (CARDS_EQUIPPED, CD:563-571) reads `ADR_DISK_CONTROL(i,0)
+  - $2000` = the low-select windows `$FC0001/$FC4001/$FC8001` for slots 0/1/2
+  (`slot_base=$FC2001`, `slot_offset=$4000`, CD:519-527).
+
+> **Emulator-state note / Task-2 gap — and the `$D801` vs `$D901` tension.**
+> `IODispatcher` currently decodes VIA1 **only at offset `$D901`, stride 8**
+> (`viaRegisterIndex`, IODispatcher.swift:296), a decision made from the Rev-H
+> **boot-ROM/floppy** evidence, which explicitly **refuted the `$D801`/`$DC01`
+> OS-source equates for that path** (IODispatcher.swift:49-52; §9
+> "disk_control idle bit"; docs/rom-trace-notes.md "Beyond the M1a boundary").
+> That refutation is about the *ROM floppy handshake*, which reads the
+> `$FCD901` Port-B mirror. The **OS ProFile driver (PROFASM) is a different
+> code path** and its source computes `HWBASE = $FCD801` / `HWSTATUS =
+> $FCDC01` (PROFILE:253-256, LIBHW-DRIVERS:137) — a real 6522 answers all of
+> `$D101/$D801/$D901/$DC01` as mirrors, so "$D801 is wrong" is too strong;
+> the accurate statement is that the ROM path *uses* `$D901`. **Which mirror
+> the OS driver hits live is UNVERIFIED** because `PROF_INIT`/`PROFASM` never
+> execute on our machine today (§10.9). So `$FCD801`/`$FCDC01`/`$FCDC05` and
+> the slot windows are currently unmapped (`0xFF`). **Task-2 action:** once a
+> `cd_intdisk` devrec exists and PROF_INIT runs, trace which address the
+> driver actually drives, then either widen VIA1's decode to the `$D801`/
+> `$DC01` mirrors or front those windows with the Widget model.
+>
+> **M5 Task 2 DONE — decode widened; live probe still UNOBSERVED (expected).**
+> `IODispatcher` now decodes the `$FCD801` HWBASE register file and the
+> `$FCDC01`/`$FCDC05` HWSTATUS/hwddrb mirrors to the same `via1` instance, with
+> `WidgetDrive` attached to VIA1 Port A/B (IODispatcher.swift `viaRegisterIndex`
+> / the `via1.portAInput`/`portBInput`/`onPortAAccess` wiring). A live probe was
+> run (`ROMFloppyBootTests.checkpointH_widgetAttachedDoesNotDriveTheRegionOr
+> MoveTheInstaller`): booting the checkpoint-G window **with a Widget attached**,
+> `bus.widgetRegionAccesses == 0` and `bus.widget.completedCommands == 0` — the
+> OS/ROM **never touches `$FCD801`/`$FCDC01`** on the boot-to-installer-dialog
+> path, so which mirror the driver drives remains **UNOBSERVED**. This is the
+> predicted result, now confirmed live: PROF_INIT only runs once the installer
+> *builds and drives* the internal-disk devrec (via `CDMake`, §10.9), which
+> happens when the user clicks Install — Task 3's frontier. `IODispatcher`'s
+> `widgetRegionAccesses`/`firstWidgetRegionAccessCycle` are the seam that will
+> capture the OBSERVED address the first time it goes non-zero (Task 3 records
+> OBSERVED vs this decode there). Attaching a Widget also left the installer
+> dialog **byte-identical** (same FNV `0x04a19e4eb59704f4`) — no boot-menu
+> movement, no re-anchoring (contrast the M2 floppy-devrec precedent).
+
+### 10.2 Handshake line semantics (Port A / Port B)
+
+The protocol is a byte-at-a-time handshake over **Port A** (the 8-bit
+bidirectional data bus, `PORTA/IORA1 = base+$78`) gated by control bits in
+**Port B** (`ORB/PORTB1 = base+0`) and the status mirror
+(`ORB(HWSTATUS)`). All bit assignments from PROFASM's own accesses:
+
+Port B (`base+0`, and its HWSTATUS mirror) control/status bits:
+
+| Bit | Mask | Role | Evidence |
+|-----|------|------|----------|
+| 0 | `$01` | **DISCONNECT** (cable), read on IRB: 1 = disconnected | `BTST #0,IRB` PROFASM:1478, PROF_INIT:1545 |
+| 1 | `$02` | **BSY** (controller busy), read on IRB / IFR (CB-latched) | `BTST #1,IRB` PROFASM:1630/1646; `BTST #1,IFR` :268/289 |
+| 3 | `$08` | **DIR** (Port A direction): set = input-from-drive, clear = output-to-drive | `ORI #$08,ORB`=in :265; `ANDI #$F7,ORB`=out :698 |
+| 4 | `$10` | **CMD** (command strobe), active-low: `ANDI #$EF` = CMD true, `ORI #$10` = CMD false | PROFASM:265/333/389 |
+| 5 | `$20` | **PARITY control** on HWSTATUS: `ANDI #$DF` then `ORI #$20` = clear/arm parity | PROFASM:355-356, 404-405; PROF_INIT parity-reset bit :1532-1533 |
+| 7 | `$80` | **PROFILE-RESET** (with bit 5) set to output at init | `ORI #$A0` PROF_INIT:1532-1533 |
+
+Other lines:
+
+- **PARITY error flag:** `IFR` bit 3 (`$08`), tested after every byte
+  transfer — `BTST #3,IFR` (PROFASM:385, 412, 731, 1180). Cleared by writing
+  `#$08,IFR` before a transfer (PROFASM:357).
+- **BSY interrupt:** VIA1 interrupts at **level 1** (§5). `PCR` selects the
+  edge: `ANDI #$FE,PCR` = interrupt on falling edge (PROFASM:262), `ORI
+  #$01,PCR` = rising edge (PROFASM:322). IFR bit 1 (`$02`) is the CB-latched
+  BSY event; cleared with `#$02,IFR`.
+- **Disconnect/timeout timer:** Timer 2 (`T2CL/T2CH`, `base+$40/$48`).
+  `MOVE.B #$FF,T2CH` starts the ~0.1 s poll used to detect a hung/absent
+  controller while "waiting for interrupt" (PROFASM:272, 293, 308; the
+  `Dinterrupt` handler decrements `COUNTER` over `COUNTLIMIT=100` polls =
+  ~12 s parallel timeout, PROFASM:1508-1512 / PROFILE:31).
+- **Port A data:** `MOVE.B x,ORA` sends a byte to the drive (DIR=out,
+  `DDRA=$FF`); `MOVE.B IRA,x` reads a byte (DIR=in, `DDRA=$00`). Direction is
+  flipped by `DDRA` (`$FF`=out / `$00`=in, PROFASM:330/402) in step with the
+  Port-B DIR bit.
+
+### 10.3 The handshake exchange (per byte / per phase)
+
+The two-wire choreography (PROFASM `RESPOND` :322-340, `DOSHAKE` :1653-1687,
+states `S1/S2/S200` :260-310):
+
+1. **Assert CMD, wait BSY.** Driver sets DIR=in, CMD true (`ANDI #$EF,ORB`),
+   `DDRA=0`, then polls IFR/IRB bit 1 for BSY (`RSPTIME`≈1 ms, `#$0050`
+   PROFASM:32). If BSY doesn't come, it arms T2 and waits for the level-1
+   interrupt.
+2. **Read the controller's response byte** off Port A (`MOVE.B PORTA,D1`) and
+   compare to the **expected-response** code (`EXPECT_HS`). A negative
+   `EXPECT_HS` is a wildcard (PROFASM:326-327).
+3. **Reply.** On a good response the driver flips DIR=out, `DDRA=$FF`, and
+   writes the **reply byte** to Port A, then raises CMD false. Reply codes:
+   - `$55` = standard "proceed" reply (PROFASM:286, 305, S200/S2).
+   - `$69` = "free device" reply for multi-block/Widget (PROFASM:284, S2A).
+   - `$AA` = negative reply, Profile/Seagate bad-response (DOSHAKE:1682).
+   - On bad response: reply `$00` (Profile/Seagate) or `$69` (Widget) and
+     branch to the BDR error state (PROFASM:335-340).
+
+**Expected-response (`EXPECT_HS`) codes seen from the controller:** `1` (idle
+→ ready), `2` (read-command accepted), `3` (write-command accepted), `6`
+(post-write status), `$22`/`$23` (multi-block read/write accepted, S50),
+`$27` (multi-block write complete), `$0F`/`$10` (Widget spare-table
+read/write), `$A3` (multi-block error) (PROFASM:260, 379, 382, 746, 1213,
+1218, 1332-1347, 1363, 1410).
+
+### 10.4 Command block format — VERIFY (brief's `$02` claim refuted)
+
+The single-block command is a **6-byte** block (PROFASM `S3` :355-391;
+PROFILE `command_buffer` :57-61):
+
+```
+byte 0 : command       (0 = read, 1 = write)     ; TST.B COMMAND_BUFFER; BNE=write  PROFASM:376
+byte 1 : block# [23:16]                            ; 3-byte big-endian sector
+byte 2 : block# [15:8]
+byte 3 : block# [7:0]  (interleave-remapped for Profile/Seagate, PROFASM:363-373)
+byte 4 : retry_count   (default 10 = $0A)          ; PROFILE:269, LDPROF:38
+byte 5 : sparing_threshold (default 3)             ; PROFILE:270, LDPROF:39
+```
+
+- **Command codes (the byte on the wire): `0` = read, `1` = write.** There is
+  **no `$02` "write-verify" command.** The brief's `$02` is the *driver-level*
+  `Formatcmd` operation code (`PROFILE:44-46`: `Readcmd=0, Writecmd=1,
+  Formatcmd=2`), which maps to a Widget spare-table sequence (§10.6), not a
+  block command. **Write-verify is not a distinct command** — it is the
+  driver re-issuing a *read* (`command_buffer := 0`) after a write when the
+  `V_FLAG` verify flag is set (`S13`, PROFASM:923-929; enabled via the dcontrol
+  `dcode 21` call, PROFILE:400-405). ~~`$02` = write-verify command byte.~~
+  (Refuted; cite PROFILE:44-46 + PROFASM:376 + S13:923-929.)
+- The driver builds the byte with `command_buffer.cmd := 1 - operation`
+  *after* storing the sector (PROFILE:331-332) — the OS "operation" enum is
+  inverted into the wire command.
+- **Device-info / status read** uses command `0` with block **`$FFFFFF`**
+  (retry `$0A`, sparing `0`): PROF_INIT reads it to fetch drive type +
+  `discsize` (PROFILE-init DOIT, PROFASM:1567-1607); LDPROF reads block
+  `$FFFFFF` to tell Profile from Widget (LDPROF:112-118).
+
+### 10.5 Status bytes
+
+After a command the driver reads **4 status bytes** into `ERRSTAT` (PROFASM
+`RD_STATUS`:402-417, `S6`:424-440):
+
+- **Fatal-error mask** `$C140C000` AND'd against the 4-byte `ERRSTAT`
+  longword: non-zero ⇒ hard error `HD_ERR` (PROFASM:429-432).
+- `ERRSTAT` byte 0 `== $09` ⇒ CRC/read error, treated as a soft checksum
+  error, retryable (PROFASM:427, 602, 981).
+- `ERRSTAT+1` bit 2 (`$04`) ⇒ **sparing occurred** on the last block →
+  triggers the extra spare-update handshake (`HS` state, PROFASM:622-628,
+  941-947, 996-1002).
+- The Widget controller-abort/diagnostic status is 4 further bytes read after
+  the `$13 $01 $05 $E6` "read state registers" diagnostic command, OR'd into
+  `ACCSTAT` (PROFASM `S41`:1099-1116, `S42`:1124-1131).
+
+### 10.5a Transfer byte ORDER + device-info layout — RECONCILED LIVE (M5 Task 3)
+
+M5 Task 2's `WidgetDrive` transcribed §10.2-10.5 as a *contract* but got the
+per-phase transport wrong; driving `PROF_INIT` live for the first time (Task 3,
+docs/rom-trace-notes.md "Checkpoint H (M5 Task 3)") pinned the exact behaviour
+against the driver's **state tables** (PROFASM `STATE_TABLE`:149-175). The facts
+the HLE now implements:
+
+- **BSY (Port B bit 1) is a LEVEL, idle = 1.** `WAIT_NOTBUSY` (PROFASM:1618-
+  1632) exits when bit 1 = **1** (ready, CMD deasserted); `WAIT_BUSY` (:1633-
+  1651) exits when bit 1 = **0** (controller presenting, CMD asserted).
+  `PROF_INIT`'s first `WAIT_NOTBUSY` requires idle BSY = 1 *before* any CMD.
+  (The Task-2 HLE held bit 1 = 0 always → `WAIT_NOTBUSY` spun the full ~16 s.)
+- **Single-block READ order** (`NEW_CMD`:151-159): after the accept handshake
+  the driver reads **`S6` status = 4 bytes FIRST** (`RD_STATUS`:402-417), then
+  **`S7` = 20-byte header (RDHDR:448) + 512 data (RDDATA:537)**. So the wire
+  stream is **status(4) · tag(20) · data(512)**.
+- **Single-block WRITE order** (`WRT`:161-168 → `S10`:687-709): **header (20,
+  WRHDR) FIRST, then 512 data (WRDATA)** — "Header followed by User Data"
+  (PROFASM:687). (Widget/multi-block `S10A`:711-728 is the reverse, "User Data
+  followed by Header"; §10.6.) The write is then followed by a **read-back
+  verify** (`S13`/`S1`, PROFASM:167-168) that re-reads the block — so a wrong
+  write order silently corrupts the block and fails as *"the Lisa could not
+  write to the disk"*, not as a status error.
+- **`PROF_INIT` device-info block** (`$FFFFFF`) is NOT a 512+20 block. After the
+  2nd handshake the driver reads (PROFASM:1600-1613), at these **absolute byte
+  offsets into the IRA stream** (the 4 status bytes are part of it): **4 status
+  bytes (0-3)**, **14 skipped (4-17)**, **DRIVETYPE @ byte 18**, **3 skipped
+  (19-21)**, **3-byte DISCSIZE @ bytes 22-24** (big-endian). `drivetype 0` +
+  `discsize ∈ (9728,30000]` ⇒ T_Seagate single-block (§10.8).
+
+Response codes come back on **PORTA = VIA reg 15** (`base+$78`, no-handshake),
+one per handshake; data/status stream through **IRA = VIA reg 1** (`base+$8`,
+handshake), auto-advancing. This is now the executable spec in
+`WidgetDriveTests` and the end-to-end anchor `checkpointI`.
+
+### 10.6 Multi-block & Widget commands (drivetype ≥ 2)
+
+Widgets (and any controller reporting `DRIVETYPE ≥ 2`) use multi-block
+commands (PROFASM `S0`:249-255, `MULTI_CMD`/`S50`:1193-1230):
+
+- **Multi-block I/O**: `CMD_BUF` = `$26` (command-type+length nibble), then
+  the 1-byte command, 3-byte block#, and a block-count (≤ 127 per request,
+  PROFASM:1199-1206). Sent by `SEND_CMD` with a trailing XOR check byte
+  (`EORI #$FF`, PROFASM:1166-1185).
+- **Widget diagnostics** (`CMD_BUF` high nibble `$1x`): read-state-registers
+  `$13 $01 $05 $E6` (S41), **read spare table** `$120D` (S60:1359), **write
+  spare table** `$160E` + fence `$F0783C1E` (S62:1405-1406).
+- Multi-block responses: `$22` (read block), `$23` (write block), `$27`
+  (write done), `$A3` (error → read status). Free-device reply `$69`.
+
+### 10.7 Checksum & sector data layout
+
+- **Data:** 512 bytes/block, transferred as `RDDATA`/`WRDATA` (PROFASM
+  :537-563, :760-799). Timing-critical: "14-21 CPU cycles between bytes"
+  (PROFASM:533-535) — a pulse handshake, invisible to a cycle-approximate
+  HLE that returns bytes on demand.
+- **On-disk header/tag:** **20 bytes** (`disk_header equ 20`, LDPROF:41;
+  read by `RDHDR` Profile / `RD_WHDR` Widget, PROFASM:448-524). The Widget
+  header is bit-packed differently (version nibble + flags nibble, PROFASM
+  RD_WHDR:491-524) from the Profile header. This is the same 20-byte soft
+  header the Sony path exposes as a 24-byte unpacked Pascal pagelabel (§9
+  "Sector layout"); DC42's 12 packed tag bytes are the subset stored.
+- **Checksum:** a running **XOR** (`EOR`) over header+data bytes; a header
+  flag bit (`$80` on the dataused byte, "cksum present" = `cksum_on $8000`,
+  LDPROF:42) says whether the block carries a checksum. A non-zero final XOR
+  ⇒ `CSERR` (PROFASM:590-598, C_SUM:631-661). Parity (`IFR` bit 3) and CRC
+  (`ERRSTAT==$09`) also raise `CSERR`.
+
+### 10.8 Block geometry & the 10 MB Widget count (partly underivable)
+
+Derivable from source:
+
+- **512 data bytes + 20-byte header** per block (§10.7).
+- Drive-type decode after PROF_INIT reads `discsize` from the controller
+  (PROFILE:283-301):
+  - `discsize ≤ 9728` **or** `> 30000` ⇒ **`T_Profile`**, `num_bloks := 9720`
+    (the 5 MB ProFile default, PROFILE:265, 283-284).
+  - `9728 < discsize ≤ 30000` ⇒ Widget or Seagate: `num_bloks := discsize -
+    strt_blok` (PROFILE:289); `DRIVETYPE ≠ 0` ⇒ **`T_Widget`**
+    (`remap_interleave:=false`, `rvrs_hdr:=20` — headers at *end* of sector,
+    PROFILE:290-295), else **`T_Seagate`** ("10 MB seagate", PROFILE:298).
+- So the exact 10 MB Widget total block count is **controller-reported
+  (`discsize`), not a source constant** — the OS accepts any value in
+  `(9728, 30000]`.
+
+**Underivable-from-source (chosen fallback):** the 6504/Widget controller
+firmware that would report `discsize` is not in this tree (same class as §9
+"Could Not Find" #1). The historically documented Widget-10 geometry is
+**19456 blocks** (× 512 = ~9.96 MB usable), which is what the Task-2 image
+container presents as `discsize`. `19456` is the chosen representative; any
+value in `(9728, 30000]` works, swapping in with no logic change.
+
+**Single-block T_Seagate vs multi-block T_Widget — the Task-2 advertisement
+(review fix round 1, I2).** The `DRIVETYPE` byte the controller reports decides
+which command path the OS driver uses: `CMPI.B #2,DRIVETYPE / BLT` — **`DRIVETYPE
+< 2` (Profile=0 or Seagate=1) → single-block** read/write; **`DRIVETYPE == 2`
+(Widget) → multi-block** (`CMD_BUF=$26`, §10.6) (PROFASM:250). The Task-2
+`WidgetDrive` HLE implements the **single-block** path (§10.4) only, so it
+advertises a **10 MB T_Seagate**: a raw `drivetype` byte of `0` with a `discsize`
+in `(9728, 30000]` resolves to `T_Seagate` with `num_bloks := discsize - strt_blok`
+(full 10 MB, PROFILE:288-298) — coherent with single-block I/O at full capacity.
+A 10 MB single-block *T_Profile* is **incoherent** (PROFILE:283-284 forces
+`num_bloks := 9720`, capping at 5 MB), and *T_Widget* (`drivetype ≠ 0`) would
+demand the unimplemented multi-block path. So `WidgetDrive.deviceInfoData`
+reports `discsize` only, leaving the `drivetype` byte 0 → T_Seagate. **Building
+the §10.6 multi-block path + advertising T_Widget is a deferred Task 3+
+enhancement**, needed only if the install is found to require Widget-specific
+behaviour (spare tables, `Formatcmd` widget-format, PROFILE:419); single-block
+read/write/device-info covers `CDMake`→FS `LookUp`/`Mount` (§10.9a).
+
+### 10.9 Attach-path conditional — the crown jewel
+
+**Whether the OS builds a ProFile/Widget devrec at all is gated on machine
+identity, exactly as the M4 floppy devrec was.** Two source sites:
+
+1. **Board detection** (BOOT_IO_INIT, STARTUP:1876-1891) reads two identity
+   bytes and derives `iomodel`:
+   - `adr_ioboard = $FCC031` (STARTUP:1746) — signed byte. `≥ 0` ⇒
+     `iob_lisa`; `[-96,-33]` (`$A0..$DF`) ⇒ `iob_sony`/`iob_lite`; otherwise
+     "some form of Pepsi" → read the second byte.
+   - `adr_intdisk = $FCC015` (STARTUP:1747-1748) — **`0` ⇒ `iob_twiggy`,
+     else `iob_pepsi`** (this byte selects the built-in *floppy* type:
+     0=twiggy, 1=SS Sony, 2=DS Sony — *not* the hard disk).
+   - Our machine returns `$FCC031 = $88` and `$FCC015 = 1`
+     (IODispatcher.swift:204/213) ⇒ **`iomodel = iob_pepsi`** (Lisa 2/10),
+     confirmed live in §"Checkpoint H prep" of rom-trace-notes.
+2. **The devrec gate** (NEW_DEVICE, CD:1004-1030):
+   ```
+   if (slot = cd_paraport) then begin
+      MACH_INFO(error, looker);
+      if (looker.io_board = iob_pepsi) or (looker.io_board = iob_twiggy)
+         then begin error := cdnoparaport; EXIT(new_device); end;  { CD:1006-1013 }
+   end;
+   ...
+   else if (slot = cd_paraport) then via1 := ord(workptr)          { CD:1029 }
+   else if (slot = cd_intdisk)  then via1 := ord(workptr);         { CD:1030 }
+   ```
+   - On a **Pepsi/Twiggy I/O board the external parallel port
+     (`cd_paraport`) is refused** — `cdnoparaport` (757), no devrec (CD:1006-1013,
+     comment "We explicitly guard against creating a CD driver for the
+     parallel port on pepsi systems", CD:922-925).
+   - The **internal hard disk (`cd_intdisk`)** devrec *is* allowed and stores
+     its control-block pointer in the same `port_cb_ptrs.via1` field
+     (CD:1030). ~~It is created **only if parameter memory carries a
+     `cd_intdisk` entry**.~~ **REFUTED for the installer (M5 Task 2, §10.9a
+     below) — struck, not erased.** Parameter memory gates only the *boot-time*
+     `INIT_CDS` reconstruction (CD:1758-1935), not the installer, which builds
+     and `CDMake`s the `cd_intdisk` position itself with zero PM. Task 1
+     over-generalized the `INIT_CDS` PM path to all devrec creation. The
+     BOOT_IO_INIT builtin loop (STARTUP:1950-2006) still creates only Twiggy
+     floppy devrecs + FS_INIT (never a hard-disk devrec), so on the *boot ROM /
+     STARTUP* path there is indeed no `cd_intdisk` — but the **installer** is a
+     separate creator (§10.9a).
+   - `MACH_INFO` folds `iob_twiggy → iob_pepsi` (CD:647-648), so both map the
+     same way for the paraport guard *and* for the installer's slot-12
+     internal-disk decision (§10.9a).
+
+### 10.9a Installer disk-scan mechanism — OBSERVED (M5 Task 2, Task-1 Q2)
+
+**How the Office System installer actually finds a disk** (installer source
+`APPS/APIN/APIN-OFFICE.TEXT.unix.txt` = **APIN-OFFICE**; verified file:line).
+Task 1's INFERRED "the installer scans devrecs/configinfo, and needs a
+PM-created `cd_intdisk`" is **REFUTED**; the OBSERVED mechanism:
+
+*(Line numbers are the `APPS/APIN` copy; the `LISA_OS/APIN` copy is offset ~1
+line lower — e.g. the slot-12 lines are 2999-3000 in APPS, 2998-2999 in
+LISA_OS. Corrected in review fix round 1 — the earlier `3010-3013` cite was the
+unrelated `Port2ID` expansion-slot CASE arm, not the internal disk.)*
+
+1. **The installer builds its own candidate list from machine type — it does
+   NOT read configinfo/PM to discover disks.** `SetDevices` (PROC APIN-OFFICE:
+   2749; the `CASE machineType.io_board` at 2987-3005) hardcodes, for
+   **`IOPepsi`** (our Lisa 2/10), the internal disk at **slot 12, chan 0**:
+   `SetDevPos(index,12,0)` (**APIN-OFFICE:2999**) + `devList[index].diskDrvrPos
+   := ProfDloc` (**APIN-OFFICE:3000**). `IOLisa`/`IOLisaLite` get the
+   parallel-port ProFile at slot 11 instead (2991/2993). **The internal disk is
+   driven by the ProFile driver (`ProfDloc`)** — the same driver that
+   auto-selects Profile/Seagate/Widget behaviour from the controller-reported
+   `discsize`/`drivetype` (PROFILE:283-301; see §10.8 and the T_Seagate
+   single-block choice in `WidgetDrive.deviceInfoData`). `io_board` comes from
+   `Mach_Info` (APIN-OFFICE:1672) ← `iomodel` ← the `$FCC031`/`$FCC015` bytes
+   (STARTUP:1746-1748, 1884-1895) we **already model** (`iob_pepsi`).
+2. **The installer creates the devrec itself — gated on `hasInfo`.**
+   `InitDrivers` (PROC APIN-OFFICE:2881-2949) `CDKill`s every position (loop
+   2912-2925), then its inner `InstallDrvr` (2889-2904) does the real
+   **`CDMake(err, theDevLoc, drvrList[theListLoc].infoBuf)` (APIN-OFFICE:2899)**
+   — but **only `IF (drvrList[theListLoc].hasInfo)` (APIN-OFFICE:2897)**. The
+   disk loop calls `InstallDrvr(devList[index].diskDrvrPos, …)` (**2946**), itself
+   gated `IF (devList[index].diskDrvrPos > 0)` (2944, comment "isn't driverless
+   or a built-in device (widget)"). `CDMake` (CD:1366-1428) → `NEW_DEVICE`
+   (CD:898-1104), which for `cd_intdisk` stores the control block in
+   `port_cb_ptrs.via1` (CD:1030) — **no PM entry consulted, no hardware probe;
+   `cd_intdisk` is never refused** (only `cd_paraport` is, CD:1006-1013).
+   - **`hasInfo` is a Task-3 navigation dependency (review fix round 1).** It is
+     set TRUE only when `GetDrvrInfo` (PROC APIN-OFFICE:2759) finds the driver's
+     entry while parsing the boot floppy's **`system.cdd`** file
+     (`hasInfo := TRUE`, **APIN-OFFICE:2818**; field decl :345). So the
+     slot-12 `CDMake` fires **only if the installer has loaded the ProFile
+     driver info for `ProfDloc` from `system.cdd`**; if that parse doesn't find
+     it, `InstallDrvr` silently no-ops (no `CDMake`, no devrec, no error). Task 3
+     must confirm the install medium's `system.cdd` carries the ProFile driver
+     entry (and that our FS reads reach `GetDrvrInfo`) before the devrec — and
+     hence any `$FCD801` traffic — can appear.
+3. **Then it tests for a real disk through the FS/driver.** `SetDevices` does
+   `LookUp` on each candidate and sets `isDisk` only if `err ≤ 0 AND fsInfo.devT
+   = diskDev` (**APIN-OFFICE:3051-3053**); `MountInit` (PROC APIN-OFFICE:2573)
+   then `MountDisk`s each `isDisk` candidate. The **"can't find a suitable
+   disk"** install alert (`LockAlert(installAlert, 162)`, APIN-OFFICE:1425)
+   fires only if the scan ends with `foundOne = FALSE` (decl :2587).
+4. **PM is an OUTPUT of install, not a precondition.** After the user picks a
+   disk, `CheckPMList` (PROC APIN-OFFICE:880, FORWARD :409; doc 882-885) queues
+   it so `Finished` → `PMWrite` (:1256) records "disk present" for the *next*
+   boot's `INIT_CDS`. PM lives in small COPS-adjacent NVRAM (`READ_PMEM`/
+   `WRITE_PMEM`, STARTUP:824-826; low level `W_PARAM_MEM`, source-twiggy:196,260).
+
+**Bottom line (decides Task 3): NO parameter-memory model is needed to make the
+installer find the disk.** The gate is entirely `Mach_Info.io_board = iob_pepsi`
+(already satisfied by our `$FCC031=$88`/`$FCC015=1`). Task 3 must:
+(a) let the installer reach `SetDevices`/`InitDrivers`/`MountInit` (script the
+"Install" click); (b) ensure `GetDrvrInfo` finds the ProFile driver in the
+install medium's `system.cdd` so `drvrList[ProfDloc].hasInfo` is TRUE — **without
+it the slot-12 `CDMake` silently no-ops** (item 2 above); and (c) make the
+**block device at slot-12/`$FCD801`** answer `CDMake`→FS `LookUp`/`Mount`
+correctly (device-info read + single-block I/O — the §10.1-10.7 model this task
+built, advertised as **T_Seagate** per §10.8). A PM/NVRAM model is a
+*second-phase* concern (so the installed system can `INIT_CDS`-reconstruct and
+boot next time, and so `PMWrite` has somewhere to write) — small (one checksummed
+`pmem` record), but **out of the install-scan critical path**, so not built here.
+*Could-not-find:* `GETNXTCONFIG`'s body (only call sites CD:1775/STARTUP:1447);
+the numeric `$FCC015`/`$FCC031` hardware encoding (only STARTUP decode ranges).
+
+**Live branch our machine takes today (the "no suitable disk" path, still
+true):** on the boot-to-installer-*dialog* path no ProFile/Widget devrec is
+built and `$FCD801`/`$FCDC01` are never touched — confirmed live with a Widget
+attached (§10.1 checkpoint-H probe: `widgetRegionAccesses == 0`). The devrec is
+created later, by the installer's own `CDMake` when the scan runs (the Install
+click), not by the boot ROM/STARTUP.
+
+**Consequence for M5:** making the installer see a disk requires (a) a Widget
+device model answering the §10.1-10.7 protocol at `$FCD801` (**this task**),
+and (b) driving the installer far enough to run its `SetDevices`/`CDMake`/
+`MountInit` scan (**Task 3**). It does **not** require a parameter-memory model
+(Task 1's "(b) a `cd_intdisk` devrec from PM" was the refuted inference).
+
+### 10.10 Image-container, creation & persistence decisions
+
+Decided for the Task-2 Widget HLE (reasoning inline):
+
+- **Container = raw fixed-size blocks, no header.** `N` blocks × **532 bytes**
+  each = `512` data + `20` header/tag (§10.7-10.8), laid out
+  `[block0: 512 data][block0: 20 tag] … ` contiguously. Rationale: the
+  protocol exposes exactly data+header per block (PROFASM `RDDATA`+`RDHDR`);
+  a headerless raw image is the least-assumption container and mirrors how
+  the Sony path already treats DC42 data+tag. (Alternative "data-only, tags
+  synthesized" was rejected — the driver reads real header bytes and
+  checksums them, PROFASM:581, so tags must be stored.) The Task-2 default is
+  the Widget-10 geometry `N = 19456` (§10.8), file size `19456 × 532 =
+  10,350,592` bytes; `discsize` reported to PROF_INIT = `N`.
+- **Creation policy = emulator creates a blank image on demand.** When the
+  configured Widget image path does not exist, the emulator creates an
+  all-zero `N × 532` file (blocks read back as zeros with a zero XOR checksum,
+  which the driver accepts as a valid unwritten block — no `CSERR`, PROFASM:591).
+  This lets "Install" format-and-populate a fresh disk without a
+  pre-seeded image, matching real hardware where a new Widget is blank.
+- **Persistence policy = write-back to the file, flushed per completed write.**
+  Each successful block write (PROFASM `S10`/`S10A` → completion) is written
+  through to the backing file (offset `block × 532`), so an installed system
+  survives across emulator sessions — unlike the floppy's copy-on-write
+  session overlay (which deliberately never mutates the read-only `.dc42`,
+  §9). The hard-disk image *is* the persistent store, so write-through is the
+  correct model; flush granularity is per-block to bound data loss on an
+  abrupt exit. (A future optimization may batch flushes, but per-block is the
+  safe default.)

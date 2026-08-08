@@ -523,3 +523,93 @@ private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeSch
     #expect(floppy.read(FloppyController.Cell.diskCmd) == 0)
     #expect(level1() == false)
 }
+
+// MARK: - Media-change attention (M5 Task 3 round 2)
+//
+// The floppy interrupt source (DISKSTAT $5F, SONYASM:22-23) carries the 6504's
+// int_stat record (SONY:84-90): bot_int (bit 7), bot_done (bit 6), unused
+// (bit 5, no button), bot_in (bit 4). The OS's DISK_INT (SONY:469-481) sets
+// disk_present := gooddisk + KEYPUSHED whenever bot_in is set on the interrupt
+// -- the *only* runtime path that flips the cached presence (ISDISKIN is
+// init-only, SONYASM:431-442). These tests pin BOTH the power-on-quiet insert
+// and the mid-run media-change attention, both directions.
+
+@Test func bareInsertRaisesNoAttentionOnThePowerOnPath() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insert(makeSyntheticImage())
+    scheduler.advance(by: FloppyController.commandDelayCycles + FloppyController.completionDelayCycles + 1)
+    #expect(level1() == false, "bare insert() (power-on) must NOT raise a floppy interrupt")
+    #expect(floppy.read(FloppyController.Cell.diskStat) & 0x90 == 0, "no bot_int/bot_in on power-on insert")
+    #expect(floppy.isInserted)
+}
+
+@Test func insertWhileRunningRaisesBotInMediaChangeAttention() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insertWhileRunning(makeSyntheticImage())
+    scheduler.advance(by: FloppyController.completionDelayCycles + 1)
+    #expect(level1() == true, "insertWhileRunning raises the level-1 attention")
+    let stat = floppy.read(FloppyController.Cell.diskStat)
+    #expect(stat & 0x80 == 0x80, "bot_int set (interrupt occurred)")
+    #expect(stat & 0x10 == 0x10, "bot_in set -> DISK_INT sets disk_present:=gooddisk + KEYPUSHED")
+    #expect(stat & 0x40 == 0, "bot_done CLEAR -- a media change is not an I/O completion")
+    #expect(floppy.isInserted)
+}
+
+@Test func unclampCommandEjectsMediaAndCompletesWithBotDone() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insert(makeSyntheticImage())
+    #expect(floppy.isInserted)
+    // OS-commanded eject: excmd with DISKPARM = unclamp (2) (SONY dskunclamp:679-688).
+    floppy.write(FloppyController.Cell.diskParm, FloppyController.SubCommand.unclamp.rawValue)
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.excmd.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles)   // go-byte decoded
+    scheduler.advance(by: FloppyController.completionDelayCycles) // completion fires
+    #expect(!floppy.isInserted, "the OS unclamp physically ejects the media")
+    #expect(level1() == true, "unclamp completes with an interrupt")
+    let stat = floppy.read(FloppyController.Cell.diskStat)
+    #expect(stat & 0x40 == 0x40, "bot_done set -- unclamp is an I/O-class completion")
+    #expect(stat & 0x10 == 0, "bot_in CLEAR -- no disk present after eject")
+}
+
+@Test func ioCompletionRaisesBotDoneNotBotIn() {
+    let (floppy, scheduler, _) = makeController()
+    floppy.insert(makeSyntheticImage())
+    issueRead(floppy, scheduler, track: 0, sector: 0, side: 0)
+    let stat = floppy.read(FloppyController.Cell.diskStat)
+    #expect(stat & 0x40 == 0x40, "bot_done on a normal I/O completion")
+    #expect(stat & 0x10 == 0, "NO spurious bot_in media-change on an I/O completion")
+}
+
+@Test func clristatClearsBotInMediaChangeToo() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insertWhileRunning(makeSyntheticImage())
+    scheduler.advance(by: FloppyController.completionDelayCycles + 1)
+    #expect(floppy.read(FloppyController.Cell.diskStat) & 0x10 == 0x10)
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.clristat.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles + 1)
+    #expect(floppy.read(FloppyController.Cell.diskStat) & 0x10 == 0, "clristat clears bot_in")
+    #expect(level1() == false, "clristat drops the completion line")
+}
+
+@Test func exportedSessionOverlayRestoresRetainedWritesOnReinsert() {
+    let (floppy, scheduler, _) = makeController()
+    let image = makeSyntheticImage()
+    floppy.insert(image)
+    // The OS writes a block (e.g. the boot MDDF's overmount_stamp).
+    stageAndIssueWrite(floppy, scheduler, track: 2, sector: 5, side: 0,
+                       data: [UInt8](repeating: 0xEE, count: 512),
+                       tag: [UInt8](repeating: 0xDD, count: 12))
+    let saved = floppy.exportSessionOverlay()
+    #expect(saved.count == 1, "one block written this session")
+
+    // Swap disks (each insert clears the overlay), then reinsert THIS disk...
+    floppy.insertWhileRunning(makeSyntheticImage())
+    floppy.insertWhileRunning(image)
+    // ...and restore its retained write session (models the physical medium).
+    floppy.importSessionOverlay(saved)
+    issueRead(floppy, scheduler, track: 2, sector: 5, side: 0)
+    let readBack = (0..<512).map { floppy.read(FloppyController.Cell.diskData + 1 + 2 * $0) }
+    #expect(readBack == [UInt8](repeating: 0xEE, count: 512),
+            "the reinserted disk retains its earlier writes (boot_remount can re-verify the MDDF)")
+    #expect(floppy.blocksWritten == 1)
+}

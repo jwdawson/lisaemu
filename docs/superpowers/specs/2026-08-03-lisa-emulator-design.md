@@ -206,6 +206,19 @@ Milestones (each a demo):
    *(Project-history note, 2026-08-06: not yet reached by the project's own
    milestone numbering — see the M2/M3 note above for how this spec's
    numbering diverged from the actual build order.)*
+   *(Project-history note, 2026-08-08: **ACHIEVED** by the project's own M5
+   (`docs/m5-demo.md`). Both clauses landed: the real Office System installer,
+   driven in-emulator, **installs OS 3.1 onto a blank Widget image** — the
+   Widget/ProFile hard-disk HLE answers `PROF_INIT`, the 19456-block disk is
+   initialized, and five install floppies copy across five live media swaps to
+   the installer's own "software has been installed" completion (leaving a
+   bootable 10 MB image at `~/Development/LisaImages/OS31-installed.widget`); and
+   that installed image **boots from the HD** — the boot ROM's own `prof_entry`
+   parallel-port routine reads block 0 off the Widget and the OS loader + OS come
+   up entirely off the disk. See `docs/rom-trace-notes.md` "Checkpoint H/I/J/K"
+   and `task-2/3/4-report.md`. The single-block `T_Seagate` protocol is what the
+   install and boot exercise; the multi-block/`T_Widget` path [§10.6] is
+   unimplemented by design.)*
 5. **M4 Desktop ⭐** — mouse/keyboard/clock live; Office System desktop.
    *(Project-history note, 2026-08-07: substantially reached, one honest step
    short of the desktop itself. The project's own M4 (`docs/m4-demo.md`)
@@ -220,5 +233,19 @@ Milestones (each a demo):
    booting from HD yields the desktop. Also carried to M5: driving the installer
    UI (mouse input at its event-wait), the soft-power/Power menu, `$C015` vs.
    800K double-sided, and the parked 1 MB-POST divergence `$FE099C`.)*
+   *(Project-history note, 2026-08-08: the **desktop ⭐ is reached** by the
+   project's own M5 (`docs/m5-demo.md`). Booting the M5-installed Office System
+   off the Widget (see the M3-Widget note above) carries all the way to the
+   **Office System desktop** — menu bar **Desk / File/Print / Edit /
+   Housekeeping** and icons **Preferences · Wastebasket · Clipboard · Internal
+   Hard Disk** — with **mouse and keyboard live**: a first-boot modal is
+   dismissed by an on-screen click (a modal answered by a mouse event), and the
+   OS cursor is steered live via the COPS input channel. The screenshot is
+   `~/Development/LisaEmu-artifacts/m5-boot-06-desktop.png`; pinned behaviourally
+   by `ROMWidgetBootTests.checkpointK`. **One clause of this line's "clock live"
+   remains honestly unmet:** no RTC (COPS real-time clock) is modeled, so the
+   Office System draws a "clock/calendar is not set" note on each boot — the
+   "working clock" is the natural M6 headline, not an M5 boot blocker. See
+   `docs/rom-trace-notes.md` "Checkpoint K" and `task-4-report.md`.)*
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

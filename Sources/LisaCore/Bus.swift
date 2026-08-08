@@ -580,6 +580,13 @@ public final class Bus {
     /// `cops.reset()`/`videoTiming.reset()` -- the inserted disk, if any,
     /// survives (see `FloppyController.reset()`'s doc comment).
     public var floppy: FloppyController { io.floppy }
+    /// HLE Widget/ProFile parallel hard disk (M5 Task 2), owned by
+    /// `IODispatcher` and wired to `via1`'s ports + VIA1 IFR bit 1 (the
+    /// completion interrupt) -- see `WidgetDrive`'s type doc comment.
+    /// `Machine.reset()` calls `widget.reset()` (after clearing its own event
+    /// queue) to drop any in-flight handshake; the attached image, if any,
+    /// survives (mirrors `floppy`).
+    public var widget: WidgetDrive { io.widget }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

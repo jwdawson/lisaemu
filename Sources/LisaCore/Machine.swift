@@ -117,6 +117,7 @@ public final class Machine {
         bus.cops.reset()
         bus.videoTiming.reset()
         bus.floppy.reset()
+        bus.widget.reset()
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {

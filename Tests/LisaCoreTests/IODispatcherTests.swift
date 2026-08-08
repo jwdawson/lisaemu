@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import LisaCore
 
@@ -341,4 +342,42 @@ import Testing
     let bus = Bus(ramSize: 0x1000)
     bus.write8(0xFC_C001, FloppyController.GoByte.excmd.rawValue)
     #expect(bus.floppy.read(0x01) == FloppyController.GoByte.excmd.rawValue)
+}
+
+// MARK: - Widget/ProFile VIA1 routing (M5 Task 2, docs/hardware-notes.md §10)
+
+@Test func widgetRegionIsIdleAndDisconnectedByDefault() {
+    // No widget attached (the default): HWSTATUS ($FCDC01) reads DISCONNECT
+    // asserted (bit 0 = 1) and the HWBASE register file at $FCD801 does not
+    // crash / reads as an idle bus. The no-widget boot path is unmoved.
+    let bus = Bus(ramSize: 0x1000)
+    #expect(!bus.widget.isAttached)
+    #expect(bus.read8(0xFC_DC01) & 0x01 == 0x01, "detached: DISCONNECT (Port B bit 0) asserted")
+}
+
+@Test func widgetHwbaseAndHwstatusRouteThroughTheBusToTheDrive() throws {
+    // Attaching a Widget and driving the HWBASE=$FCD801 register file through
+    // the REAL Bus must reach WidgetDrive: HWSTATUS ($FCDC01) reflects the
+    // connected state, and a CMD strobe on Port B ($FCD801 reg 0) + an ORA
+    // read ($FCD809 reg 1, DDRA=0 input) returns the $01 idle->ready response
+    // (§10.1-10.3). Proves the $D801 decode widening + Port-B forward + Port-A
+    // input wiring end-to-end.
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("iodisp-widget-\(UUID().uuidString).widget")
+    defer { try? FileManager.default.removeItem(at: url) }
+    let image = try WidgetImage(createBlankAt: url, blockCount: 8)
+
+    let bus = Bus(ramSize: 0x1000)
+    bus.widget.attach(image)
+
+    // Connected: HWSTATUS DISCONNECT bit clear. (DDRB=0 at reset, so reg-0
+    // read passes WidgetDrive.portBInput straight through.)
+    #expect(bus.read8(0xFC_DC01) & 0x01 == 0x00)
+
+    // Ready handshake: CMD false->true (DIR=in) on Port B, then read ORA.
+    bus.write8(0xFC_D801, 0x18)   // reg 0: CMD false, DIR in
+    bus.write8(0xFC_D801, 0x08)   // reg 0: CMD asserted -> present ready + BSY
+    #expect(bus.read8(0xFC_D809) == 0x01, "ORA (reg 1) should read the $01 idle->ready response")
+    // BSY (Port B bit 1) asserted while CMD is held.
+    #expect(bus.read8(0xFC_DC01) & 0x02 == 0x02)
 }

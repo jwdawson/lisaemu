@@ -2520,3 +2520,108 @@ disk swaps, the boot disk reinserts and re-verifies, and the installer reports
 "software has been installed" — leaving a bootable 10 MB image for Task 4.
 `checkpointI` pins the disk-found precursor and `checkpointJ` the first media-
 change swap; the full multi-swap run stays narrative (screenshots).
+
+## Checkpoint K (M5 Task 4) — THE DESKTOP: the installed OS boots off the Widget ⭐
+
+The spec's M4 north star, reached over the Widget: the **installed** Office
+System (`~/Development/LisaImages/OS31-installed.widget`, built by the Task 3
+installer) boots from the hard disk through the boot ROM's OWN parallel-port
+boot path — a code path never before exercised on our machine — all the way to
+the Office System desktop (menu bar + icons) with live mouse. Reproduce with
+`swift run -c release lisadbg --rom ~/Development/LisaROMs --widget <copy>.widget`
+then the `click`/`g`/`sc` sequence in docs/m5-demo.md; pinned by
+`ROMWidgetBootTests.checkpointK_romBootsInstalledOSOffTheWidget` (env-gated on
+`LISAEMU_ROM_DIR` + `LISAEMU_WIDGET_DIR`).
+
+### The ROM boots ProFile-family disks through `prof_entry` ($FE1F70), base $FCD901
+
+The ROM does not auto-boot (checkpoint C): STARTUP FROM → device item. The boot
+device jump table (`$FE0090`) resolves **prof_entry = `$FE1F70`** (vs twig_entry
+= `$FE1D76` for Sony/floppy). `prof_entry` is the ROM's own ProFile parallel
+read routine, and it drives the parallel port at VIA1 base **`$FCD901`** (stride
+8) — NOT the OS driver's `$FCD801` (§10.1). Disassembly (the citation source is
+OBSERVED ROM behaviour; the .BIN is genuine):
+
+```
+FE1FF0: (setup) A3 = $FCDD81 (VIA2): ORB2|=$A0, DDRB2|=$A0
+        A0 = $FCD901 (VIA1): PCR($60) masked; DDRA($18)=0 (PORTA all input=data
+        bus); PORTB bits 3,4 driven (bit4=CMD active-low, bit3=DIR); DDRB($10) set
+FE1F82: btst #1,(A0)      ; poll BSY = VIA1 PORT B bit 1  (== §10.2 BSY!)
+FE2048: (send command)    ; command block staged at RAM $304, response read back
+FE1FC6: andi.l #$c140c000 ; the SAME ProFile ERRSTAT error mask WidgetDrive uses
+FE2032: move.b ($8,A0)... ; read data bytes off PORTA reg 1 ($FCD909)
+```
+
+So the ROM speaks the **same** ProFile wire protocol as the OS `PROFASM` driver
+(BSY on PORT B bit 1, CMD/DIR strobe, `$C140C000` status mask) — just through
+the `$FCD901` alias, which `viaRegisterIndex` already decodes to the same
+physical VIA1 register file as `$FCD801`. Data and BSY *reads* therefore already
+reached `WidgetDrive` (same VIA instance, PORTA/PORTB inputs wired to the drive).
+
+### The one divergence, root-caused and fixed: the $FCD901 Port-B WRITE forward
+
+`WidgetDrive`'s CMD/DIR strobe is driven by PORT-B (ORB, register 0) **writes**,
+which `IODispatcher` forwards to `widget.portBWrite`. That forward was gated to
+`$FCD801`/`$FCDC01` only — the `$FCD901` alias was **excluded** (a Task-3 guard,
+"the Widget must not react to floppy-path Port B traffic"). That exclusion also
+silently blocked the ROM's legitimate boot probe: the ROM bit-banged CMD at
+`$FCD901`, the strobe never reached the drive, BSY never answered, and
+`prof_entry` timed out (error `$50`/`$51` at `$FE1F7E`/`$FE1F8C`). **Observed
+symptom:** STARTUP FROM listed only the floppy (⌘2); the main-menu ProFile icon
+stayed crossed-out ("42"). **Fix** (evidence-gated, `IODispatcher
+.isWidgetPortBOffset`): forward PORT-B (index-0) writes for the `$FCD901` alias
+too — they are the *same physical register* on real hardware, so writing CMD/DIR
+through either base drives the same pins. The floppy path only *reads* VIA1 PB6
+(`$FE1E04`, DDR-masked input) and never writes the CMD bit, and the forward is a
+no-op while the Widget is detached — so the no-widget floppy checkpoints (E/G,
+menu/loader anchors) and the widget-attached install (I/J) are all unmoved
+(full matrix green). TDD: `IODispatcherTests
+.widgetPortBStrobeRoutesThroughTheROMParallelBaseD901` (the alias reaches the
+drive) + `...ForwardIgnoresNonPortBVia1Offsets` (DDR/timer writes never phantom-
+strobe CMD).
+
+### OBSERVED — the whole boot, off the hard disk
+
+After the fix, STARTUP FROM lists the **hard disk (⌘1)** above the floppy (⌘2)
+(`m5-boot-02-device-list.png`). Clicking it:
+
+1. **`prof_entry` reads block 0** off the Widget and JMPs into the LFS boot
+   block, exactly as the floppy path does for its `4E FA …` block — the OS
+   loader then pulls its code + the LFS off the Widget: `completedCommands`
+   climbs into the **hundreds** of single-block ProFile reads (~669 by the time
+   the loader hands to the OS, ~1400 by the desktop), every one served by
+   `WidgetDrive`. PC leaves ROM into loaded RAM/translated code (`$2Exxxx`,
+   `$46xxxx` `[NEWSEG1.*]`, `$52xxxx`, `$C8xxxx`) — **the 22 app Linkmaps now
+   resolve LIVE** (`[NEWSEG1.DOPAGEBR]`, `[lmfiler.DOCCONSI]`, `[fpelems.RANDOMX]`
+   …): spec §4's UNIT.PROC overlay finally has data (the merged-table ambiguity
+   minor did NOT bite — names resolve cleanly).
+2. **OS boot progress** (the hourglass, `m5-boot-03`).
+3. The OS reaches its UI layer and draws a genuine Office System dialog:
+   **"The startup disk was in use when the Lisa failed … Don't Check / Power
+   Off"** (`m5-boot-04-dirty-volume-dialog.png`) — the normal dirty-volume
+   (unclean-shutdown) warning, expected because a boot marks the LFS volume
+   in-use (and this is a fresh copy). Clicking **Don't Check** (live OS cursor,
+   MousX/MousY `$3CF0`) skips the scavenger and boots on.
+4. **THE DESKTOP** (`m5-boot-06-desktop.png`): the Desktop Manager draws the
+   menu bar **Desk / File/Print / Edit / Housekeeping** and the desktop icons
+   **Preferences, Wastebasket, Clipboard, Internal Hard Disk** (the last is the
+   Widget itself). A first-boot **"Note: The Lisa clock/calendar is not set
+   properly"** dialog draws (`m5-boot-05`, no RTC set); **clicking its OK button
+   dismisses it** — proving **live mouse** (a modal dialog answered by a click).
+
+**Exit bar MET.** The Office System desktop is drawn from a Widget boot with
+mouse live. The screen has left the boot-menu anchor
+(FNV ≠ `0xd09234d25516d0b8`); the boot runs live with no halt.
+
+### Boundary / carry-forward
+
+- The dirty-volume + clock-note dialogs are genuine OS first-boot notices, not
+  emulator faults — dismissed by the documented clicks. A future nicety: seed a
+  clean `overmount`/RTC so they don't appear, but that is content-shaping, not a
+  boot blocker.
+- No RTC (COPS clock) is modeled, hence the clock note; orthogonal to the boot.
+- `checkpointK` pins the robust behavioural proof (hundreds of Widget reads +
+  booted code outside ROM + screen left the menu), not an exact desktop FNV: the
+  desktop is reached only after two click-through dialogs whose feedback-loop
+  timing makes an exact-cycle framebuffer anchor fragile for CI. The desktop
+  itself is the narrative artifact (`m5-boot-06`, docs/m5-demo.md).

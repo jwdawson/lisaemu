@@ -1249,6 +1249,22 @@ zone/track/sector/side:
 - **FIND_BOOT decode** (STARTUP:1297-1393): bootdev 1 = internal Sony
   (2/10-class); 0 = internal hard disk (Pepsi) or upper Twiggy; 2 =
   parallel-port ProFile; 3-14 slots.
+- **prof_entry parallel-port boot (M5 Task 4 live trace).** The
+  `prof_entry` (`$FE0090`) jump-table slot resolves to **`$FE1F70`**, the boot
+  ROM's own ProFile parallel read routine. It bit-bangs the parallel port at
+  **VIA1 base `$FCD901`** (stride 8), NOT the OS `PROFASM` driver's `$FCD801`
+  (§10.1): PORT A (`$FCD909`, DDRA=0) is the 8-bit data bus, PORT B carries the
+  CMD strobe (bit 4, active-low) + DIR (bit 3) + BSY (bit 1, input), and the
+  status error mask is the same `$C140C000` `PROFASM` uses. It is therefore the
+  **same ProFile wire protocol** as the OS driver on a different VIA1 alias
+  (`viaRegisterIndex` decodes `$FCD801`/`$FCD901`/`$FCDC01` to one physical
+  register file). Selecting the hard-disk item in STARTUP FROM runs this routine
+  to read block 0 and boot the installed OS off the Widget — see
+  docs/rom-trace-notes.md "Checkpoint K". **Reconciliation (this task):**
+  `IODispatcher` now forwards VIA1 PORT-B (register 0) writes to `WidgetDrive`
+  for the `$FCD901` alias too (was `$FCD801`/`$FCDC01`-only, which blocked the
+  ROM's boot probe and left STARTUP FROM listing only the floppy); §10.2's
+  Port-B strobe applies to all three aliases.
 - **ROM entry points** (LDEQU:59-62): prof_entry=`$FE0090`,
   twig_entry=`$FE0094` (SHARED by Sony — "use same entrypoint as twiggy",
   ldmicro:38-40,301-302,389-390), prom_monitor=`$FE0084`,

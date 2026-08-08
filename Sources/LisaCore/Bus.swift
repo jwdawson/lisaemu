@@ -587,6 +587,11 @@ public final class Bus {
     /// queue) to drop any in-flight handshake; the attached image, if any,
     /// survives (mirrors `floppy`).
     public var widget: WidgetDrive { io.widget }
+    /// Diagnostic: accesses to the OS ProFile/Widget driver's VIA1 region
+    /// (`$FCD801`/`$FCDC01`/`$FCDC05`, §10.1) -- the M5 Task 1 Q1 live-probe
+    /// seam. 0 until the OS driver first drives the Widget (Task 3).
+    public var widgetRegionAccesses: Int { io.widgetRegionAccesses }
+    public var firstWidgetRegionAccessCycle: UInt64? { io.firstWidgetRegionAccessCycle }
     public var statusByte: UInt8 {
         get { io.statusByte }
         set { io.statusByte = newValue }

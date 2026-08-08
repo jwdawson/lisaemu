@@ -514,5 +514,45 @@ extension MusashiSuites {
             #expect(fb.reduce(0) { $0 + $1.nonzeroBitCount } == 60107,
                     "installer-dialog set-pixel count; got \(fb.reduce(0) { $0 + $1.nonzeroBitCount })")
         }
+
+        // M5 Task 2 -- Q1 live $FCD801 probe + the M2-precedent boot-menu
+        // watch, in one test. Attaches a Widget hard disk and boots the SAME
+        // window as checkpointG. Two assertions:
+        //  (1) The OS ProFile/Widget driver never drives the `$FCD801`/`$FCDC01`
+        //      region on the boot-to-installer path -- `widgetRegionAccesses`
+        //      stays 0 -- confirming §10.9 live: PROF_INIT never runs because
+        //      no `cd_intdisk` devrec exists (attaching hardware alone does not
+        //      create the devrec). This is the OBSERVED-vs-contract record the
+        //      Task 1 Q1 hand-off asked for, and the Task 3 frontier anchor
+        //      (the moment it first goes non-zero).
+        //  (2) The installer dialog is BYTE-IDENTICAL with a Widget attached
+        //      (same FNV as checkpointG) -- so attaching a Widget does NOT move
+        //      the boot menu / installer UI (unlike the M2 floppy-devrec
+        //      precedent). No re-anchoring needed; documented here + in
+        //      docs/rom-trace-notes.md "Checkpoint H prep".
+        @Test func checkpointH_widgetAttachedDoesNotDriveTheRegionOrMoveTheInstaller() throws {
+            let m = try bootIntoLoader()
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("checkpointH-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let widget = try WidgetImage(createBlankAt: url, blockCount: 512)
+            m.bus.widget.attach(widget)
+
+            var steps = 0
+            while steps < 10_000_000 && !m.halted {
+                _ = m.step(); steps += 1
+            }
+
+            #expect(!m.halted, "the OS runs live through the window with a Widget attached -- no halt")
+            #expect(m.bus.widgetRegionAccesses == 0,
+                    "OBSERVED: the OS/ROM never touches the $FCD801/$FCDC01 Widget region on the boot-to-installer path (PROF_INIT never runs, §10.9); got \(m.bus.widgetRegionAccesses) access(es), first at cycle \(String(describing: m.bus.firstWidgetRegionAccessCycle))")
+            #expect(m.bus.widget.completedCommands == 0,
+                    "OBSERVED: no Widget command completes -- the driver never handshakes")
+
+            // The installer dialog is unchanged by attaching a Widget.
+            let fb = m.bus.framebufferSnapshot()
+            #expect(fnv1a(fb) == 0x04a1_9e4e_b597_04f4,
+                    "attaching a Widget must not move the installer dialog; got \(String(format: "0x%016llx", fnv1a(fb)))")
+        }
     }
 }

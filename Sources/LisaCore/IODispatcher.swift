@@ -176,11 +176,13 @@ final class IODispatcher {
             value = currentValue(offset)
             applyLatch(offset)
         }
+        noteWidgetRegionAccess(offset)
         record(offset: offset, value: value, isWrite: false)
         return value
     }
 
     func write(_ offset: UInt32, _ value: UInt8) {
+        noteWidgetRegionAccess(offset)
         if let (via, index) = Self.viaRegisterIndex(offset) {
             viaInstance(via).write(index, value)
             // Forward the Widget's Port-B control strobe (CMD/DIR, §10.2). The
@@ -205,6 +207,29 @@ final class IODispatcher {
     private static func isWidgetPortBOffset(_ offset: UInt32, index: Int) -> Bool {
         if offset == 0xDC01 { return true }
         return index == 0 && offset >= 0xD801 && offset <= 0xD801 + 15 * 8
+    }
+
+    /// Count of accesses (read or write) to the OS ProFile/Widget driver's
+    /// VIA1 region -- the `$FCD801` HWBASE register file and the `$FCDC01`/
+    /// `$FCDC05` HWSTATUS/hwddrb mirrors (docs/hardware-notes.md §10.1). The
+    /// `$FCD901` ROM-floppy mirror is deliberately excluded. **M5 Task 2 live
+    /// probe / Task 1 Q1 seam:** `PROF_INIT`/`PROFASM` have never run on our
+    /// machine (§10.9), so this stays 0 on the boot-to-installer path; the
+    /// first time it goes non-zero is the moment the OS driver actually starts
+    /// driving the Widget (Task 3's frontier). A pure diagnostic -- nothing
+    /// branches on it, exactly like `vsyncResetCount`.
+    private(set) var widgetRegionAccesses = 0
+    /// The `Bus` cycle of the FIRST widget-region access, or `nil` if none yet
+    /// -- pairs with `widgetRegionAccesses` for the Task 3 trace.
+    private(set) var firstWidgetRegionAccessCycle: UInt64?
+
+    private func noteWidgetRegionAccess(_ offset: UInt32) {
+        let inHwbase = offset >= 0xD801 && offset <= 0xD801 + 15 * 8
+        guard inHwbase || offset == 0xDC01 || offset == 0xDC05 else { return }
+        widgetRegionAccesses += 1
+        if firstWidgetRegionAccessCycle == nil {
+            firstWidgetRegionAccessCycle = bus.cycleProvider()
+        }
     }
 
     /// The value a read would currently return -- with NO side effects.

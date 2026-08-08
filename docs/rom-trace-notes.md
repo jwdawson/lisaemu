@@ -2391,3 +2391,83 @@ Widget device model answering §10.1-10.7 at `$FCD801` (**M5 Task 2, done**) and
 (b) driving the installer far enough to run its own `SetDevices`/`CDMake`/
 `MountInit` scan (**Task 3** — the Install click). It does **not** need a
 parameter-memory model (the refuted half above).
+
+### Checkpoint H (M5 Task 3) — the install DRIVEN; disk found; the swap boundary
+
+Task 3 scripted the **Install** click for the first time (via the OS cursor —
+see below) with a blank Widget attached, and drove the installer as far as the
+evidence-grounded device allows. Anchored by `checkpointI_installClickFindsThe
+WidgetDisk` (the stable precursor); the stages past it are **narrative**
+(screenshots at `~/Development/LisaEmu-artifacts/m5-install-*.png`).
+
+**Driving the OS UI (OBSERVED).** The ROM boot-menu cursor cells `$496`/`$498`
+that `bootdisk`/`moveCursor` steer go **dead once the OS runs** (they read
+`$FFFF`). The OS keeps its live cursor at **physical RAM `$3CF0`** (`MousX`
+high word / `MousY` low word, LIBHW-MOUSE `MouseLocation`), clamped to
+`[0,719]×[0,363]`, **scaled 3/2 coarse on X** (found by homing + differential
+RAM scan). Feedback-steering that global (halve the X step) places the cursor
+on any installer button; the mouse button is COPS keycap `$06`. This is the
+`click <x> <y>` primitive added to `lisadbg`.
+
+**The scan, RECONCILED (OBSERVED → device fix).** The Install click runs the OS
+ProFile driver's `PROF_INIT` **live for the first time** (first `$FCD801` touch
+at cycle ≈154.7 M). Against the M5 Task 2 HLE it spun **1.5 M region accesses,
+0 completions**, then the installer alerted **"unable to locate a usable
+disk… the internal disk was not ready in time"**. Root cause — the Task-2 HLE
+transcribed a *contract* whose transport diverged from what the driver actually
+does. Traced against SOURCE-PROFILEASM and reconciled (hardware-notes §10.2-10.5,
+strike-not-erase):
+
+- **BSY = Port B bit 1, a LEVEL** the driver polls (`WAIT_BUSY`/`WAIT_NOTBUSY`,
+  PROFASM:1618-1651): idle/ready = 1 (CMD deasserted), 0 when CMD asserted. (The
+  old model held it 0 forever → `WAIT_NOTBUSY`'s ~16 s spin.)
+- **Response codes on PORTA (VIA reg 15, no-handshake)**; the `$55` reply is
+  written back there (`DOSHAKE`, PROFASM:1663). **Data/status on IRA (reg 1,
+  auto-advancing)**; command bytes out on ORA (reg 1).
+- **`PROF_INIT` device-info** (block `$FFFFFF`) is not a 512+20 block: 4 status,
+  14 skip, **DRIVETYPE @ byte 14**, 3 skip, **3-byte DISCSIZE @ 18-20**
+  (PROFASM:1596-1613) → we answer drivetype 0 + discsize = 19456 (T_Seagate).
+- **Read byte ORDER** (NEW_CMD, PROFASM:150-159): **status (4, S6) FIRST**, then
+  header (20) + data (512, S7). **Write byte ORDER** (S10, PROFASM:687-707):
+  **header (20, WRHDR) FIRST**, then data (512, WRDATA); the driver then does a
+  **read-back verify** (S13/S1, PROFASM:167-168).
+
+With those fixed, `PROF_INIT`'s device-info handshake **completes** and the
+installer FINDS the disk: **"Do you want to use the disk attached to the
+internal connector?"** (`checkpointI`, disk-found FNV `0xb2a6195e6a532849`).
+
+**Install stages driven (OBSERVED, narrative).** OK → *"disk … not initialized …
+Continue"* → *"use part of the disk with MacWorks? Don't Share"* → **the whole
+19456-block disk is erased/initialized** (all writes persist to the image; the
+read-back verify passes) → the **Office System startup software is copied from
+the floppy to the Widget** (floppy reads climb into the thousands, Widget write
+commands past 20 000, interleaved 5:1 per the T_Seagate `remap_interleave`
+path, PROFILE:271/298) → **"Please insert the Lisa Office System 2 micro
+diskette"** — the first media swap.
+
+**BOUNDARY — the floppy media-change / remount attention (documented, not
+faked).** At the "insert disk 2" prompt the installer's process **blocks**: the
+OS scheduler idles (`$2E2BF8`) and the installer spins (`$CC4BDC`) with **zero
+I/O** — it is not polling the floppy, the Widget, or any register; it is a
+blocked process awaiting a device **event**. Ejecting the floppy and inserting
+disk 2 through the real `FloppyController.eject()`/`insert()` path (presence
+bits `DISKIN`/`DISKSTAT`, the same path `EmulationController` uses) does **not**
+wake it, and neither does a raised floppy **completion** interrupt. The exact
+unsatisfiable condition: **a mid-run floppy media change must raise a disk
+eject/insert *attention* interrupt that wakes the blocked OS Sony-driver
+process so the FS remounts the new volume** (the installer's main loop "always
+attempts remount" and verifies the diskette name, APIN-OFFICE:27,201). Our
+`FloppyController` models only **command-completion** interrupts (read/write),
+never a media-change attention, and the OS's eject (`unclamp`) is a modeled
+no-op — this was never needed before because every prior milestone booted from
+a single disk present at power-on. Closing it is a **floppy-subsystem** effort
+(eject/insert attention + the OS remount handshake), distinct from the Widget
+HLE this task delivered, and is the M5-follow-on frontier.
+
+### Bottom line (Task 3)
+
+The Widget hard-disk HLE is proven end to end for a single-disk session:
+`PROF_INIT` finds it, the disk initializes (19456 blocks, persisted), and the
+Office System copies onto it until the install needs disk 2. `checkpointI` pins
+the disk-found precursor; the install completes up to the floppy media-change
+boundary above.

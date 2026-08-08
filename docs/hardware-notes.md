@@ -1613,6 +1613,41 @@ After a command the driver reads **4 status bytes** into `ERRSTAT` (PROFASM
   the `$13 $01 $05 $E6` "read state registers" diagnostic command, OR'd into
   `ACCSTAT` (PROFASM `S41`:1099-1116, `S42`:1124-1131).
 
+### 10.5a Transfer byte ORDER + device-info layout — RECONCILED LIVE (M5 Task 3)
+
+M5 Task 2's `WidgetDrive` transcribed §10.2-10.5 as a *contract* but got the
+per-phase transport wrong; driving `PROF_INIT` live for the first time (Task 3,
+docs/rom-trace-notes.md "Checkpoint H (M5 Task 3)") pinned the exact behaviour
+against the driver's **state tables** (PROFASM `STATE_TABLE`:149-175). The facts
+the HLE now implements:
+
+- **BSY (Port B bit 1) is a LEVEL, idle = 1.** `WAIT_NOTBUSY` (PROFASM:1618-
+  1632) exits when bit 1 = **1** (ready, CMD deasserted); `WAIT_BUSY` (:1633-
+  1651) exits when bit 1 = **0** (controller presenting, CMD asserted).
+  `PROF_INIT`'s first `WAIT_NOTBUSY` requires idle BSY = 1 *before* any CMD.
+  (The Task-2 HLE held bit 1 = 0 always → `WAIT_NOTBUSY` spun the full ~16 s.)
+- **Single-block READ order** (`NEW_CMD`:151-159): after the accept handshake
+  the driver reads **`S6` status = 4 bytes FIRST** (`RD_STATUS`:402-417), then
+  **`S7` = 20-byte header (RDHDR:448) + 512 data (RDDATA:537)**. So the wire
+  stream is **status(4) · tag(20) · data(512)**.
+- **Single-block WRITE order** (`WRT`:161-168 → `S10`:687-709): **header (20,
+  WRHDR) FIRST, then 512 data (WRDATA)** — "Header followed by User Data"
+  (PROFASM:687). (Widget/multi-block `S10A`:711-728 is the reverse, "User Data
+  followed by Header"; §10.6.) The write is then followed by a **read-back
+  verify** (`S13`/`S1`, PROFASM:167-168) that re-reads the block — so a wrong
+  write order silently corrupts the block and fails as *"the Lisa could not
+  write to the disk"*, not as a status error.
+- **`PROF_INIT` device-info block** (`$FFFFFF`) is NOT a 512+20 block. After the
+  2nd handshake the driver reads (PROFASM:1600-1613): **4 status bytes**, **14
+  skipped**, **DRIVETYPE @ data byte 14**, **3 skipped**, **3-byte DISCSIZE @
+  bytes 18-20** (big-endian). `drivetype 0` + `discsize ∈ (9728,30000]` ⇒
+  T_Seagate single-block (§10.8).
+
+Response codes come back on **PORTA = VIA reg 15** (`base+$78`, no-handshake),
+one per handshake; data/status stream through **IRA = VIA reg 1** (`base+$8`,
+handshake), auto-advancing. This is now the executable spec in
+`WidgetDriveTests` and the end-to-end anchor `checkpointI`.
+
 ### 10.6 Multi-block & Widget commands (drivetype ≥ 2)
 
 Widgets (and any controller reporting `DRIVETYPE ≥ 2`) use multi-block

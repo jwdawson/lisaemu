@@ -113,13 +113,13 @@ private final class Harness {
     #expect(h.handshake() == 0x01)                 // first handshake: idle -> ready
     h.sendCommandBlock(cmd: 0x00, block: 6)        // 6-byte read command
     #expect(h.handshake() == 0x02)                 // read accepted
-    // Stream: 20 tag (RDHDR) then 512 data (RDDATA) then 4 status.
+    // Driver read order: 4 status (S6) FIRST, then 20 tag (RDHDR), then 512 data.
+    let status = h.readBytes(4)
     let gotTag = h.readBytes(20)
     let gotData = h.readBytes(512)
-    let status = h.readBytes(4)
+    #expect(status == [0, 0, 0, 0])
     #expect(Data(gotTag) == tag)
     #expect(Data(gotData) == data)
-    #expect(status == [0, 0, 0, 0])
     #expect(h.completionRaised)
     #expect(h.drive.completedCommands == 1)
 }
@@ -137,8 +137,8 @@ private final class Harness {
     #expect(h.handshake() == 0x01)
     h.sendCommandBlock(cmd: 0x01, block: 10)       // cmd 1 = write
     #expect(h.handshake() == 0x03)                 // write accepted
-    for b in data { h.sendByte(b) }                // 512 data
-    for b in tag { h.sendByte(b) }                 // 20 tag
+    for b in tag { h.sendByte(b) }                 // 20 header (WRHDR) first
+    for b in data { h.sendByte(b) }                // then 512 data (WRDATA)
     #expect(h.handshake() == 0x06)                 // post-write status handshake
     let status = h.readBytes(4)
     #expect(status == [0, 0, 0, 0])
@@ -161,8 +161,8 @@ private final class Harness {
     #expect(h.handshake() == 0x01)
     h.sendCommandBlock(cmd: 0x00, block: 999)
     #expect(h.handshake() == 0x02)
+    let status = h.readBytes(4)     // status FIRST (S6)
     _ = h.readBytes(20 + 512)
-    let status = h.readBytes(4)
     let longword = (UInt32(status[0]) << 24) | (UInt32(status[1]) << 16)
         | (UInt32(status[2]) << 8) | UInt32(status[3])
     #expect(longword & 0xC140C000 != 0, "out-of-range block must carry a fatal errstat bit")

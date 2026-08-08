@@ -343,30 +343,37 @@ public final class WidgetDrive {
         }
     }
 
-    /// The byte stream a read presents on IRA. For the device-info block
-    /// ($FFFFFF) this is `PROF_INIT`'s status+characteristics layout
-    /// (PROFASM:1596-1613); for a normal block it is 20 tag + 512 data + 4
-    /// status (the driver reads the header then the data; status follows).
+    /// The byte stream a read presents on IRA, in the order the DRIVER read
+    /// sequence consumes it: **4 status bytes FIRST** (S6 RD_STATUS,
+    /// PROFASM:158/408-411), then the **20-byte header** and **512 data bytes**
+    /// (S7, RDHDR:448 then RDDATA:537). (Struck the earlier data/tag-then-status
+    /// order, which scrambled every block read — the driver read the first 4
+    /// data bytes as status, etc. — and made the FS read its freshly-written
+    /// structures back as garbage: "the Lisa could not write to the disk".)
+    /// The device-info block ($FFFFFF) is PROF_INIT's own status+characteristics
+    /// layout (PROFASM:1596-1613), which is also status-first.
     private func readStream(block: Int) -> (stream: [UInt8], status: [UInt8]) {
-        guard let image else { return (zeros(4) + zeros(WidgetImage.bytesPerBlock), fatalStatus()) }
+        guard let image else { return (fatalStatus() + zeros(WidgetImage.bytesPerBlock), fatalStatus()) }
         if block == Command.deviceInfoBlock {
             return (deviceInfoStream(), okStatus())
         }
         guard block >= 0, block < image.blockCount else {
             log("WidgetDrive: read of out-of-range block \(block) (blockCount \(image.blockCount))")
             let s = fatalStatus()
-            return (zeros(WidgetImage.tagBytes) + zeros(WidgetImage.dataBytesPerBlock) + s, s)
+            return (s + zeros(WidgetImage.tagBytes) + zeros(WidgetImage.dataBytesPerBlock), s)
         }
         let s = okStatus()
-        // Tag first (RDHDR header, 20 bytes), then 512 data, then 4 status.
-        return ([UInt8](image.tag(block: block)) + [UInt8](image.data(block: block)) + s, s)
+        return (s + [UInt8](image.tag(block: block)) + [UInt8](image.data(block: block)), s)
     }
 
     private func commitWrite() {
-        let data = Data(writeAccum.prefix(WidgetImage.dataBytesPerBlock))
-        // The 20 tag bytes precede or follow the data in the driver's stream;
-        // WidgetImage stores 512 data + 20 tag. Take the last 20 as tag.
-        let tag = Data(writeAccum.suffix(WidgetImage.tagBytes))
+        // Single-block (T_Seagate) write stream is HEADER first, then user data
+        // (PROFASM S10:687-707 — WRHDR then WRDATA), i.e. 20 tag bytes then 512
+        // data bytes. (Struck the earlier data-first split, which scrambled the
+        // block and failed the driver's post-write read-back verify — S13/S1,
+        // PROFASM:167-168 — surfacing as "the Lisa could not write to the disk".)
+        let tag = Data(writeAccum.prefix(WidgetImage.tagBytes))
+        let data = Data(writeAccum[WidgetImage.tagBytes..<WidgetImage.bytesPerBlock])
         var status = okStatus()
         if let image, pendingBlock >= 0, pendingBlock < image.blockCount,
            pendingBlock != Command.deviceInfoBlock {

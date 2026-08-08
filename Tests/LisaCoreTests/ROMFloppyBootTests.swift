@@ -554,5 +554,80 @@ extension MusashiSuites {
             #expect(fnv1a(fb) == 0x04a1_9e4e_b597_04f4,
                     "attaching a Widget must not move the installer dialog; got \(String(format: "0x%016llx", fnv1a(fb)))")
         }
+
+        /// The live OS cursor position (MousX/MousY at physical RAM $3CF0,
+        /// found by M5 Task 3's install trace). Once the OS is running the ROM
+        /// cursor cells ($496/$498) are dead, so the boot-menu `moveCursor`
+        /// above cannot steer the installer -- this reads the OS's own cursor.
+        private func osCursor(_ m: Machine) -> (Int, Int) {
+            (Int(m.bus.physicalRead16(0x3CF0)), Int(m.bus.physicalRead16(0x3CF2)))
+        }
+        /// Feedback-steer the OS cursor to `(tx,ty)` then click (the half-step
+        /// on X damps the OS mouse driver's 3/2 coarse scaling, LIBHW-MOUSE).
+        private func osClick(_ m: Machine, _ tx: Int, _ ty: Int) {
+            for _ in 0..<80 {
+                let (cx, cy) = osCursor(m)
+                let dx = tx - cx, dy = ty - cy
+                if abs(dx) <= 1 && abs(dy) <= 1 { break }
+                m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                                     dy: Int8(max(-100, min(100, dy))))
+                m.run(until: m.cycles + 200_000)
+            }
+            click(m)
+        }
+
+        /// **Checkpoint I (M5 Task 3) -- the installer's disk scan FINDS the
+        /// Widget.** The furthest STABLE, deterministic install state pinned for
+        /// CI: the full install (initialize + copy + five disk swaps) is too
+        /// long and too stateful to pin, and stalls at the floppy media-change
+        /// boundary (docs/rom-trace-notes.md "Checkpoint H"), so those stages
+        /// are narrative. This anchors the precursor: with a blank Widget
+        /// attached, clicking "Install" drives the OS ProFile driver's
+        /// `PROF_INIT` live for the first time; its device-info handshake
+        /// completes against `WidgetDrive` (§10.2-10.5, reconciled in Task 3),
+        /// and the installer advances from "unable to locate a usable disk" to
+        /// "use the disk attached to the internal connector?". This is the
+        /// end-to-end proof of the WidgetDrive protocol rework.
+        @Test func checkpointI_installClickFindsTheWidgetDisk() throws {
+            let m = try bootIntoLoader()
+            var steps = 0
+            while steps < 10_000_000 && !m.halted { _ = m.step(); steps += 1 }
+            // Sanity: we are at the installer dialog (same anchor as G/H).
+            #expect(fnv1a(m.bus.framebufferSnapshot()) == 0x04a1_9e4e_b597_04f4)
+
+            // Attach a blank Widget-10 in a temp dir (Apple-derived install data
+            // never enters the repo -- a synthetic all-zero image, removed here).
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("checkpointI-\(UUID().uuidString).widget")
+            defer { try? FileManager.default.removeItem(at: url) }
+            let widget = try WidgetImage(createBlankAt: url, blockCount: 19456)
+            m.bus.widget.attach(widget)
+
+            // Click "Install" (screen pixel ~615,210) via the OS cursor.
+            osClick(m, 615, 210)
+            // Run until PROF_INIT drives the Widget region and the scan settles.
+            var lastFNV: UInt64 = 0, idle = 0
+            for _ in 0..<60 {
+                m.run(until: m.cycles + 5_000_000)
+                let f = fnv1a(m.bus.framebufferSnapshot())
+                idle = (f == lastFNV) ? idle + 1 : 0
+                lastFNV = f
+                if idle >= 6 && m.bus.widget.completedCommands >= 2 { break }
+                if m.halted { break }
+            }
+
+            #expect(!m.halted, "the OS runs live through the Install scan -- no halt")
+            // PROF_INIT ran live: the OS ProFile driver drove $FCD801 and its
+            // device-info handshake completed (was 0/0 on the boot path, G/H).
+            #expect(m.bus.widgetRegionAccesses > 0,
+                    "PROF_INIT drives the $FCD801 region on the Install scan")
+            #expect(m.bus.widget.completedCommands >= 2,
+                    "the device-info handshake completes; got \(m.bus.widget.completedCommands)")
+            // THE ANCHOR: the "use the disk attached to the internal connector?"
+            // dialog -- the installer FOUND the Widget (contrast the pre-rework
+            // "unable to locate a usable disk").
+            #expect(fnv1a(m.bus.framebufferSnapshot()) == 0xb2a6_195e_6a53_2849,
+                    "disk-found dialog FNV; got \(String(format: "0x%016llx", fnv1a(m.bus.framebufferSnapshot())))")
+        }
     }
 }

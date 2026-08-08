@@ -22,10 +22,16 @@ import Testing
 /// process-global singleton; only one live `Machine` per test).
 private let wRomDir = ProcessInfo.processInfo.environment["LISAEMU_ROM_DIR"]
 private let wWidgetDir = ProcessInfo.processInfo.environment["LISAEMU_WIDGET_DIR"]
+private let wWidgetImagePath = wWidgetDir.map { $0 + "/OS31-installed.widget" }
+// Fold the image's existence into the enable predicate so a set-but-empty
+// LISAEMU_WIDGET_DIR yields an explicit SKIP (reported as such), not a silently
+// green test that returned early without asserting anything.
+private let wWidgetImageExists =
+    wWidgetImagePath.map { FileManager.default.fileExists(atPath: $0) } ?? false
 
 extension MusashiSuites {
-    @Suite(.enabled(if: wRomDir != nil && wWidgetDir != nil,
-                    "Set LISAEMU_ROM_DIR and LISAEMU_WIDGET_DIR (holding OS31-installed.widget) to run Widget-boot tests"))
+    @Suite(.enabled(if: wRomDir != nil && wWidgetImageExists,
+                    "Set LISAEMU_ROM_DIR and LISAEMU_WIDGET_DIR to a directory holding OS31-installed.widget to run Widget-boot tests"))
     struct ROMWidgetBootTests {
         private func fnv1a(_ bytes: [UInt8]) -> UInt64 {
             var h: UInt64 = 0xcbf2_9ce4_8422_2325
@@ -78,9 +84,8 @@ extension MusashiSuites {
         /// loaded RAM code, and the OS drew substantial UI -- the boot ran off
         /// the hard disk, live, with no halt.
         @Test func checkpointK_romBootsInstalledOSOffTheWidget() throws {
-            let widgetPath = wWidgetDir! + "/OS31-installed.widget"
-            guard FileManager.default.fileExists(atPath: widgetPath) else { return }
-
+            // Image presence is guaranteed by the suite's .enabled(if:) predicate
+            // (wWidgetImageExists), so no silent early-return guard here.
             let m = try machineWithInstalledWidgetCopy()
             m.run(until: 18_000_000)                              // POST -> boot menu
             moveCursor(m, to: 420, 182); click(m)                // "STARTUP FROM..."

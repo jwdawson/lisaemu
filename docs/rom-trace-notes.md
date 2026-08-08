@@ -2567,8 +2567,19 @@ which `IODispatcher` forwards to `widget.portBWrite`. That forward was gated to
 silently blocked the ROM's legitimate boot probe: the ROM bit-banged CMD at
 `$FCD901`, the strobe never reached the drive, BSY never answered, and
 `prof_entry` timed out (error `$50`/`$51` at `$FE1F7E`/`$FE1F8C`). **Observed
-symptom:** STARTUP FROM listed only the floppy (⌘2); the main-menu ProFile icon
-stayed crossed-out ("42"). **Fix** (evidence-gated, `IODispatcher
+symptom (the one this fix moves):** STARTUP FROM listed only the floppy (⌘2); after
+the fix the **Internal Hard Disk (⌘1)** appears in that device list.
+**Decoupling note (M5 Task 5):** this fix changes the **menu-time** device
+listing (the `$FCD901` boot probe run when you open STARTUP FROM), and *only*
+that. It does **not** touch the **POST-time** power-on boot menu, whose
+crossed-out ProFile icon labelled **"42"** (the no-boot-device indicator, §"The
+screen: the classic Lisa startup menu…") is drawn before any STARTUP FROM
+selection and remains unchanged — the M5 power-on menu framebuffer `m5-boot-01`
+is **byte-identical to the M1b anchor** (FNV `0xd09234d25516d0b8`, 78,100 set px,
+crossed-out "42" and all). Earlier phrasing that paired "STARTUP FROM lists only
+the floppy" with "the main-menu ProFile icon stayed crossed-out" as a single
+symptom conflated the two probes; only the menu-time listing is a function of
+this change. **Fix** (evidence-gated, `IODispatcher
 .isWidgetPortBOffset`): forward PORT-B (index-0) writes for the `$FCD901` alias
 too — they are the *same physical register* on real hardware, so writing CMD/DIR
 through either base drives the same pins. The floppy path only *reads* VIA1 PB6
@@ -2620,8 +2631,26 @@ mouse live. The screen has left the boot-menu anchor
   clean `overmount`/RTC so they don't appear, but that is content-shaping, not a
   boot blocker.
 - No RTC (COPS clock) is modeled, hence the clock note; orthogonal to the boot.
+- **OQ1″ residual falsifier — still not surfaced (M5 Task 5 check).** The Widget
+  boot runs `prof_entry` in supervisor/domain-0 and the OS across domains 0/2,
+  but it exercised **no** supervisor DATA access to a segment mapped
+  present-but-different across domains (the one event class that could distinguish
+  forced-domain-0 from latch-following — see "Checkpoint G … OQ1″ — ANSWERED
+  (round 5)"). So the residual falsifier row **stands**: OQ1″ remains ANSWERED
+  (forced domain 0), with the both-present-differing case still the documented
+  revisit point for `Bus.translationDomain` if ever observed.
 - `checkpointK` pins the robust behavioural proof (hundreds of Widget reads +
   booted code outside ROM + screen left the menu), not an exact desktop FNV: the
   desktop is reached only after two click-through dialogs whose feedback-loop
   timing makes an exact-cycle framebuffer anchor fragile for CI. The desktop
   itself is the narrative artifact (`m5-boot-06`, docs/m5-demo.md).
+
+**Standing frontier at M5 close.** Checkpoint K is this document's current
+frontier statement: the Office System **desktop is drawn from a Widget boot with
+the mouse live** — the spec's M4 ⭐, reached. What lies beyond it is not a stalled
+boundary but unexercised surface: the desktop's apps (Filer operations, launching
+LisaWrite/LisaDraw — the Linkmaps now resolve live to annotate them), a modeled
+RTC so the clock/calendar note stops appearing (the north star's "working clock"
+clause, the natural M6 headline), and the multi-block/`T_Widget` protocol path
+(§10.6, unimplemented by design). See `docs/m5-demo.md` for the full milestone
+walkthrough and the M6 candidate roster.

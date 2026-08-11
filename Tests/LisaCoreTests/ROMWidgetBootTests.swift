@@ -155,16 +155,28 @@ extension MusashiSuites {
             #expect(set > 2000, "the OS drew substantial UI off the Widget boot; set pixels = \(set)")
         }
 
-        /// **Checkpoint L (M6 Task 1) -- soft power: the OS shuts itself down.**
-        /// Boots the installed Office System off the Widget, dismisses the
-        /// dirty-volume + clock-not-set dialogs to reach the live desktop, then
-        /// presses the soft-power button (`COPS.pressPowerButton()` = the `$FB`
-        /// reset-dispatch byte). The OS runs its OWN shutdown -- DRIVERS
-        /// synthesizes keycap `$08`, the Office System requests shutdown, and
-        /// PowerDown (libhw-MACHINE:419-436) issues a COPS power-off command
-        /// (`$20`/`$21`) -- which drives `Machine.powerState` to `.off`, a
-        /// clean stop (NOT a `halted` double fault). See docs/rom-trace-notes.md
-        /// "Checkpoint L" and docs/hardware-notes.md §7.
+        /// **Checkpoint L (M6 Task 1, extended by Task 2) -- soft power +
+        /// the clock the OS believes.** Boots the installed Office System off
+        /// the Widget, dismisses the dirty-volume dialog, and reaches the live
+        /// desktop -- which, since M6 Task 2's real `$02` clock reply, NO
+        /// LONGER shows the "clock not set" Note (the M1b placeholder's garbage
+        /// BCD triggered it; the parser-derived host-time reply reads as a
+        /// valid date). Then presses the soft-power button
+        /// (`COPS.pressPowerButton()` = the `$FB` reset-dispatch byte): the OS
+        /// runs its OWN shutdown -- DRIVERS synthesizes keycap `$08`, the
+        /// Office System requests shutdown, and PowerDown (libhw-MACHINE:419-
+        /// 436) issues a COPS power-off command -- which drives
+        /// `Machine.powerState` to `.off`, a clean stop (NOT a `halted` double
+        /// fault). See docs/rom-trace-notes.md "Checkpoint L" and
+        /// docs/hardware-notes.md §4/§7.
+        ///
+        /// **Task 2's added proof:** the shutdown byte is now `$21` (power off,
+        /// clock ON), not `$20` (clock off). PowerDown reads the clock and
+        /// branches on `$0FFF` (MACHINE:423-427): `$21` when the clock is
+        /// running, `$20` when it isn't. A `$21` shutdown is therefore direct
+        /// evidence the OS read our clock as SET -- the same fact that removes
+        /// the Note. (Expected-movement re-anchor: pre-Task-2 this was `$20`;
+        /// the clock fix legitimately moves it to `$21`.)
         ///
         /// The proof this closes: after this clean shutdown, the volume is
         /// written back not-in-use, so rebooting the same image no longer shows
@@ -180,7 +192,9 @@ extension MusashiSuites {
             m.run(until: m.cycles + 160_000_000)                 // boot -> dirty-volume dialog
             clickAt(m, 595, 72)                                  // "Don't Check"
             m.run(until: m.cycles + 390_000_000)                 // Desktop Manager builds the desktop
-            clickAt(m, 585, 118)                                 // "OK" on the clock-not-set note
+            // No clock-not-set Note to dismiss anymore (Task 2): the desktop is
+            // reached clean. (The M1b placeholder needed a clickAt(585,118)
+            // here; verified live-gone in task-2-report.md, m6-clock-02.)
             m.run(until: m.cycles + 40_000_000)
 
             // At the live desktop, no halt, still powered on.
@@ -198,11 +212,15 @@ extension MusashiSuites {
             #expect(m.powerState == .off,
                     "the OS ran its own shutdown and the COPS power-off command stopped the machine")
             #expect(!m.halted, "a clean soft power-off is distinct from a double-fault halt")
-            // The command the OS actually sent is one of the documented
-            // power-off bytes (hardware-notes.md §7: $20/$21/$23).
-            let powerOffs: Set<UInt8> = [0x20, 0x21, 0x23]
-            #expect(m.bus.cops.powerCommandLog.contains { powerOffs.contains($0) },
-                    "a real power-off command was issued; log = \(m.bus.cops.powerCommandLog.map { String(format: "$%02X", $0) })")
+            // The command the OS actually sent is $21 (power off, clock ON):
+            // PowerDown only sends that when it read the clock as running
+            // (MACHINE:423-427), so this doubles as proof the OS believes our
+            // clock. $20 (clock off) would mean it read the clock as unset.
+            let log = m.bus.cops.powerCommandLog.map { String(format: "$%02X", $0) }
+            #expect(m.bus.cops.powerCommandLog.contains(0x21),
+                    "shutdown sent $21 (clock believed set); log = \(log)")
+            #expect(!m.bus.cops.powerCommandLog.contains(0x20),
+                    "$20 (clock-off) would mean the OS read the clock as unset; log = \(log)")
         }
     }
 }

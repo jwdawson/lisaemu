@@ -610,7 +610,7 @@ Source: libhw-DRIVERS:1074-1252 (COPS/COPSX handlers)
 
 **State 2:** Receive dy → emit MouseMovement, return to state 0
 
-**State 3:** Receive 5 clock bytes (after $E0-$EF seen in state 4) → update ClockHigh/ClockLow
+**State 3:** Receive 5 clock bytes (after $E0-$EF seen in state 4) → update ClockHigh/ClockLow (byte layout: see "Read-Clock ($02) Reply Format" below)
 
 **State 4 (reset dispatch):**
 - $00-$DF: keyboard ID
@@ -646,6 +646,101 @@ faithful 2-byte `$80, <keyboard ID>` announcement and drops the 5 trailing
 `$00`s; the ROM reaches the byte-identical boot menu either way (the
 power-on stream is not load-bearing for the boot path — see
 docs/rom-trace-notes.md "POST completion (Task 7)").
+
+### Read-Clock ($02) Reply Format and Set-Clock Sequence (M6 Task 2)
+
+Sources: libhw-TIMERS:600-609 (clock/calendar packing), :619-641 (`Clock`,
+the `$02` read), :652-680 (`SetClock`, the set sequence), :695-766
+(`ClockToDate`, the consumer); libhw-DRIVERS:1161-1219 (`COPS3`/`COPS4`, the
+parser); :505-506 (uninitialized init); libhw-MACHINE:419-480 (power-off /
+reboot-alarm clock semantics).
+
+**~~M1b-era placeholder (STRUCK):~~** ~~the `$02` reply was `$80, $E0,
+<4-byte big-endian host Unix time>, $00` — a best-effort guess, no
+byte-level format claimed.~~ SUPERSEDED: the OS parses those raw seconds as
+BCD and gets an invalid day/hour, which is why the Office System showed its
+"clock not set" Note (M6 Task 2 live proof, task-2-report.md). The real
+format is derived below from the OS's own parser — the OS side is the
+contract, every byte cited.
+
+**Clock/calendar packing (TIMERS:600-606).** Six nib-packed bytes:
+
+```
+byte0     byte1     byte2     byte3     byte4     byte5
+0000yyyy  dddddddd  ddddhhhh  hhhhmmmm  mmmmssss  sssstttt
+```
+
+- `yyyy` — year, BINARY, `1980 = 0`; 4 bits, rolls over every 16 years
+  (TIMERS:596). `ClockToDate` maps `n -> 1980+n`, range 1980..1995
+  (TIMERS:687,711-713).
+- `dddddddddddd` — day-of-year `1..366`, 3 BCD nibbles (hundreds, tens, ones).
+- `hhhhhhhh`/`mmmmmmmm`/`ssssssss` — hour/minute/second, 2 BCD nibbles each.
+- `tttt` — tenths of a second, 1 BCD nibble.
+- Top nibble `0000` of byte0 is the ALARM field (SetClock zeros it,
+  TIMERS:655); it is dropped in the read reply's selector high nibble.
+- "Not set since battery loss" sentinel: `0FFF FFFFFFFF` (TIMERS:608-609),
+  the value `ClockToDate` treats as uninitialized (DRIVERS:505-506).
+
+**The `$02` reply stream (parser-derived, DRIVERS:1077-1219).** `Clock`
+(TIMERS:619) sends `$02` then spins reading Port A into the `COPS` interrupt
+parser until `ClockReady`. COPS must reply with this 7-byte input stream:
+
+| Byte  | Value            | Parser action (DRIVERS)                                   |
+|-------|------------------|----------------------------------------------------------|
+| 1     | `$80`            | State 0 -> State 4 ("reset code follows", COPS0 @5:1092)  |
+| 2     | `$E0 \| yyyy`    | State 4 clock-start: `ClockReady=0, ClockBytes=5, ClockHigh=year nibble`, -> State 3 (COPS4 @2:1212) |
+| 3     | byte1 `dddddddd` | State 3, ClockBytes==5: `ClockHigh=(ClockHigh<<8)\|b` (:1167) |
+| 4     | byte2            | State 3: `ClockLow=(ClockLow<<8)\|b` (:1173)              |
+| 5     | byte3            | State 3: ditto                                            |
+| 6     | byte4            | State 3: ditto                                            |
+| 7     | byte5            | State 3, ClockBytes->0: `ClockReady=1`, -> State 0 (:1181)|
+
+Result: `ClockHigh = 0000yyyy dddddddd`, `ClockLow = ddddhhhh hhhhmmmm
+mmmmssss sssstttt` — exactly the packing above. So the reply PAYLOAD (after
+the `$80` frame) is `[$E0|yearNibble, byte1..byte5]`, 6 bytes. This is what
+`COPS.clockReplyBytes(from:)` builds from host time and what
+`notSetClockReply = [$EF,$FF,$FF,$FF,$FF,$FF]` builds for the off state.
+
+**Host-year windowing.** Host year `Y` maps by the same 16-year rollover the
+silicon uses: `yearNibble = (Y - 1980) & $0F`. E.g. 2026 -> nibble 14 ->
+displayed 1994; 2023 -> nibble 11 -> displayed 1991. Faithful to the 4-bit
+field and keeps the desktop showing an in-window date. Time-of-day/day-of-
+year are preserved exactly. Decoded in a FIXED UTC Gregorian calendar so the
+byte sequence is a pure function of the injected `Date` (deterministic
+tests).
+
+**Set-clock sequence `$2C -> $10xN -> $25` (TIMERS:652-680).** `SetClock`:
+1. `$2C` — disable clock/timer, prep set (TIMERS:656).
+2. 16x `$10|nibble` (TIMERS:659-671): two 8-iteration loops send, MSN-first,
+   the high clock LONGWORD's 8 nibbles (`0,0,0,0,0,year,dayHi,dayMid` — the
+   5 leading zeros are the `AND #$0FFF` zero-fill of the 16-bit high word
+   promoted to a longword) then the low longword's 8
+   (`dayLo,hourHi,hourLo,minHi,minLo,secHi,secLo,tenths`).
+3. `$25` — enable clock, disable timer (TIMERS:673): commit.
+
+So COPS drops the 5 leading fill nibbles and repacks the last 11 into the
+6-byte reply payload — the exact inverse of the read parse. A committed set
+value is returned by every subsequent `$02` until cleared. (Modeled in
+`COPS.finishSetSequence`.)
+
+**Power-off clock semantics (MACHINE:419-480).** `PowerDown` reads the clock
+and picks the power-off byte by whether it is running (MACHINE:423-427):
+- `$21` — power off, clock ON (clock was running): clock PRESERVED.
+- `$20` — power off, clock OFF (clock read as `$0FFF`): clock CLEARED; next
+  `$02` returns the not-set sentinel. The OS only sends `$20` when it already
+  saw the clock unset, so this is a faithful mirror.
+- `$23` — power off, reboot later (PowerCycle, MACHINE:473): clock ON,
+  PRESERVED; pairs with `$2D` + 5 alarm nibbles (MACHINE:462-471).
+
+**DEFERRED to M7 — the `$23`/`$2D` timed reboot WAKE.** `PowerCycle`
+(MACHINE:447-480) powers off and re-powers after N seconds, but ONLY if the
+clock is already set (MACHINE:451-456 falls back to a plain `PowerDown`
+otherwise). Now that our `$02` reads as set, that path is reachable, but
+modeling the physical wake needs a host-time alarm that RE-POWERS the Machine
+(Task 1's `powerState` in reverse) — out of Task 2's read/set/keep scope. The
+alarm nibbles are captured in `COPS.clockSetNibbles` for provenance; delivery
+source expectation is MACHINE:447-480. (Mirrors Task 1's `$23`/`$2D` deferral
+note in §7.)
 
 ## 5. Interrupts
 

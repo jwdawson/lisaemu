@@ -191,16 +191,54 @@ import Foundation
 ///   (Task 7)". The stream is fidelity-only, not load-bearing: the ROM
 ///   draws the identical menu even with no power-on stream at all (verified
 ///   unaffected by this ID correction too -- see task-2-report.md).
-/// - `$02` (read clock) reply: `$80, $E0, <4-byte big-endian host Unix
-///   time>, $00` -- BEST-EFFORT PLACEHOLDER (hardware-notes gives no
-///   byte-level format for the 5-byte clock payload). `$E0` (state-4 "clock
-///   start", year nibble left `0`) framed behind `$80` because state 0's
-///   decode only reaches state 4 via `$80`; a bare `$E0-$EF` byte at state 0
-///   decodes as a keycode instead (hardware-notes.md §4), so this framing is
-///   the only self-consistent reading of the documented state machine, even
-///   though the exact 5-data-byte encoding is unverified. The boot ROM does
-///   not send `$02` on the path to the menu, so this remains unexercised by
-///   the boot trace.
+///
+/// ## M6 Task 2 -- the `$02` reply is now a REAL clock, parser-derived
+///
+/// ~~`$02` (read clock) reply: `$80, $E0, <4-byte big-endian host Unix
+/// time>, $00` -- BEST-EFFORT PLACEHOLDER (hardware-notes gives no
+/// byte-level format for the 5-byte clock payload). `$E0` (state-4 "clock
+/// start", year nibble left `0`) framed behind `$80`...~~ SUPERSEDED. That
+/// M1b-era placeholder shipped raw big-endian Unix-time bytes as if they
+/// were the clock payload; the OS's own parser reads them as BCD and gets
+/// garbage (an invalid day/hour), which is exactly why the Office System
+/// showed its "clock not set" Note (see task-2-report.md live proof). The
+/// real byte format is NOT a guess -- it is DERIVED from the OS's own COPS
+/// input parser, `COPS3`/`COPS4` in libhw-DRIVERS:1161-1219, cross-checked
+/// against the packing comment libhw-TIMERS:600-609 and the `ClockToDate`
+/// consumer libhw-TIMERS:695-766. Documented in full in hardware-notes.md
+/// §4 "Read-Clock ($02) Reply Format". Summary of the contract:
+///
+/// - The OS sends `$02`; `Clock` (TIMERS:619-641) then spins reading Port A,
+///   feeding each byte to the `COPS` interrupt parser, until `ClockReady`.
+/// - COPS replies with a 7-byte input stream: `$80` (State 0 -> State 4
+///   "reset code follows"), then `$E0|year` (State 4 clock-start; the low
+///   nibble is the year, DRIVERS:1216), then 5 data bytes (State 3,
+///   DRIVERS:1161-1185). `ClockBytes` counts exactly 5, so the packet is
+///   `$80` + 6 bytes.
+/// - The clock/calendar is 6 nib-packed bytes (TIMERS:600-606):
+///   `0000yyyy dddddddd ddddhhhh hhhhmmmm mmmmssss sssstttt` -- year binary
+///   (1980=0), day-of-year (1..366), hour, minute, second, tenths all BCD.
+///   The State-4 selector byte carries `yyyy` in its low nibble (the top
+///   `0000` alarm nibble is dropped into the `$E` selector high nibble); the
+///   5 State-3 data bytes are the remaining 5 packed bytes verbatim. So the
+///   reply payload is `[$E0|yearNibble, dayHi:dayMid, dayLo:hourHi,
+///   hourLo:minHi, minLo:secHi, secLo:tenths]`.
+/// - Year windowing: the hardware year field is 4 bits and rolls over every
+///   16 years (TIMERS:596); `ClockToDate` maps nibble `n` -> `1980+n`,
+///   range 1980..1995 (TIMERS:687,711-713). Host years are mapped by the
+///   same 16-year rollover: `yearNibble = (hostYear - 1980) & 0x0F` (e.g.
+///   2026 -> nibble 14 -> displayed 1994). Faithful to the silicon, and it
+///   keeps the desktop showing a plausible in-window date. See
+///   `clockReplyBytes(from:)`.
+/// - "Not set" sentinel: `0FFF FFFFFFFF` (TIMERS:608-609, DRIVERS:505-506).
+///   When our modeled clock is OFF (a `$20` power-off cleared it) the reply
+///   payload is `[$EF, $FF, $FF, $FF, $FF, $FF]`, which the parser folds to
+///   `ClockHigh=$0FFF, ClockLow=$FFFFFFFF` -- the exact uninitialized
+///   pattern, so the OS correctly re-shows "not set".
+///
+/// The boot ROM does not send `$02` on the path to the menu; the Office
+/// System does, once, while building the desktop -- that read is what this
+/// format satisfies.
 public final class COPS {
     // MARK: - Tunable timing ("plausible", not cycle-exact -- see the type
     // doc comment). All comfortably inside the ROM's ~1562-iteration CRDY
@@ -299,11 +337,12 @@ public final class COPS {
     /// (waking at a scheduled time) is NOT modeled -- see `processCommand`.
     private let onPowerOff: () -> Void
     /// Injectable clock source for the `$02` read-clock reply
-    /// (`enqueueClockReply`/`defaultHostClockBytes`) -- `Date()` is
-    /// LisaCore's only source of nondeterminism, and the OS loader (a
-    /// later M2 task) may exercise this path. Defaults to the real host
-    /// clock; tests inject a fixed `Date` for a deterministic reply byte
-    /// sequence. Fold-in from the M1b final review.
+    /// (`enqueueClockReply` -> `clockReplyBytes(from:)`) -- `Date()` is
+    /// LisaCore's only source of nondeterminism, and the Office System
+    /// exercises this path once while building the desktop. Defaults to the
+    /// real host clock; tests inject a fixed `Date` for a deterministic reply
+    /// byte sequence. Fold-in from the M1b final review; M6 Task 2 made the
+    /// encoding a real parser-derived BCD clock.
     private let clockSource: () -> Date
 
     // MARK: - CRDY / output (command) state
@@ -335,6 +374,34 @@ public final class COPS {
     public private(set) var clockSetNibbles: [UInt8] = []
     /// Set by `$7C` ("enable mouse interrupts (16ms)", hardware-notes.md §4).
     public private(set) var mouseInterruptsEnabled = false
+
+    // MARK: - Clock ("keep it") state -- M6 Task 2
+
+    /// Whether the modeled RTC currently holds a valid time. `true` by
+    /// default (a real Lisa's battery-backed clock keeps running across soft
+    /// power-off, TIMERS:596-598, so a freshly-booted machine finds it set --
+    /// which is what kills the Office System's "clock not set" Note). A `$20`
+    /// power-off (clock OFF, MACHINE:425) clears it; `$21`/`$23` (clock ON,
+    /// MACHINE:427/473) preserve it. When `false`, `$02` replies with the
+    /// `0FFF FFFFFFFF` uninitialized sentinel (TIMERS:608-609).
+    public private(set) var clockRunning = true
+    /// A clock the OS explicitly SET via the `$2C -> $10xN -> $25` sequence
+    /// (TIMERS:652-680), stored as the 6-byte `$02` reply payload
+    /// (`[$E0|year, ...5 data bytes]`). `nil` = no explicit set, so `$02`
+    /// replies from the injected `clockSource` (host time). Once set, every
+    /// subsequent `$02` read returns THIS value (the "set it changes reads"
+    /// contract); it does not tick -- the OS reads the clock rarely (boot,
+    /// file stamps) and a fixed set value is deterministic and sufficient.
+    private var setClockReply: [UInt8]?
+    /// True between a `$2C` (prep set-clock, TIMERS:656) and its closing
+    /// `$25` (enable clock, TIMERS:673): the window during which `$10|n`
+    /// nibbles are accumulated into `setSequenceNibbles` for this set.
+    private var setSequenceActive = false
+    /// Nibbles collected since the last `$2C`, in send order. SetClock sends
+    /// 16 (TIMERS:659-671: 2 outer x 8 inner); the clock is the last 11
+    /// (5 leading zeros from the high longword's zero-fill are dropped) --
+    /// see `finishSetSequence`.
+    private var setSequenceNibbles: [UInt8] = []
 
     /// Total bytes currently queued for delivery to the CPU, including one
     /// already "ready" on Port A (`byteReady`) but not yet consumed via a
@@ -419,6 +486,13 @@ public final class COPS {
         powerCommandLog.removeAll()
         clockSetNibbles.removeAll()
         mouseInterruptsEnabled = false
+        // A battery-backed RTC survives reset with a valid time (TIMERS:596-
+        // 598); default it running and unset-by-OS, so `$02` reads live host
+        // time and the desktop shows a sane date without any set sequence.
+        clockRunning = true
+        setClockReply = nil
+        setSequenceActive = false
+        setSequenceNibbles.removeAll()
         for byte in Self.powerOnResetPacket {
             enqueue(byte)
         }
@@ -481,48 +555,141 @@ public final class COPS {
         case Command.readClock:
             enqueueClockReply()
         case Command.writeClockNibbleBase...(Command.writeClockNibbleBase | 0x0F):
-            clockSetNibbles.append(command & 0x0F)
-        case Command.powerOffClockOff, Command.powerOffClockOn, Command.powerOffRebootLater:
-            // The three POWER-OFF commands (hardware-notes.md §7, MACHINE:425/
-            // 427/473): after logging, drive the machine to its powered-off
-            // state. `$23` ("power off, reboot later") powers off HERE exactly
-            // like `$20`/`$21`; only the wake-at-alarm half is deferred (the OS
-            // pairs it with a `$2D` "set clock for reboot alarm" which we log
-            // but do not schedule a wake from -- no RTC alarm is modeled, M6
-            // Task 2 territory).
+            let nibble = command & 0x0F
+            clockSetNibbles.append(nibble)
+            // Inside a `$2C..$25` set window, this nibble is part of the clock
+            // the OS is writing (TIMERS:663-668). Outside one (e.g. the
+            // PowerCycle `$2D` reboot-alarm nibbles, MACHINE:466-469), it is
+            // still logged above but does not touch the stored clock.
+            if setSequenceActive { setSequenceNibbles.append(nibble) }
+        case Command.disableClockPrepSetClock:
+            // `$2C` disable-clock/prep-set (TIMERS:656): opens the set window.
+            powerCommandLog.append(command)
+            setSequenceActive = true
+            setSequenceNibbles.removeAll()
+        case Command.enableClockDisableTimer:
+            // `$25` enable-clock/disable-timer (TIMERS:673): closes the set
+            // window and commits the accumulated nibbles as the new clock.
+            powerCommandLog.append(command)
+            finishSetSequence()
+        case Command.disableTimerSetRebootAlarm:
+            // `$2D` set clock for a reboot alarm (MACHINE:462). Logged for
+            // provenance; the physical timed WAKE is not modeled (see below).
+            powerCommandLog.append(command)
+        case Command.powerOffClockOn, Command.powerOffRebootLater:
+            // `$21`/`$23` power off with the clock LEFT ON (MACHINE:427/473):
+            // the battery-backed RTC keeps its time across the power-off, so
+            // the stored clock is PRESERVED. `$23` ("reboot later") also arms
+            // a wake alarm on real hardware; that timed WAKE is DEFERRED (see
+            // the deferral note below).
             powerCommandLog.append(command)
             onPowerOff()
-        case Command.enableClockDisableTimer, Command.disableClockPrepSetClock,
-             Command.disableTimerSetRebootAlarm:
-            // Clock/timer configuration, NOT power-off (hardware-notes.md §7):
-            // `$25` enable-clock/disable-timer, `$2C` disable-clock prep-set,
-            // `$2D` set reboot alarm. Logged for provenance; no power effect.
+        case Command.powerOffClockOff:
+            // `$20` power off with the clock OFF (MACHINE:425): the RTC stops
+            // and loses its time, so subsequent `$02` reads return the
+            // uninitialized `0FFF..` sentinel (TIMERS:608-609). The OS only
+            // issues `$20` when it already read the clock as unset (PowerDown,
+            // MACHINE:423-425), so this is a faithful mirror, not a
+            // data-loss surprise.
             powerCommandLog.append(command)
+            clockRunning = false
+            setClockReply = nil
+            onPowerOff()
         case Command.enableMouseInterrupts:
             mouseInterruptsEnabled = true
         default:
             break   // unrecognized (e.g. the ROM's own POST probe bytes) -- handshake-only ack
         }
+        // DEFERRED (M7): the `$23`/`$2D` timed-reboot WAKE half. PowerCycle
+        // (MACHINE:447-480) sends `$2D` + 5 alarm nibbles + `$23` to power off
+        // and wake after N seconds -- but ONLY when the clock is already set
+        // (MACHINE:451-456 falls back to a plain PowerDown otherwise). Now
+        // that our clock reads as set, that path becomes reachable; modeling
+        // the wake needs host-time alarm scheduling that RE-POWERS the
+        // Machine (Task 1's `powerState` in reverse), which is out of this
+        // task's read/set/keep scope. The alarm nibbles are captured in
+        // `clockSetNibbles` for provenance. Source expectation on delivery:
+        // MACHINE:447-480. Documented in hardware-notes.md §4/§7.
+    }
+
+    /// Commits a completed `$2C..$25` set sequence (TIMERS:652-680) into
+    /// `setClockReply`. SetClock sends 16 nibbles (2 outer x 8 inner loops,
+    /// TIMERS:659-671): the high clock longword's 8 nibbles (5 leading zeros
+    /// from its `AND #$0FFF` zero-fill, then year + 2 day nibbles) followed
+    /// by the low longword's 8 (the remaining day nibble + hour/minute/second/
+    /// tenths). The meaningful clock is the LAST 11 nibbles
+    /// `[year, dayHi, dayMid, dayLo, hourHi, hourLo, minHi, minLo, secHi,
+    /// secLo, tenths]`; we drop the 5 leading fill nibbles and repack into the
+    /// 6-byte `$02` reply payload `[$E0|year, ...5 data bytes]` -- the exact
+    /// inverse of the `COPS4`/`COPS3` parser (DRIVERS:1212-1185).
+    private func finishSetSequence() {
+        setSequenceActive = false
+        guard setSequenceNibbles.count >= 11 else {
+            // Malformed/short sequence: leave the prior clock untouched.
+            setSequenceNibbles.removeAll()
+            return
+        }
+        let n = Array(setSequenceNibbles.suffix(11))
+        setSequenceNibbles.removeAll()
+        let selector = 0xE0 | (n[0] & 0x0F)
+        setClockReply = [selector,
+                         (n[1] << 4) | n[2], (n[3] << 4) | n[4],
+                         (n[5] << 4) | n[6], (n[7] << 4) | n[8],
+                         (n[9] << 4) | n[10]]
+        clockRunning = true
     }
 
     private func enqueueClockReply() {
         enqueue(0x80)
-        for byte in Self.defaultHostClockBytes(now: clockSource()) {
+        for byte in currentClockReplyPayload() {
             enqueue(byte)
         }
     }
 
-    /// Best-effort placeholder host-clock encoding -- see the type doc
-    /// comment "Power-on stream and the `$02` clock reply". 6 bytes: state-4
-    /// selector `$E0` (year nibble left 0, unvalidated) + 4-byte big-endian
-    /// host Unix time + 1 reserved/padding byte, matching hardware-notes.md
-    /// §4 State 4 ($E0-EF) -> State 3 (5 data bytes).
-    public static func defaultHostClockBytes(now: Date = Date()) -> [UInt8] {
-        let seconds = UInt32(max(0, min(Double(UInt32.max), now.timeIntervalSince1970)))
-        return [0xE0,
-                UInt8(seconds >> 24), UInt8((seconds >> 16) & 0xFF),
-                UInt8((seconds >> 8) & 0xFF), UInt8(seconds & 0xFF),
-                0x00]
+    /// The 6-byte `$02` reply payload for the modeled clock's current state:
+    /// the uninitialized sentinel when the clock is off, an explicitly-set
+    /// value if the OS set one, else live host time. See the type doc comment
+    /// "M6 Task 2 -- the `$02` reply".
+    private func currentClockReplyPayload() -> [UInt8] {
+        guard clockRunning else { return Self.notSetClockReply }
+        if let set = setClockReply { return set }
+        return Self.clockReplyBytes(from: clockSource())
+    }
+
+    /// The `0FFF FFFFFFFF` "clock not set since battery loss" pattern
+    /// (TIMERS:608-609) as a `$02` reply payload: `$EF` (State-4 clock-start,
+    /// year nibble `$F`) + five `$FF`. The parser folds this to
+    /// `ClockHigh=$0FFF, ClockLow=$FFFFFFFF` (DRIVERS:1214-1185), the exact
+    /// value `ClockToDate` treats as uninitialized (DRIVERS:505-506).
+    static let notSetClockReply: [UInt8] = [0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]
+
+    /// Encodes a host `Date` into the 6-byte `$02` reply payload
+    /// `[$E0|yearNibble, dayHi:dayMid, dayLo:hourHi, hourLo:minHi,
+    /// minLo:secHi, secLo:tenths]`, per the clock/calendar packing
+    /// (TIMERS:600-606) and the parser (DRIVERS:1212-1185). Day is day-of-
+    /// year (1..366, TIMERS:687); hour/minute/second/tenths and each day
+    /// digit are BCD; year is the 16-year-rollover nibble `(year-1980)&$F`
+    /// (TIMERS:596,711-713). Decoded in a FIXED UTC Gregorian calendar so the
+    /// byte sequence is a pure function of the `Date` (tests inject a fixed
+    /// `Date`; `Date()` is LisaCore's only nondeterminism).
+    public static func clockReplyBytes(from date: Date) -> [UInt8] {
+        var cal = Calendar(identifier: .gregorian)
+        cal.timeZone = TimeZone(identifier: "UTC")!
+        let c = cal.dateComponents([.year, .hour, .minute, .second, .nanosecond], from: date)
+        let dayOfYear = cal.ordinality(of: .day, in: .year, for: date) ?? 1
+        let year = c.year ?? 1980
+        let yearNibble = UInt8((year - 1980) & 0x0F)
+        let dH = UInt8((dayOfYear / 100) % 10)
+        let dT = UInt8((dayOfYear / 10) % 10)
+        let dO = UInt8(dayOfYear % 10)
+        let hH = UInt8(((c.hour ?? 0) / 10) % 10), hL = UInt8((c.hour ?? 0) % 10)
+        let mH = UInt8(((c.minute ?? 0) / 10) % 10), mL = UInt8((c.minute ?? 0) % 10)
+        let sH = UInt8(((c.second ?? 0) / 10) % 10), sL = UInt8((c.second ?? 0) % 10)
+        let tenths = UInt8(((c.nanosecond ?? 0) / 100_000_000) % 10)
+        return [0xE0 | yearNibble,
+                (dH << 4) | dT, (dO << 4) | hH,
+                (hL << 4) | mH, (mL << 4) | sH,
+                (sL << 4) | tenths]
     }
 
     // MARK: - Input path (FIFO -> Port A + interrupt)

@@ -261,65 +261,150 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
 
 // MARK: - Command decode
 
-/// M2 Task 2 fold-in: `COPS` takes an injectable `clockSource: () -> Date`
-/// (default `{ Date() }`, `Date()` being LisaCore's only nondeterminism)
-/// instead of a raw byte-array override, used by the `$02` read-clock
-/// reply. This test injects a FIXED `Date` and asserts the deterministic
-/// reply byte sequence that `COPS.defaultHostClockBytes(now:)` produces
-/// from it (per hardware-notes.md §4's currently-understood, best-effort
-/// placeholder clock-payload format -- see that function's doc comment;
-/// this test is exercising/pinning what IS modeled, not asserting a
-/// verified-correct real-hardware byte layout).
-@Test func readClockCommandEnqueuesAClockReplyPacket() {
-    // 0x1122_3344 seconds since the epoch -> big-endian bytes $11,$22,$33,$44
-    // -- an explicit, hand-computed expectation (not literally CALLING
-    // `defaultHostClockBytes(now:)` to generate it, which would make this
-    // test tautological). (M2 Task 2 precision nit, folded in M3 Task 3:
-    // "hand-computed" doesn't make this an INDEPENDENT ORACLE -- the
-    // computation is the identical big-endian byte-swap the function under
-    // test performs, just written out by hand, so a shared error in that
-    // conversion logic would slip past both. This test is a genuine
-    // REGRESSION PIN against an accidental future change to
-    // `defaultHostClockBytes`'s byte layout/ordering -- it does NOT
-    // independently verify that layout against real Lisa hardware; see the
-    // type-level doc comment above for that same caveat stated once for
-    // the whole placeholder clock-payload format.)
-    let fixedDate = Date(timeIntervalSince1970: 0x1122_3344)
-    let fixedBytes: [UInt8] = [0xE0, 0x11, 0x22, 0x33, 0x44, 0x00]
+/// Drives a `$02` read-clock command through the ack + delivery delays and
+/// returns the full delivered input stream (`$80` frame + 6-byte payload).
+private func readClockStream(_ cops: COPS, _ scheduler: FakeScheduler) -> [UInt8] {
+    cops.handlePortAAccess(index: 1, value: COPS.Command.readClock, isWrite: true)
+    // Two hops: the command's own ack delay, then (once the reply is
+    // enqueued by that ack firing) the first reply byte's delivery delay.
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+    scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+    var received: [UInt8] = []
+    for _ in 0..<7 {   // $80 + 6 payload bytes ($E0|year + 5 data)
+        received.append(cops.portAInput())
+        cops.handlePortAAccess(index: 1, value: 0, isWrite: false)
+        scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+    }
+    return received
+}
+
+/// M6 Task 2: the `$02` reply is a REAL clock, byte-for-byte DERIVED from
+/// the OS's own COPS parser (`COPS4`/`COPS3`, libhw-DRIVERS:1212-1185) and
+/// the clock/calendar packing (libhw-TIMERS:600-606). The reply payload is
+/// `[$E0|yearNibble, dayHi:dayMid, dayLo:hourHi, hourLo:minHi, minLo:secHi,
+/// secLo:tenths]` with BCD date fields and a 16-year-rollover year nibble.
+///
+/// This pins the encoding for a FIXED injected `Date` -- 2023-04-10
+/// 13:45:30.5 UTC (epoch 1681134330.5), day-of-year 100, year nibble
+/// `(2023-1980)&$F = $B`. The expected bytes are hand-derived from the
+/// packing rule, NOT by calling the encoder (see the type doc comment for
+/// the full derivation): year `$B`, day 100 -> BCD `1,0,0`; 13:45:30 ->
+/// `1,3 4,5 3,0`; tenths `5`.
+@Test func readClockReplyEncodesHostTimeAsParserBCD() {
+    let fixedDate = Date(timeIntervalSince1970: 1_681_134_330.5)
+    // selector $E0|$B=$EB; b1=dH:dT=$10; b2=dO:hH=$01; b3=hL:mH=$34;
+    // b4=mL:sH=$53; b5=sL:tenths=$05.
+    let expectedPayload: [UInt8] = [0xEB, 0x10, 0x01, 0x34, 0x53, 0x05]
     let (cops, scheduler, interruptRaised) = makeCOPS(clockSource: { fixedDate })
     cops.reset()
     drainPowerOnStream(cops, scheduler)
     #expect(interruptRaised() == false, "FIFO drained")
 
-    cops.handlePortAAccess(index: 1, value: COPS.Command.readClock, isWrite: true)
-    // Two separate hops: the command's own ack delay (register 1 is the
-    // "real" handshake ORA, so no suppressed-read consumption is needed
-    // here -- this test never reads portBInput at all), THEN (once the
-    // reply is enqueued as a result of that ack firing) the first reply
-    // byte's own delivery delay -- each is scheduled relative to the cycle
-    // at the moment it's requested, not the cycle at the start of this test.
+    let received = readClockStream(cops, scheduler)
+    #expect(received == [0x80] + expectedPayload)
+}
+
+/// Feeding those same reply bytes back through a real Lisa `ClockToDate`
+/// (libhw-TIMERS:695-766) must recover 2023 / day 100 / 13:45:30 -- a
+/// round-trip against the OS consumer, closing the loop the type doc opens.
+/// This models the parser's fold (`$EB` -> ClockHigh=$0B10; data ->
+/// ClockLow=$01345305) and the BCD unpack, in Swift, as an independent
+/// oracle for the byte layout.
+@Test func readClockReplyRoundTripsThroughClockToDateSemantics() {
+    let payload: [UInt8] = [0xEB, 0x10, 0x01, 0x34, 0x53, 0x05]
+    // Parser fold (DRIVERS:1214-1176): selector low nibble -> year; byte1
+    // completes ClockHigh; bytes 2..5 are ClockLow.
+    let clockHigh = UInt16(0x0F & payload[0]) << 8 | UInt16(payload[1])
+    var clockLow: UInt32 = 0
+    for b in payload[2...] { clockLow = (clockLow << 8) | UInt32(b) }
+    #expect(clockHigh != 0x0FFF, "a set clock is NOT the not-set sentinel")
+    // ClockToDate BCD unpack (TIMERS:711-754).
+    let year = 1980 + Int(clockHigh >> 8 & 0x0F)
+    let dayHi = Int(clockHigh >> 4 & 0x0F), dayMid = Int(clockHigh & 0x0F)
+    let dayLo = Int(clockLow >> 28 & 0x0F)
+    let day = dayHi * 100 + dayMid * 10 + dayLo
+    let hour = Int(clockLow >> 24 & 0x0F) * 10 + Int(clockLow >> 20 & 0x0F)
+    let minute = Int(clockLow >> 16 & 0x0F) * 10 + Int(clockLow >> 12 & 0x0F)
+    let second = Int(clockLow >> 8 & 0x0F) * 10 + Int(clockLow >> 4 & 0x0F)
+    // Year nibble $B (=(2023-1980)&$F=11) decodes to 1980+11 = 1991: the
+    // 16-year rollover window (TIMERS:596,711-713) maps 2023 -> displayed
+    // 1991 (2023 - 32). The nibble round-trips exactly; the DISPLAYED year is
+    // the in-window representative, which is the whole point of the windowing.
+    #expect(year == 1991)
+    #expect(day == 100)
+    #expect(hour == 13 && minute == 45 && second == 30)
+}
+
+/// The set sequence `$2C -> $10xN -> $25` (TIMERS:652-680) commits a new
+/// clock, and a subsequent `$02` read returns THAT clock, not host time --
+/// the "set it changes reads" contract. The 16 nibbles SetClock would send
+/// for 2023/day100/13:45:30.5 are hand-derived: the high longword
+/// `$00000B10` (`0,0,0,0,0,B,1,0`) then the low longword `$01345305`
+/// (`0,1,3,4,5,3,0,5`); dropping the 5 fill zeros yields the same payload
+/// the host-time test pins.
+@Test func setClockSequenceChangesSubsequentReads() {
+    // Inject a DIFFERENT host time (epoch 0 = 1970, out of window) so a pass
+    // can only come from the SET value, never a host-clock fallback.
+    let (cops, scheduler, _) = makeCOPS(clockSource: { Date(timeIntervalSince1970: 0) })
+    cops.reset()
+    drainPowerOnStream(cops, scheduler)
+
+    let setNibbles: [UInt8] = [0,0,0,0,0, 0xB,1,0, 0,1,3,4,5,3,0,5]
+    cops.handlePortAAccess(index: 15, value: 0x2C, isWrite: true)   // open set window
     scheduler.advance(by: COPS.commandAckDelayCycles)
-    scheduler.advance(by: COPS.byteDeliveryDelayCycles)
-
-    #expect(interruptRaised() == true, "clock reply's first byte should now be ready")
-    #expect(cops.portAInput() == 0x80, "clock reply is framed as a reset-dispatch packet ($80 first)")
-
-    var received: [UInt8] = []
-    for _ in 0..<(1 + fixedBytes.count) {
-        received.append(cops.portAInput())
-        cops.handlePortAAccess(index: 1, value: 0, isWrite: false)
-        scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+    for n in setNibbles {
+        cops.handlePortAAccess(index: 15, value: 0x10 | n, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
     }
-    #expect(received == [0x80] + fixedBytes)
+    cops.handlePortAAccess(index: 15, value: 0x25, isWrite: true)   // commit
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+
+    let received = readClockStream(cops, scheduler)
+    #expect(received == [0x80, 0xEB, 0x10, 0x01, 0x34, 0x53, 0x05],
+            "a set clock, not the 1970 host fallback, is returned")
 }
 
 @Test func writeClockNibbleCommandsAccumulateInOrder() {
+    // Raw $10 nibbles OUTSIDE a $2C..$25 window are still logged (provenance)
+    // but do not build a stored clock.
     let (cops, scheduler, _) = makeCOPS()
     for n: UInt8 in [0x1, 0xA, 0xF] {
         cops.handlePortAAccess(index: 15, value: 0x10 | n, isWrite: true)
         scheduler.advance(by: COPS.commandAckDelayCycles)
     }
     #expect(cops.clockSetNibbles == [0x1, 0xA, 0xF])
+}
+
+/// Power-off clock semantics (MACHINE:425/427/473): `$21`/`$23` leave the
+/// clock ON (a set value survives, subsequent `$02` still returns it); `$20`
+/// turns the clock OFF (subsequent `$02` returns the `0FFF..` not-set
+/// sentinel, TIMERS:608-609).
+@Test func powerOffClockOnPreservesButClockOffClears() {
+    func setThenPowerOff(_ off: UInt8) -> [UInt8] {
+        let (cops, scheduler, _) = makeCOPS(clockSource: { Date(timeIntervalSince1970: 0) })
+        cops.reset()
+        drainPowerOnStream(cops, scheduler)
+        let setNibbles: [UInt8] = [0,0,0,0,0, 0xB,1,0, 0,1,3,4,5,3,0,5]
+        cops.handlePortAAccess(index: 15, value: 0x2C, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+        for n in setNibbles {
+            cops.handlePortAAccess(index: 15, value: 0x10 | n, isWrite: true)
+            scheduler.advance(by: COPS.commandAckDelayCycles)
+        }
+        cops.handlePortAAccess(index: 15, value: 0x25, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+        cops.handlePortAAccess(index: 15, value: off, isWrite: true)   // power off
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+        return readClockStream(cops, scheduler)
+    }
+    // $21 (clock on): the set clock is preserved.
+    #expect(setThenPowerOff(0x21) == [0x80, 0xEB, 0x10, 0x01, 0x34, 0x53, 0x05])
+    // $23 (reboot later, clock on): also preserved.
+    #expect(setThenPowerOff(0x23) == [0x80, 0xEB, 0x10, 0x01, 0x34, 0x53, 0x05])
+    // $20 (clock off): cleared to the not-set sentinel.
+    #expect(setThenPowerOff(0x20) == [0x80] + COPS.notSetClockReply)
+    #expect(setThenPowerOff(0x20)[1...] == [0xEF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            "not-set folds to ClockHigh=$0FFF, ClockLow=$FFFFFFFF")
 }
 
 @Test func powerCommandsAreLogged() {

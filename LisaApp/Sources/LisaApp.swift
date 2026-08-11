@@ -64,17 +64,12 @@ struct LisaEmuApp: App {
                     presentSaveScreenshotPanel()
                 }
             }
-            // CONSCIOUS DEFERRAL (M2 Task 7, re-recorded from M1c's own
-            // deferral of the same item): no "Power" menu item here.
-            // `LisaCore.COPS.powerCommandLog` already exists (captures the
-            // OS-driven soft-power-off command byte sequence) and the M2
-            // Task 7 brief explicitly named this a task-7 candidate, but a
-            // Power menu belongs together with M3's soft-power/Widget work
-            // (a real power-off needs somewhere to GO -- suspend the
-            // emulation thread, show a "powered off" UI state, etc. -- none
-            // of which exists yet). This task instead lands the disk-
-            // activity status-strip indicator, M1c's OTHER still-open
-            // deferred item. Deliberate, not lost -- see task-7-report.md.
+            // M6 Task 1 CLOSES the consciously-deferred Power menu item
+            // (M1c/M2 Task 7 deferred "power on/off via COPS", spec §4, until
+            // soft power had somewhere to GO). It now does: "Power" presses
+            // the Lisa's soft-power button (`COPS.pressPowerButton()`), the OS
+            // runs its own clean shutdown, and the machine stops
+            // (`AppModel.poweredOff`).
             CommandMenu("Machine") {
                 Button(model.running ? "Pause" : "Start") {
                     model.toggleRunning()
@@ -85,6 +80,18 @@ struct LisaEmuApp: App {
                     model.reset()
                 }
                 .keyboardShortcut("r", modifiers: [.command])
+
+                Divider()
+
+                // ⌘⌥P (not ⌘-something bare): the soft-power button runs the
+                // OS's real shutdown -- a deliberate, hard-to-fat-finger action
+                // distinct from Start/Pause (⌘P). Disabled once already powered
+                // off (nothing to shut down until a Reset boots afresh).
+                Button("Power (Shut Down)") {
+                    model.pressPowerButton()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .option])
+                .disabled(model.poweredOff)
 
                 Divider()
 

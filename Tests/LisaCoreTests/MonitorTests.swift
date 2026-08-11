@@ -32,6 +32,8 @@ extension MusashiSuites {
             #expect(Monitor.parse("click") == nil, "click requires coordinates")
             #expect(Monitor.parse("type Hello World") == .type("Hello World"))
             #expect(Monitor.parse("type") == nil, "type requires text")
+            // M6 Task 1: soft-power button.
+            #expect(Monitor.parse("power") == .power)
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
         }

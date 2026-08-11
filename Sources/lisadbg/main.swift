@@ -586,10 +586,13 @@ while let line = readLine(strippingNewline: true) {
     case .type(let text):
         typeText(machine, text)
         print("      typed \(text.count) character(s)")
+    case .power:
+        machine.bus.cops.pressPowerButton()
+        print("      pressed soft-power button (COPS $80,$FB) -- run forward (g) to let the OS shut down; powerState=\(machine.powerState)")
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | type <text> | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | type <text> | power | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

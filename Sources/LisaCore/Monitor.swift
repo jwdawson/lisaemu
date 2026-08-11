@@ -27,6 +27,11 @@ public struct Monitor {
         /// `type <text>` (M5 Task 3) -- injects `text` as COPS keyboard
         /// make/break events (with Shift for uppercase / shifted symbols).
         case type(String)
+        /// `power` (M6 Task 1) -- presses the Lisa's soft-power button
+        /// (`COPS.pressPowerButton()`): COPS delivers `$80,$FB` on its input
+        /// stream, the OS runs its own shutdown and issues a COPS power-off
+        /// command, and the machine stops (`Machine.powerState == .off`).
+        case power
         case quit, help
     }
 
@@ -87,6 +92,7 @@ public struct Monitor {
         case "type":
             guard parts.count >= 2 else { return nil }
             return .type(parts[1...].joined(separator: " "))
+        case "power": return .power
         case "q": return .quit
         case "?": return .help
         default:  return nil

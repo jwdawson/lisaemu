@@ -293,6 +293,43 @@ func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
     click(m)
 }
 
+/// Feedback-steer the cursor to `(tx,ty)` using the same convergence loop as
+/// `clickAt`, but WITHOUT clicking -- shared by `press`/`drag` so the button
+/// transitions land at the intended pixel.
+func steerCursor(_ m: Machine, to tx: Int, _ ty: Int) {
+    for _ in 0..<80 {
+        let (cx, cy) = osCursor(m)
+        let dx = tx - cx, dy = ty - cy
+        if abs(dx) <= 1 && abs(dy) <= 1 { break }
+        m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                             dy: Int8(max(-100, min(100, dy))))
+        m.run(until: m.cycles + 200_000)
+    }
+}
+
+/// Steer to `(tx,ty)` then press the mouse button DOWN and leave it held
+/// (keycap `$06` down, no up). See `Monitor.Command.press`.
+func pressAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+    steerCursor(m, to: tx, ty)
+    m.bus.cops.postKey(code: 0x06, down: true)
+    m.run(until: m.cycles + 300_000)
+}
+
+/// Release the mouse button in place (keycap `$06` up). See
+/// `Monitor.Command.release`.
+func releaseButton(_ m: Machine) {
+    m.bus.cops.postKey(code: 0x06, down: false)
+    m.run(until: m.cycles + 300_000)
+}
+
+/// A full drag: steer to the start, press, steer to the end with the button
+/// held, release. See `Monitor.Command.drag`.
+func dragFromTo(_ m: Machine, _ x1: Int, _ y1: Int, _ x2: Int, _ y2: Int) {
+    pressAt(m, x1, y1)
+    steerCursor(m, to: x2, y2)
+    releaseButton(m)
+}
+
 /// Maps a printable ASCII character to its Lisa keycap + whether Shift is held
 /// (Final-US layout, docs/hardware-notes.md §8 -- the same keycaps as
 /// `LisaShell/KeyMap`, keyed on ASCII here rather than macOS virtual codes).
@@ -593,10 +630,37 @@ while let line = readLine(strippingNewline: true) {
     case .power:
         machine.bus.cops.pressPowerButton()
         print("      pressed soft-power button (COPS $80,$FB) -- run forward (g) to let the OS shut down; powerState=\(machine.powerState)")
+    case .press(let x, let y):
+        pressAt(machine, x, y)
+        let (cx, cy) = osCursor(machine)
+        print("      pressed (button held) at cursor (\(cx),\(cy)) [target (\(x),\(y))]")
+    case .release:
+        releaseButton(machine)
+        let (cx, cy) = osCursor(machine)
+        print("      released button at cursor (\(cx),\(cy))")
+    case .moveTo(let x, let y):
+        steerCursor(machine, to: x, y)
+        let (cx, cy) = osCursor(machine)
+        print("      moved to cursor (\(cx),\(cy)) [target (\(x),\(y))] (button state unchanged)")
+    case .drag(let x1, let y1, let x2, let y2):
+        dragFromTo(machine, x1, y1, x2, y2)
+        let (cx, cy) = osCursor(machine)
+        print("      dragged (\(x1),\(y1)) -> (\(x2),\(y2)); cursor now (\(cx),\(cy))")
+    case .insertFloppy(let path):
+        do {
+            let image = try DC42Image.load(url: URL(fileURLWithPath: path))
+            machine.bus.floppy.insertWhileRunning(image)
+            print("      inserted floppy \(path) (\(image.blockCount) blocks) via media-change path -- bot_in attention raised, run forward (g) to let the OS mount it")
+        } catch {
+            print("      insert: cannot load \(path): \(error)")
+        }
+    case .ejectFloppy:
+        machine.bus.floppy.eject()
+        print("      ejected floppy")
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | type <text> | power | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

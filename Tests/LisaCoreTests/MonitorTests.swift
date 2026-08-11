@@ -32,6 +32,20 @@ extension MusashiSuites {
             #expect(Monitor.parse("click") == nil, "click requires coordinates")
             #expect(Monitor.parse("type Hello World") == .type("Hello World"))
             #expect(Monitor.parse("type") == nil, "type requires text")
+            // M6 Task 3: mouse press/release/drag primitives (menus, drags).
+            #expect(Monitor.parse("press 90 7") == .press(90, 7))
+            #expect(Monitor.parse("press 90") == nil, "press requires both x and y")
+            #expect(Monitor.parse("press") == nil, "press requires coordinates")
+            #expect(Monitor.parse("release") == .release)
+            #expect(Monitor.parse("moveto 150 66") == .moveTo(150, 66))
+            #expect(Monitor.parse("moveto 150") == nil, "moveto requires both x and y")
+            #expect(Monitor.parse("drag 90 7 90 40") == .drag(90, 7, 90, 40))
+            #expect(Monitor.parse("drag 90 7 90") == nil, "drag requires two full points")
+            #expect(Monitor.parse("drag") == nil, "drag requires coordinates")
+            // M6 Task 3: floppy media-change (insert while running / eject).
+            #expect(Monitor.parse("insert /tmp/LisaWrite.dc42") == .insertFloppy("/tmp/LisaWrite.dc42"))
+            #expect(Monitor.parse("insert") == nil, "insert requires a path")
+            #expect(Monitor.parse("eject") == .ejectFloppy)
             // M6 Task 1: soft-power button.
             #expect(Monitor.parse("power") == .power)
             #expect(Monitor.parse("q") == .quit)

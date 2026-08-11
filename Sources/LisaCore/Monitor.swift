@@ -32,6 +32,37 @@ public struct Monitor {
         /// stream, the OS runs its own shutdown and issues a COPS power-off
         /// command, and the machine stops (`Machine.powerState == .off`).
         case power
+        /// `press <x> <y>` (M6 Task 3) -- feedback-steer the cursor to screen
+        /// pixel `(x,y)` and press the mouse button DOWN, leaving it held. Used
+        /// to pull down (and hold open) an Office System menu so its dropped
+        /// state can be screenshotted, and to begin a drag. Pair with `release`
+        /// (button up in place) or `drag`.
+        case press(Int, Int)
+        /// `release` (M6 Task 3) -- release the mouse button in place (button
+        /// up at the current cursor). Closes a menu opened by `press` (releasing
+        /// on the title cancels), or ends a manual press.
+        case release
+        /// `moveto <x> <y>` (M6 Task 3) -- feedback-steer the cursor to
+        /// `(x,y)` WITHOUT changing the mouse button state. Used between
+        /// `press` and `release` to drag over a held-open menu one step at a
+        /// time so the highlighted item can be screenshotted before release.
+        case moveTo(Int, Int)
+        /// `drag <x1> <y1> <x2> <y2>` (M6 Task 3) -- steer to `(x1,y1)`, press
+        /// the button, steer to `(x2,y2)` with the button held, then release.
+        /// A menu selection (press title, drag to item, release) and an icon
+        /// drag both use this; the OS cursor keeps tracking the COPS deltas
+        /// while the button is down, so the feedback steer still converges.
+        case drag(Int, Int, Int, Int)
+        /// `insert <path.dc42>` (M6 Task 3) -- insert a floppy WHILE the OS is
+        /// running, through the media-change path (`insertWhileRunning`): raises
+        /// the `bot_in` floppy attention the OS's DISK_INT needs to mount the
+        /// new volume. The runtime counterpart of `--disk` (which is the
+        /// power-on/pre-boot path). Used to insert the LisaWrite tool diskette
+        /// at the live desktop.
+        case insertFloppy(String)
+        /// `eject` (M6 Task 3) -- eject the current floppy (`floppy.eject()`),
+        /// the same call the app's `ejectFloppy` mailbox makes.
+        case ejectFloppy
         case quit, help
     }
 
@@ -93,6 +124,24 @@ public struct Monitor {
             guard parts.count >= 2 else { return nil }
             return .type(parts[1...].joined(separator: " "))
         case "power": return .power
+        case "press":
+            guard parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]),
+                  x >= 0, y >= 0 else { return nil }
+            return .press(x, y)
+        case "release": return .release
+        case "moveto":
+            guard parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]),
+                  x >= 0, y >= 0 else { return nil }
+            return .moveTo(x, y)
+        case "drag":
+            guard parts.count >= 5, let x1 = Int(parts[1]), let y1 = Int(parts[2]),
+                  let x2 = Int(parts[3]), let y2 = Int(parts[4]),
+                  x1 >= 0, y1 >= 0, x2 >= 0, y2 >= 0 else { return nil }
+            return .drag(x1, y1, x2, y2)
+        case "insert":
+            guard parts.count >= 2 else { return nil }
+            return .insertFloppy(parts[1...].joined(separator: " "))
+        case "eject": return .ejectFloppy
         case "q": return .quit
         case "?": return .help
         default:  return nil

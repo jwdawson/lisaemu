@@ -36,6 +36,12 @@ public struct EmuStatus: Sendable {
     /// is a UI liveness indicator (`ScreenView`'s status-strip flash), not a
     /// precise "disk read in progress" signal.
     public let diskActivity: Bool
+    /// M6 Task 1 (soft power): whether the machine has been cleanly powered
+    /// off by its own OS shutdown (COPS power-off command -> `Machine
+    /// .powerState == .off`), sampled fresh at every publish. Distinct from
+    /// `halted` (a fatal double-fault): a powered-off Lisa stopped on purpose.
+    /// The app surfaces this as a "powered off" UI state.
+    public let poweredOff: Bool
 }
 
 /// Commands crossing from any external thread into the emulation thread's
@@ -53,6 +59,7 @@ private enum Command {
     case ejectFloppy
     case attachWidget(URL)
     case detachWidget
+    case powerButton
     case shutdown
 }
 
@@ -311,6 +318,15 @@ public final class EmulationController {
     /// Widget is currently attached.
     public func detachWidget() { shared.mailbox.post(.detachWidget) }
 
+    /// Presses the Lisa's soft-power button (M6 Task 1): posts a mailbox
+    /// command that calls `Machine.bus.cops.pressPowerButton()` on the
+    /// emulation thread. The OS sees the COPS `$FB` reset-dispatch byte and
+    /// runs its own shutdown, which ends by issuing a COPS power-off command
+    /// -> `Machine.powerState == .off`; the run loop then stops executing and
+    /// publishes a `poweredOff` status. Asynchronous, like every mailbox
+    /// command -- the shutdown takes real emulated time to run.
+    public func pressPowerButton() { shared.mailbox.post(.powerButton) }
+
     /// Returns the raw 1bpp framebuffer snapshot + dimensions via `Frame`
     /// (PNG-encoding stays app-side, per the plan's Task 1 interfaces).
     /// `completion` fires ON THE EMULATION THREAD, same as `onFrame`/
@@ -433,7 +449,8 @@ public final class EmulationController {
                               throttled: shared.mailbox.throttledSnapshot,
                               emulatedSeconds: Double(machine.cycles) / Governor.cyclesPerSecond,
                               diskInserted: machine.bus.floppy.isInserted,
-                              diskActivity: activity)
+                              diskActivity: activity,
+                              poweredOff: machine.powerState == .off)
         }
 
         while true {
@@ -493,15 +510,24 @@ public final class EmulationController {
                     }
                 case .detachWidget:
                     machine.bus.widget.detach()
+                case .powerButton:
+                    machine.bus.cops.pressPowerButton()
                 case .shutdown:
                     shutdownGate.signal()
                     return
                 }
             }
 
-            guard running, !machine.halted else {
-                // Avoid a hot spin while paused/halted; mailbox is still
-                // drained every iteration so commands stay responsive.
+            guard running, !machine.halted, machine.powerState == .on else {
+                // Avoid a hot spin while paused/halted/powered-off; mailbox is
+                // still drained every iteration so commands stay responsive.
+                // M6 Task 1: a cleanly powered-off machine (COPS power-off ->
+                // `powerState == .off`) is a terminal-until-reset stop, just
+                // like `halted` -- it reuses the exact same force-publish path
+                // below so the app reliably learns the transition (the status
+                // it publishes carries `poweredOff`, sampled in
+                // `currentStatus`). `stopped` OR's the two so either reason
+                // triggers the transition + periodic republish.
                 //
                 // HALTED force-publish (whole-branch-review Important
                 // finding: "HALTED status almost never published"): without
@@ -533,12 +559,13 @@ public final class EmulationController {
                 // every `statusPublishInterval` for as long as the halt
                 // continues, same cadence as ordinary running-mode status.
                 let now = ProcessInfo.processInfo.systemUptime
-                if EmulationController.haltedStatusPublish(machineHalted: machine.halted,
+                let stopped = machine.halted || machine.powerState == .off
+                if EmulationController.haltedStatusPublish(machineHalted: stopped,
                                                              alreadyPublished: haltedPublished,
                                                              secondsSinceLastPublish: now - lastStatusPublish) {
                     haltedPublished = true
                     lastStatusPublish = now
-                    shared.onStatus?(currentStatus(halted: true))
+                    shared.onStatus?(currentStatus(halted: machine.halted))
                 }
                 Thread.sleep(forTimeInterval: 0.005)
                 continue

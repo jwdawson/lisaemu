@@ -332,6 +332,63 @@ private func makeCOPS(clockSource: @escaping () -> Date = { Date(timeIntervalSin
     #expect(cops.powerCommandLog == commands)
 }
 
+@Test func powerOffCommandsFireTheSeamAndAreLogged() {
+    // hardware-notes.md §7 "Soft Power Control": $20/$21/$23 are the three
+    // POWER-OFF commands (MACHINE:425/427/473). Each must fire the onPowerOff
+    // seam (so Machine can stop cleanly) AND still be logged.
+    for cmd: UInt8 in [0x20, 0x21, 0x23] {
+        let scheduler = FakeScheduler()
+        var powerOffs = 0
+        let cops = COPS(scheduleEvent: { d, a in scheduler.schedule(d, a) },
+                        currentCycle: { scheduler.now() },
+                        raiseInterrupt: {}, clearInterrupt: {},
+                        onPowerOff: { powerOffs += 1 })
+        cops.handlePortAAccess(index: 15, value: cmd, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+        #expect(powerOffs == 1, "command $\(String(cmd, radix: 16)) powers off")
+        #expect(cops.powerCommandLog == [cmd])
+    }
+}
+
+@Test func clockTimerCommandsDoNotPowerOff() {
+    // $25/$2C/$2D are clock/timer configuration (hardware-notes.md §7), NOT
+    // power-off -- the reboot-alarm $2D is logged but must NOT stop the
+    // machine (the wake-at-alarm half is deferred; see COPS.processCommand).
+    for cmd: UInt8 in [0x25, 0x2C, 0x2D] {
+        let scheduler = FakeScheduler()
+        var powerOffs = 0
+        let cops = COPS(scheduleEvent: { d, a in scheduler.schedule(d, a) },
+                        currentCycle: { scheduler.now() },
+                        raiseInterrupt: {}, clearInterrupt: {},
+                        onPowerOff: { powerOffs += 1 })
+        cops.handlePortAAccess(index: 15, value: cmd, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+        #expect(powerOffs == 0, "command $\(String(cmd, radix: 16)) is not a power-off")
+        #expect(cops.powerCommandLog == [cmd], "still logged for provenance")
+    }
+}
+
+@Test func pressPowerButtonEnqueuesResetDispatchStream() {
+    // hardware-notes.md §4/§8: the power button reaches the OS as a two-byte
+    // reset-dispatch packet -- $80 ("reset code follows", State 0 -> State 4)
+    // then $FB (State 4 "power button" sub-code). COPS puts exactly those two
+    // faithful bytes on the input FIFO; the OS's DRIVERS handler is what turns
+    // $FB into a synthesized pseudo-keycap $08. (This pins that COPS sends
+    // $FB, NOT a synthesized $08 -- correcting the M1b-era shorthand.)
+    let (cops, scheduler, _) = makeCOPS()
+    cops.reset()
+    drainPowerOnStream(cops, scheduler)
+
+    cops.pressPowerButton()
+    var received: [UInt8] = []
+    for _ in 0..<2 {
+        scheduler.advance(by: COPS.byteDeliveryDelayCycles)
+        received.append(cops.portAInput())
+        cops.handlePortAAccess(index: 1, value: 0, isWrite: false)
+    }
+    #expect(received == [0x80, 0xFB])
+}
+
 @Test func mouseEnableCommandSetsFlag() {
     let (cops, scheduler, _) = makeCOPS()
     #expect(cops.mouseInterruptsEnabled == false)

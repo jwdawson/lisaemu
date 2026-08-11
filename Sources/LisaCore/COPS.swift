@@ -288,6 +288,16 @@ public final class COPS {
     private let currentCycle: () -> UInt64
     private let raiseInterrupt: () -> Void
     private let clearInterrupt: () -> Void
+    /// M6 Task 1 (soft power): fired the instant a power-OFF command byte
+    /// (`$20`/`$21`/`$23` -- hardware-notes.md §7 "Soft Power Control",
+    /// MACHINE:425/427/473) is decoded, so the machine can stop executing
+    /// cleanly. `Bus.powerOffHandler` -> `Machine.powerState = .off` is the
+    /// real wiring; defaults to a no-op so protocol-level tests (and any
+    /// caller that doesn't care about power) pay nothing. Distinct from
+    /// `raiseInterrupt`: this is a one-way "the OS asked to be powered down"
+    /// edge, not a VIA flag. The reboot-later alarm half of `$23`/`$2D`
+    /// (waking at a scheduled time) is NOT modeled -- see `processCommand`.
+    private let onPowerOff: () -> Void
     /// Injectable clock source for the `$02` read-clock reply
     /// (`enqueueClockReply`/`defaultHostClockBytes`) -- `Date()` is
     /// LisaCore's only source of nondeterminism, and the OS loader (a
@@ -384,12 +394,14 @@ public final class COPS {
                 currentCycle: @escaping () -> UInt64,
                 raiseInterrupt: @escaping () -> Void,
                 clearInterrupt: @escaping () -> Void,
-                clockSource: @escaping () -> Date = { Date() }) {
+                clockSource: @escaping () -> Date = { Date() },
+                onPowerOff: @escaping () -> Void = {}) {
         self.scheduleEvent = scheduleEvent
         self.currentCycle = currentCycle
         self.raiseInterrupt = raiseInterrupt
         self.clearInterrupt = clearInterrupt
         self.clockSource = clockSource
+        self.onPowerOff = onPowerOff
     }
 
     /// Resets all COPS state and (re-)delivers the power-on stream. Callers
@@ -470,9 +482,21 @@ public final class COPS {
             enqueueClockReply()
         case Command.writeClockNibbleBase...(Command.writeClockNibbleBase | 0x0F):
             clockSetNibbles.append(command & 0x0F)
-        case Command.powerOffClockOff, Command.powerOffClockOn, Command.powerOffRebootLater,
-             Command.enableClockDisableTimer, Command.disableClockPrepSetClock,
+        case Command.powerOffClockOff, Command.powerOffClockOn, Command.powerOffRebootLater:
+            // The three POWER-OFF commands (hardware-notes.md §7, MACHINE:425/
+            // 427/473): after logging, drive the machine to its powered-off
+            // state. `$23` ("power off, reboot later") powers off HERE exactly
+            // like `$20`/`$21`; only the wake-at-alarm half is deferred (the OS
+            // pairs it with a `$2D` "set clock for reboot alarm" which we log
+            // but do not schedule a wake from -- no RTC alarm is modeled, M6
+            // Task 2 territory).
+            powerCommandLog.append(command)
+            onPowerOff()
+        case Command.enableClockDisableTimer, Command.disableClockPrepSetClock,
              Command.disableTimerSetRebootAlarm:
+            // Clock/timer configuration, NOT power-off (hardware-notes.md §7):
+            // `$25` enable-clock/disable-timer, `$2C` disable-clock prep-set,
+            // `$2D` set reboot alarm. Logged for provenance; no power effect.
             powerCommandLog.append(command)
         case Command.enableMouseInterrupts:
             mouseInterruptsEnabled = true
@@ -573,5 +597,25 @@ public final class COPS {
         enqueue(0x00)
         enqueue(UInt8(bitPattern: dx))
         enqueue(UInt8(bitPattern: dy))
+    }
+
+    /// Presses the soft-power button (M6 Task 1). COPS delivers the button as
+    /// a two-byte reset-dispatch packet on its input stream: `$80` ("reset
+    /// code follows" -- State 0 -> State 4, hardware-notes.md §4 Input Packet
+    /// State Machine) followed by `$FB` (State 4 "power button" sub-code,
+    /// DRIVERS:1227-1232, hardware-notes.md §4/§8). This is exactly what a
+    /// real COPS puts on the wire; the OS's own COPS input handler is what
+    /// synthesizes the pseudo-keycap `$08` down/up from `$FB` (the M1b-era
+    /// note that COPS itself sends `$08` was imprecise -- COPS sends `$FB`,
+    /// the OS makes the `$08`; corrected in lockstep in hardware-notes.md
+    /// §4/§7/§8). Modeling the faithful `$FB` (not a synthesized `$08`) means
+    /// the OS runs its real DRIVERS dispatch, exactly as on hardware.
+    ///
+    /// Same shape as `postKey`/`postMouse`: the bytes go through the ordinary
+    /// input FIFO (`enqueue`), delivered one at a time via the CRDY/IFR2
+    /// handshake -- no special path.
+    public func pressPowerButton() {
+        enqueue(0x80)   // State 0 -> State 4: "reset code follows"
+        enqueue(0xFB)   // State 4: power-button sub-code
     }
 }

@@ -133,6 +133,15 @@ public final class Bus {
     /// `Machine.init` wires this to `{ [weak self] in self?.floppyPending =
     /// $0 }`; defaults to a no-op for bare `Bus` use.
     public var floppyInterruptHandler: (Bool) -> Void = { _ in }
+    /// Reaches `Machine.powerState` from `COPS` (M6 Task 1, soft power) --
+    /// invoked when a power-OFF command byte (`$20`/`$21`/`$23`) is decoded,
+    /// driving the machine to `.off` (stop executing cleanly, distinct from a
+    /// double-fault `halted`). Wired in `IODispatcher.init` onto `COPS`'s
+    /// `onPowerOff` seam, and reached by `Machine.init` via `{ [weak self] in
+    /// self?.powerState = .off }`; defaults to a no-op for bare `Bus` use.
+    /// Mirrors `vsyncInterruptHandler`/`floppyInterruptHandler`'s injection
+    /// pattern (a device reaching a `Machine` flag it has no reference to).
+    public var powerOffHandler: () -> Void = { }
     /// Reports the CPU's current supervisor/user mode to `mmu.translate`.
     /// Defaults to always-supervisor; `Machine.init` wires this to the live
     /// CPU state.

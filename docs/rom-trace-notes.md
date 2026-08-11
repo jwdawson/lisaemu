@@ -2726,3 +2726,166 @@ g 200000000
 OFF (clean OS shutdown) — a real machine's power cycle. The remaining M6 north-
 star clause is the **working clock** (RTC): modeling the COPS real-time clock so
 the clock-not-set note stops appearing and `PowerCycle`'s reboot alarm can wake.
+
+## Checkpoint M (M6 Task 3) — THE DESKTOP IN USE: Filer work, and LisaWrite typed-into ⭐
+
+The clean-booting Office System desktop (Checkpoints K/L, Tasks 1–2's clock) is
+now **driven as a machine in use** — real Filer operations, and the LisaWrite
+tool installed, launched, and typed into. This closes M5 Task 5's honest gap
+(keyboard-at-desktop): text typed through the COPS keyboard path is visible in a
+live application document.
+
+All of the below is **OBSERVED** live (`lisadbg` + release build, working copy
+`/tmp/lisa-work.widget` — Apple-derived, kept out of the repo, persisted across
+the whole task so the install/folder changes carry). Screenshots in
+`~/Development/LisaEmu-artifacts/m6-desktop-*.png` and `m6-lisawrite-*.png`.
+Where the Desktop Manager's own internals would be the explanation, they stay
+**inferred** and are labelled so — the Desktop Manager source is NOT in the tree
+(M6 Task 1 finding); only the Filer (`lmfiler`) has source + linkmaps.
+
+### New `lisadbg` driving primitives (this task)
+
+The desktop's real interaction model needed input verbs the M5 `click`/`type`
+pair didn't cover, so `lisadbg` gained (all thin wrappers over existing
+`COPS.postMouse`/`postKey` and `FloppyController`, parse-tested in
+`MonitorTests`):
+
+- `press <x> <y>` / `release` / `moveto <x> <y>` — mouse-button-DOWN-and-hold,
+  button-UP-in-place, and steer-without-touching-the-button. Office System menus
+  are **press-drag-release pull-downs** (NOT click-latched — verified: a bare
+  click on a menu title drops AND closes it); a menu is screenshotted by
+  `press`ing its title (button held across `lisadbg` commands, since no cycles
+  run between them), stepping `moveto` down to the item, and `release`-ing on it.
+- `drag <x1> <y1> <x2> <y2>` — press, steer, release (menu selection and
+  icon-to-disk copy both use it).
+- `insert <path.dc42>` / `eject` — the **media-change path**
+  (`FloppyController.insertWhileRunning`, M5 Task 3 round 2 — raises `bot_in`),
+  the runtime counterpart of `--disk`; identical call to the app's
+  `insertFloppy` mailbox. Used to insert the LisaWrite diskette at the live
+  desktop.
+
+Two driving gotchas, ledgered so the next task doesn't re-derive them: (1) the
+framebuffer is **720 wide** — a click with `x ≥ 720` is off-screen and
+`osCursor`'s `≤ 720` guard silently drops it (cost me the Preferences-note
+`Cancel` at a mis-estimated `x=795`; real button was `x≈600`). (2) menu
+highlight tracking needs **incremental** `moveto` steps — a single big jump to a
+deep item skips the OS's per-move highlight, and menu rows are ~16 px apart so
+`Open` sits at cursor `y≈80` in File/Print, not the ~56 an eyeballed row-count
+suggests.
+
+### Filer work, OBSERVED (Step 1)
+
+- **Open the Internal Hard Disk window** via the **Desk menu** (it lists the
+  desktop's objects — Clipboard, Internal Hard Disk, Preferences, Wastebasket,
+  plus any mounted disk; selecting one opens it). Double-click does NOT open on
+  this synthetic-input path — the OS's time-based double-click detector doesn't
+  fire on injected click pairs at any gap tried (0 / 400k / 1M cycles); the menu
+  route is the reliable open. Window shows `Empty Folders`, `Clock`, `Calculator`.
+- **All four menus pulled down** (`m6-desktop-menu-*`): **Desk** (objects),
+  **File/Print** (Set Aside Everything/Set Aside, Save & Put Away, Open,
+  Duplicate ⌘D, Attributes of…, Tear Off Stationery, Make Stationery Pad,
+  Monitor the Printer…), **Edit** (Undo, Cut/Copy/Copy Reference/Paste, Select
+  All Icons), **Housekeeping** (Eject Micro Diskette ⌘E). Items are
+  context-sensitive (grey out per selection).
+- **Create a folder**: `Empty Folders` is a **stationery pad** — `File/Print ▸
+  Tear Off Stationery` tears off a new folder, auto-named **`Folders 08/11`**
+  (the date stamp is Task 2's RTC, live). **Rename**: the fresh name is in edit
+  mode, so typing replaces it — typed `Reports` (COPS keyboard → Filer name
+  field; a real keyboard-at-desktop interaction in its own right).
+- **Duplicate** and its modal: `File/Print ▸ Duplicate` starts a copy that must
+  be **placed before anything else** ("…you must move the duplicate before you
+  do anything else"); a stray click raised that modal — cited here as the real
+  Filer duplicate flow, `Cancel` terminates it.
+- **Preferences** opened (Desk menu): notes a **card in slot 1** (our emulated
+  expansion) not yet connected, then the panel — Set Conveniences, Select
+  Defaults, Connect Devices, Install/Remove Device Software.
+- **Boundary**: opening a *sub*-folder via `File/Print ▸ Open` is finicky on
+  synthetic input (narrow hit row next to greyed items + separators); disk-window
+  and menu navigation are solid, nested-folder open is documented as a
+  precision limit, not an emulator fault.
+
+### The §4 payoff — live `UNIT.PROC` symbol resolution (Linkmap overlay)
+
+During Filer work the overlay resolves the running PC to **named Filer
+procedures**, live (`lisadbg` annotated `PC=` / `t`):
+
+- `flrAll.WALKTREE`, `flrAll.UPDATEFI`, `flrAll.UPDATETE`, `flrAll.VALIDSCR`,
+  `flrAll.INDIALOG`, `flrAll.IGNOREDE`, `flrAll.ERASEOBJ`, `flrAll.FLUSHOBJ`,
+  `flrAll.ISCONTAI` (the Filer's main unit; ~40+ hits/burst)
+- `flrDm.DOMOVEDE` (Filer desktop-manager unit), `lmfiler.DOCCONSI`,
+  `lmfiler.DOFILERE` (Filer main program)
+- `lmlist.DFILTER / GET_PHYS / IN_RANGE` (list manager — folder listings),
+  `CiDlg.SPECREDR` (dialog), `Core2.GETVRTSE`, `NEWSEG1.MMPAGEBR / ARGINSCR`
+  (segment loader)
+
+These are **high-confidence** because the running app IS the Filer and
+`flrAll`/`flrDm`/`lmfiler` are unique to the filer linkmap — running-app ==
+symbol-app.
+
+### The merged-symbol-table ambiguity — CONFIRMED live, handled per its note
+
+`LinkmapSymbols` merges all 22 app/library linkmaps into one flat table with
+`baseOffset` defaulting to 0 (`assume link-time == runtime`); its own doc
+(the "base-offset story") warns different apps' same-numbered segments **collide
+at the same link-time address** and are "only meaningful one file at a time."
+This task drove that live: **while LisaWrite is the frontmost app**, sampled PCs
+STILL resolve to **`flrAll.*` / `lmfiler.*`** (ERASEOBJ, FLUSHOBJ, ISCONTAI,
+DOCCONSI, DOFILERE) plus `NEWSEG1` (the segment loader). Two readings, both
+consistent with the note: (a) genuinely the **resident Filer/Desktop-Manager
+event loop + segment loader** running under/for LisaWrite, or (b) a **merged-
+table collision** mis-attributing LisaWrite's relocated code to the nearest-
+below Filer symbol in the shared slot. Without per-app relocation the overlay
+**cannot distinguish** which — so the honest rule (ledgered, matching
+`LinkmapSymbols`'s self-doc; **no code change** — `symbase` is the manual lever):
+a resolved name is trustworthy only when the **running app is known to be that
+symbol's app** (true for Filer-during-Filer-work; NOT assured for a name shown
+while a *different* app is frontmost). Not "fixed" here — a real fix is per-app
+`baseOffset`, out of this task's scope.
+
+### LisaWrite, OBSERVED end-to-end (Step 2 — keyboard-at-desktop CLOSED)
+
+1. **Insert disk 1 at the live desktop** (`insert …/682-0093-B_LisaWrite1_3.1
+   .dc42`) through the media-change path → the OS honors the `bot_in` attention,
+   mounts the volume and reads its catalog **with no UI interaction** (`blocksRead`
+   0→305), and draws the diskette icon **`LisaWrite 1 - 3.1`**
+   (`m6-lisawrite-01-inserted`).
+2. **Open the diskette window** (Desk menu) → `LisaWrite Paper` (stationery pad),
+   `LisaWrite Examples`, `LisaWrite` (the tool), `American Dictionary`.
+3. **The Office System's own copy/install flow**: dragging the `LisaWrite` tool
+   icon onto the Internal Hard Disk icon raises the OS's **"The Lisa is moving
+   'LisaWrite' to 'Internal Hard Disk'"** Wait dialog; the tool is installed onto
+   the Widget (leaves the floppy window; the working `.widget` gains 141,606
+   changed bytes — the install persisted).
+4. **Tear off a document** from `LisaWrite Paper` → `File/Print ▸ Tear Off
+   Stationery` creates **`LisaWrite Paper 08/11`** (RTC date-stamped again).
+5. **Launch**: `File/Print ▸ Open` on that document boots the LisaWrite tool —
+   the menu bar becomes LisaWrite's (Type Style, Format ¶, Page Layout, Search,
+   Spelling) and a blank document opens with a blinking insertion caret
+   (`m6-lisawrite-06-launch`).
+6. **TYPE INTO IT**: `Hello from LisaEmu-- M6 Task 3.` renders in the document
+   (`m6-lisawrite-07/08`) — caps, digits, spaces, punctuation through the COPS
+   make/break + Final-US KeyMap path. **Keyboard-at-desktop closed.** Disk 2 was
+   **not** requested — a single-diskette tool copy + tear-off sufficed; the
+   disk-2 media is on hand if a future flow asks.
+
+### What Checkpoint M pins (`ROMWidgetBootTests`, env-gated)
+
+`checkpointM_disketteInsertedAtDesktopMounts` pins the **deterministic** slice —
+boot to the desktop (K/L path), `insertWhileRunning` the LisaWrite diskette, and
+assert the OS mounts + reads it (`isInserted`, `blocksRead` grew, `!halted`,
+`powerState == .on`). The Filer/LisaWrite *UI* work (drag/menu, feedback-timed
+click precision) is deliberately **NOT** pinned to a framebuffer — like K/L it
+would be fragile; the insert is a direct API call whose mount is a plain OS
+consequence, so the assertion is on read-count state. Gated additionally on the
+LisaWrite disk-1 image under `LISAEMU_DISK_DIR` (Apple-derived, never committed;
+absent → early return, the disk-2-swap convention).
+
+**Standing frontier at M6 Task 3 close.** The Lisa is now a machine **in daily
+use**: it boots clean off the Widget, keeps a real clock, runs the Filer
+(navigate/create/rename/Preferences), installs a tool from its diskette, and is
+**typed into** in a live LisaWrite document — then powers off clean (Checkpoint
+L). The north star ("working mouse, keyboard, and clock") is met end-to-end. What
+remains unexercised is breadth, not a wall: the other tools (LisaCalc/Draw/…),
+printing (`Monitor the Printer…`), and — the one honest overlay caveat above —
+per-app symbol relocation so the merged table names a *non-Filer* app's code
+correctly.

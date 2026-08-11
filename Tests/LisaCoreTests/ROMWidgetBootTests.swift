@@ -222,5 +222,58 @@ extension MusashiSuites {
             #expect(!m.bus.cops.powerCommandLog.contains(0x20),
                     "$20 (clock-off) would mean the OS read the clock as unset; log = \(log)")
         }
+
+        /// **M6 Task 3 -- "Checkpoint M: a diskette inserted at the live desktop
+        /// mounts."** Reaching the Office System desktop (Checkpoint K/L path),
+        /// a floppy inserted through the media-change path
+        /// (`FloppyController.insertWhileRunning`, M5 Task 3 round 2 -- the same
+        /// call lisadbg's `insert` and the app's `insertFloppy` mailbox make)
+        /// raises the `bot_in` floppy attention, and the resident Desktop
+        /// Manager mounts the new volume and reads its catalog WITHOUT any
+        /// further UI interaction. This pins that end-to-end path deterministic-
+        /// ally: unlike the drag/menu Filer work (feedback-timed clicks, kept
+        /// out of the suite), the insert is a direct API call and the OS's mount
+        /// response is a plain consequence, so the assertion is on read-count
+        /// state, not an exact framebuffer.
+        ///
+        /// Gated additionally on the LisaWrite disk-1 image existing under
+        /// `LISAEMU_DISK_DIR` (Apple-derived, never committed); absent, the test
+        /// returns early -- same secondary-file convention as
+        /// `ROMFloppyBootTests`' disk-2 swap test.
+        @Test func checkpointM_disketteInsertedAtDesktopMounts() throws {
+            let diskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
+            guard let diskDir else { return }   // needs a floppy image dir
+            let lwPath = diskDir
+                + "/Lisa_Office_System_3.1/682-0093-B_LisaWrite1_3.1/682-0093-B_LisaWrite1_3.1.dc42"
+            guard FileManager.default.fileExists(atPath: lwPath) else { return }
+
+            let m = try machineWithInstalledWidgetCopy()
+            m.run(until: 18_000_000)                              // POST -> boot menu
+            moveCursor(m, to: 420, 182); click(m)                // "STARTUP FROM..."
+            m.run(until: m.cycles + 6_000_000)
+            moveCursor(m, to: 88, 33); click(m)                  // top item = the Widget
+            m.run(until: m.cycles + 160_000_000)                 // boot -> dirty-volume dialog
+            clickAt(m, 595, 72)                                  // "Don't Check"
+            m.run(until: m.cycles + 390_000_000)                 // Desktop Manager builds the desktop
+            m.run(until: m.cycles + 40_000_000)
+
+            #expect(!m.halted && m.powerState == .on, "at the live desktop")
+            let readsBefore = m.bus.floppy.blocksRead
+            #expect(!m.bus.floppy.isInserted, "no floppy before the insert")
+
+            // Insert the LisaWrite tool diskette THROUGH the media-change path.
+            let image = try DC42Image.load(url: URL(fileURLWithPath: lwPath))
+            m.bus.floppy.insertWhileRunning(image)
+            // Let the bot_in attention wake the Desktop Manager's mount.
+            for _ in 0..<12 {
+                m.run(until: m.cycles + 8_000_000)
+                if m.bus.floppy.blocksRead > readsBefore + 4 { break }
+            }
+
+            #expect(m.bus.floppy.isInserted, "the diskette is present after insert")
+            #expect(m.bus.floppy.blocksRead > readsBefore,
+                    "the OS mounted the new volume and read its catalog off the diskette (media-change attention honored at the live desktop)")
+            #expect(!m.halted, "the live mount did not fault the machine")
+        }
     }
 }

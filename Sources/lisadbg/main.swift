@@ -535,7 +535,11 @@ while let line = readLine(strippingNewline: true) {
         for access in machine.bus.ioTrace[beforeIO...] {
             print(formatIOAccess(access))
         }
-        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted) \(diskStatus(machine))")
+        let pcl = machine.bus.cops.powerCommandLog
+        let powerSuffix = machine.powerState == .off
+            ? " power=OFF powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]"
+            : (pcl.isEmpty ? "" : " powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]")
+        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted)\(powerSuffix) \(diskStatus(machine))")
         print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
         print(monitor.registerDump())
     case .screenshot(let path):

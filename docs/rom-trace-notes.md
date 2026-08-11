@@ -2654,3 +2654,75 @@ RTC so the clock/calendar note stops appearing (the north star's "working clock"
 clause, the natural M6 headline), and the multi-block/`T_Widget` protocol path
 (§10.6, unimplemented by design). See `docs/m5-demo.md` for the full milestone
 walkthrough and the M6 candidate roster.
+
+## Checkpoint L (M6 Task 1) — SOFT POWER: the OS shuts itself down, cleanly ⭐
+
+The Office System desktop, booted off the Widget (Checkpoint K), now responds to
+the **soft-power button** by running its **own** shutdown — and the clean
+shutdown makes the next boot of the same image skip the dirty-volume dialog.
+
+### The chain, cited (LIBHW `/LIBS/LIBHW/`, byte-identical to `/LIBHW/`)
+
+`COPS.pressPowerButton()` puts `$80,$FB` on the COPS input stream (a State-4
+reset-dispatch packet, hardware-notes §4). The OS decodes it:
+`COPS4` (DRIVERS:1190) branches on `$FB` (DRIVERS:1196) → `MOVE.W #$08,D0`
+(DRIVERS:1230) → `KeyPushed` (DRIVERS:1231), which synthesizes pseudo-keycap
+`$08` **down+up** (KEYBD:755/758) onto the keyboard event queue. Userland turns
+that into a shutdown request (Shell `PowerOff` nwshell:2143-2162 / Desktop
+Manager, same `term_event[1]=4` path) → Root scheduler `kill_power`
+(PMSPROCS:315-344) → `FS_ShutDown` flush/unmount (fsinit:1216) → `GiveUpGhost`
+(fsinit:1066) → `powerdown` (fsinit:1115) = `PowerDown` (MACHINE:419-436):
+contrast→255, read clock, and — clock running — send COPS **`$21`** via `COPSCMD`
+(MACHINE:427/429, DRIVERS:829). See hardware-notes §7 for the full citation set.
+
+### OBSERVED (live, `lisadbg` + release build)
+
+```
+... boot to the Office System desktop (Checkpoint K path) ...
+power                     # COPS $80,$FB
+g 120000000
+      ... halted=false power=OFF powerCmds=[$21] ...   PC=5208A4 (COPSCMD rts)
+g 200000000
+      ... power=OFF ...   cycles UNCHANGED (664318646) — CPU executes no further
+```
+
+- The OS issued **`$21`** (PowerDown's clock-running path, MACHINE:427). The
+  emulator's `COPS` decoded it and drove `Machine.powerState = .off` — a clean
+  stop, `halted=false` (distinct from a double-fault HALT). A subsequent `g`
+  advanced **zero** cycles: a powered-off machine executes nothing.
+- Shutdown UI: `PowerDown`/`GiveUpGhost` dims contrast to 255 and blanks the
+  screen — the framebuffer goes fully black (artifact `m6-power-05-shutdown.png`).
+
+### THE DIRTY-VOLUME PROOF (the deliverable's headline)
+
+1. Fresh copy of `OS31-installed.widget`, booted → **dirty-volume dialog**
+   ("The startup disk was in use when the Lisa failed…", `m6-power-02`). This is
+   why every prior boot showed it: the volume was left marked in-use.
+2. Reach the desktop (dismiss dirty + clock dialogs), press the power button →
+   the OS runs its shutdown → `$21` → machine stops. `FS_ShutDown` wrote the
+   volume back **not-in-use**.
+3. **Reboot the SAME image → the dirty-volume dialog is GONE** (`m6-power-07`
+   shows the normal "Wait — Office System Release 3.1" boot progress; `m6-power-08`
+   the desktop with only the clock-not-set note, no dirty dialog).
+
+### Boundary / carry-forward
+
+- **The button is honored only at the LIVE DESKTOP, not at the modal
+  dirty-volume dialog** (observed: pressing it at that dialog does nothing — the
+  dialog's own event loop swallows the keycap). So Checkpoint L / the LIVE PROOF
+  press the button after reaching the desktop. Not an emulator fault — matches
+  how the OS routes the pseudo-keycap through the ordinary event queue that the
+  frontmost modal owns.
+- The **reboot-later alarm** half of `$23`/`$2D` (PowerCycle) is deferred: no RTC
+  alarm is modeled, so `$23` powers off but schedules no wake (M6 Task 2, RTC —
+  which will also retire the clock-not-set note).
+- `checkpointL` (env-gated, `ROMWidgetBootTests`) pins the behavioural proof:
+  desktop reached → button → `powerState == .off`, `!halted`, and a documented
+  power-off byte (`$20`/`$21`/`$23`) in `powerCommandLog`. Like `checkpointK` it
+  asserts state, not an exact framebuffer, since the desktop is reached through
+  feedback-timed dialog clicks.
+
+**Standing frontier at M6 Task 1 close.** The machine now powers ON (boot) and
+OFF (clean OS shutdown) — a real machine's power cycle. The remaining M6 north-
+star clause is the **working clock** (RTC): modeling the COPS real-time clock so
+the clock-not-set note stops appearing and `PowerCycle`'s reboot alarm can wake.

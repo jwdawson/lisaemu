@@ -126,6 +126,13 @@ speed), menus (power on/off via COPS, reset, insert/eject floppy, choose Widget
 image). Speed toggle (real-time vs unthrottled). Drag-and-drop disk images.
 Deferred: sound, full-screen, config UI.
 
+> **CLOSED (M6 Task 1):** "power on/off via COPS" — deferred four times since
+> M1c — is now implemented: LisaApp Machine > Power (Shut Down, ⌘⌥P) presses the
+> soft-power button (`COPS.pressPowerButton()`), the OS runs its own shutdown,
+> and `Machine.powerState` → `.off` (surfaced as `EmuStatus.poweredOff` /
+> `AppModel.poweredOff`). "Power on" = a Reset / fresh boot. See
+> rom-trace-notes "Checkpoint L" and hardware-notes §7.
+
 **Debugger (bring-up tool from day one),** separate window:
 
 - CPU + disassembly (Musashi dasm): pause, step, step-over, run-to, breakpoints.

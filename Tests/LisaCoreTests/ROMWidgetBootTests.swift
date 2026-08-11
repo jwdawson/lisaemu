@@ -58,6 +58,32 @@ extension MusashiSuites {
             m.run(until: m.cycles + 300_000)
         }
 
+        /// The live cursor: the OS cursor (`MousX`/`MousY`, physical $3CF0)
+        /// once the OS is running, else the ROM boot-menu cursor -- same as
+        /// lisadbg's `osCursor`. Needed to click the OS's own modal dialogs
+        /// (dirty-volume, clock-not-set), whose cursor the ROM cells don't
+        /// track.
+        private func osCursor(_ m: Machine) -> (Int, Int) {
+            let ox = Int(m.bus.physicalRead16(0x3CF0)), oy = Int(m.bus.physicalRead16(0x3CF2))
+            if ox <= 720 && oy <= 364 && (ox > 0 || oy > 0) { return (ox, oy) }
+            return (Int(m.bus.read16(0x496)), Int(m.bus.read16(0x498)))
+        }
+
+        /// Feedback-steer the OS cursor to `(tx,ty)` then click -- ported from
+        /// lisadbg's `clickAt` (the half-step on X damps the OS mouse driver's
+        /// 3/2 coarse scaling). Self-correcting, so it's robust to exact timing.
+        private func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+            for _ in 0..<80 {
+                let (cx, cy) = osCursor(m)
+                let dx = tx - cx, dy = ty - cy
+                if abs(dx) <= 1 && abs(dy) <= 1 { break }
+                m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                                     dy: Int8(max(-100, min(100, dy))))
+                m.run(until: m.cycles + 200_000)
+            }
+            click(m)
+        }
+
         /// Loads the ROM, attaches a throwaway COPY of the installed Widget
         /// image, and reaches the boot menu.
         private func machineWithInstalledWidgetCopy() throws -> Machine {
@@ -127,6 +153,56 @@ extension MusashiSuites {
             #expect(fnv1a(fb) != 0xd092_34d2_5516_d0b8 && set != 78100,
                     "the framebuffer must have left the boot-menu anchor; set pixels = \(set)")
             #expect(set > 2000, "the OS drew substantial UI off the Widget boot; set pixels = \(set)")
+        }
+
+        /// **Checkpoint L (M6 Task 1) -- soft power: the OS shuts itself down.**
+        /// Boots the installed Office System off the Widget, dismisses the
+        /// dirty-volume + clock-not-set dialogs to reach the live desktop, then
+        /// presses the soft-power button (`COPS.pressPowerButton()` = the `$FB`
+        /// reset-dispatch byte). The OS runs its OWN shutdown -- DRIVERS
+        /// synthesizes keycap `$08`, the Office System requests shutdown, and
+        /// PowerDown (libhw-MACHINE:419-436) issues a COPS power-off command
+        /// (`$20`/`$21`) -- which drives `Machine.powerState` to `.off`, a
+        /// clean stop (NOT a `halted` double fault). See docs/rom-trace-notes.md
+        /// "Checkpoint L" and docs/hardware-notes.md §7.
+        ///
+        /// The proof this closes: after this clean shutdown, the volume is
+        /// written back not-in-use, so rebooting the same image no longer shows
+        /// the dirty-volume dialog (demonstrated live in the task report; not
+        /// re-asserted here to keep this a single-boot test).
+        @Test func checkpointL_softPowerOSShutsItselfDownFromTheDesktop() throws {
+            let m = try machineWithInstalledWidgetCopy()
+            m.run(until: 18_000_000)                              // POST -> boot menu
+            moveCursor(m, to: 420, 182); click(m)                // "STARTUP FROM..."
+            m.run(until: m.cycles + 6_000_000)
+            moveCursor(m, to: 88, 33); click(m)                  // top item = the Widget
+
+            m.run(until: m.cycles + 160_000_000)                 // boot -> dirty-volume dialog
+            clickAt(m, 595, 72)                                  // "Don't Check"
+            m.run(until: m.cycles + 390_000_000)                 // Desktop Manager builds the desktop
+            clickAt(m, 585, 118)                                 // "OK" on the clock-not-set note
+            m.run(until: m.cycles + 40_000_000)
+
+            // At the live desktop, no halt, still powered on.
+            #expect(!m.halted, "reached the desktop without a fatal halt")
+            #expect(m.powerState == .on, "still powered on at the desktop")
+
+            // Press the soft-power button; run until the OS's shutdown issues a
+            // power-off command and the machine stops, or a generous cap.
+            m.bus.cops.pressPowerButton()
+            for _ in 0..<40 {
+                m.run(until: m.cycles + 8_000_000)
+                if m.powerState == .off { break }
+            }
+
+            #expect(m.powerState == .off,
+                    "the OS ran its own shutdown and the COPS power-off command stopped the machine")
+            #expect(!m.halted, "a clean soft power-off is distinct from a double-fault halt")
+            // The command the OS actually sent is one of the documented
+            // power-off bytes (hardware-notes.md §7: $20/$21/$23).
+            let powerOffs: Set<UInt8> = [0x20, 0x21, 0x23]
+            #expect(m.bus.cops.powerCommandLog.contains { powerOffs.contains($0) },
+                    "a real power-off command was issued; log = \(m.bus.cops.powerCommandLog.map { String(format: "$%02X", $0) })")
         }
     }
 }

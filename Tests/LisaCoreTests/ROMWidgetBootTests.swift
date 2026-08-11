@@ -29,6 +29,20 @@ private let wWidgetImagePath = wWidgetDir.map { $0 + "/OS31-installed.widget" }
 private let wWidgetImageExists =
     wWidgetImagePath.map { FileManager.default.fileExists(atPath: $0) } ?? false
 
+/// Checkpoint M additionally needs the LisaWrite disk-1 image under
+/// `LISAEMU_DISK_DIR` (a DIFFERENT env var than this suite's own
+/// `LISAEMU_ROM_DIR`/`LISAEMU_WIDGET_DIR` gate) -- folded the same way as
+/// `wWidgetImageExists` above, so a missing `LISAEMU_DISK_DIR` or a missing
+/// LisaWrite image is an explicit, reported SKIP via `.enabled(if:)` on the
+/// test itself, not a guard-return that quietly returns without asserting
+/// anything (M6 Task 4 carried fix, same convention as checkpoint J in
+/// ROMFloppyBootTests).
+private let mDiskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
+private let mLisaWriteDiskPath = mDiskDir.map {
+    $0 + "/Lisa_Office_System_3.1/682-0093-B_LisaWrite1_3.1/682-0093-B_LisaWrite1_3.1.dc42"
+}
+private let mLisaWriteDiskExists = mLisaWriteDiskPath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+
 extension MusashiSuites {
     @Suite(.enabled(if: wRomDir != nil && wWidgetImageExists,
                     "Set LISAEMU_ROM_DIR and LISAEMU_WIDGET_DIR to a directory holding OS31-installed.widget to run Widget-boot tests"))
@@ -237,15 +251,18 @@ extension MusashiSuites {
         /// state, not an exact framebuffer.
         ///
         /// Gated additionally on the LisaWrite disk-1 image existing under
-        /// `LISAEMU_DISK_DIR` (Apple-derived, never committed); absent, the test
-        /// returns early -- same secondary-file convention as
-        /// `ROMFloppyBootTests`' disk-2 swap test.
-        @Test func checkpointM_disketteInsertedAtDesktopMounts() throws {
-            let diskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
-            guard let diskDir else { return }   // needs a floppy image dir
-            let lwPath = diskDir
-                + "/Lisa_Office_System_3.1/682-0093-B_LisaWrite1_3.1/682-0093-B_LisaWrite1_3.1.dc42"
-            guard FileManager.default.fileExists(atPath: lwPath) else { return }
+        /// `LISAEMU_DISK_DIR` (Apple-derived, never committed): folded into
+        /// this test's own `.enabled(if:)` predicate (`mLisaWriteDiskExists`)
+        /// so an absent image is an explicit, reported SKIP rather than a
+        /// guard-return early-out (M6 Task 4) -- same convention as
+        /// `ROMFloppyBootTests`' disk-2 swap test (checkpoint J).
+        @Test(.enabled(if: mLisaWriteDiskExists,
+                      "Set LISAEMU_DISK_DIR to a directory holding the LisaWrite disk-1 image to run checkpoint M"))
+        func checkpointM_disketteInsertedAtDesktopMounts() throws {
+            // LisaWrite disk-1 presence is guaranteed by this test's
+            // .enabled(if:) predicate (mLisaWriteDiskExists), so no silent
+            // early-return guard here (M6 Task 4).
+            let lwPath = mLisaWriteDiskPath!
 
             let m = try machineWithInstalledWidgetCopy()
             m.run(until: 18_000_000)                              // POST -> boot menu

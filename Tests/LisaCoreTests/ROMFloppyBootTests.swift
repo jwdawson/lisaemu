@@ -14,6 +14,17 @@ import Testing
 /// process-global singleton; only one live `Machine` per test).
 private let fRomDir = ProcessInfo.processInfo.environment["LISAEMU_ROM_DIR"]
 private let fDiskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
+/// Checkpoint J needs the full 5-disk Office System set, not just the boot
+/// disk the other checkpoints use -- specifically disk 2, for the
+/// media-change swap. Folded into a computable-at-load-time `Bool` (same
+/// convention as `ROMWidgetBootTests`' `wWidgetImageExists`) so a missing
+/// disk 2 is an explicit, reported SKIP via `.enabled(if:)` on the test
+/// itself, not a guard-return that quietly returns without asserting
+/// anything (M6 Task 4 carried fix).
+private let fDisk2Path = fDiskDir.map {
+    $0 + "/Lisa_Office_System_3.1/682-0097-B_Office_System_3.1_2/682-0097-B_Office_System_3.1_2.dc42"
+}
+private let fDisk2Exists = fDisk2Path.map { FileManager.default.fileExists(atPath: $0) } ?? false
 
 extension MusashiSuites {
     @Suite(.enabled(if: fRomDir != nil && fDiskDir != nil,
@@ -658,13 +669,13 @@ extension MusashiSuites {
         /// m5-install-*); this pins the stable precursor that proves the swap
         /// works end to end. Longer than G/H/I (drives the real erase+copy), but
         /// env-gated like them.
-        @Test func checkpointJ_floppyMediaChangeSwapMountsTheNextDisk() throws {
-            let diskDir = fDiskDir!
-            let disk2Path = diskDir + "/Lisa_Office_System_3.1/682-0097-B_Office_System_3.1_2/682-0097-B_Office_System_3.1_2.dc42"
-            // This checkpoint needs the full 5-disk Office System set, not just
-            // the boot disk G/H/I use. If it isn't present, no-op rather than
-            // fail (the swap subsystem is also covered by FloppyControllerTests).
-            guard FileManager.default.fileExists(atPath: disk2Path) else { return }
+        @Test(.enabled(if: fDisk2Exists,
+                      "Set LISAEMU_DISK_DIR to the full 5-disk Office System set (including disk 2) to run checkpoint J"))
+        func checkpointJ_floppyMediaChangeSwapMountsTheNextDisk() throws {
+            // Disk-2 presence is guaranteed by this test's .enabled(if:)
+            // predicate (fDisk2Exists), so no silent early-return guard here --
+            // same convention as ROMWidgetBootTests' checkpointK (M6 Task 4).
+            let disk2Path = fDisk2Path!
 
             let m = try bootIntoLoader()
             var steps = 0

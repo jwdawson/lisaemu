@@ -194,8 +194,12 @@ public final class Machine {
     /// for a single `run(until: 20_000_000)` style call. `1024` is smaller
     /// than any VIA1/VIA2 timer period this codebase or the ROM has been
     /// observed to use (docs/hardware-notes.md §3's Pre-/Post-Pepsi T1
-    /// reloads are $CA27/$7B63, i.e. ~10-31K cycles), so an interrupt
-    /// becomes visible within at most two bursts of latency; this is a
+    /// reloads are $CA27/$7B63 = 10186/25467 VIA-clocks; at the CPU/4 phi2
+    /// divisor these are ~40-102K CPU cycles -- the `viaClockDivisor` fix
+    /// multiplied the effective CPU-cycle periods by 4 vs the old ~10-31K,
+    /// so the 1024-cycle invariant now holds with EVEN MORE margin), so an
+    /// interrupt becomes visible within at most two bursts of latency; this
+    /// is a
     /// deliberate coarse-grained precision tradeoff, not cycle-exact
     /// delivery -- see `VIA6522`'s doc comment for the matching tradeoff on
     /// the timer side. `step()` does not need this: it always executes

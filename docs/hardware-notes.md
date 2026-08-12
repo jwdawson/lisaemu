@@ -440,10 +440,16 @@ the clock is running faster":
   1.273 MHz = **CPU/4** (= master 20.371 MHz / 16). The ratio 25467/10186 =
   2.5 = 10/4 confirms the divisor went from /10 to /4.
 
-Emulation: `Machine.tickVIAsAndUpdateIRQ` feeds both VIAs `cycles/4`
-(`Machine.viaClockDivisor`, remainder carried), so 25467 counts take
-~101,872 CPU cycles ≈ 20.37 ms (within the existing 5.0-vs-5.093 MHz
-approximation). **Bug history (keyboard-duplication fix):** the VIAs were
+On real hardware `/4` is EXACT: master 20.371 MHz / 16 = 1.2732 MHz phi2,
+and 25467 / 1.2732 MHz = 20.002 ms. Emulation: `Machine.tickVIAsAndUpdateIRQ`
+feeds both VIAs `cycles/4` (`Machine.viaClockDivisor`, remainder carried), so
+25467 counts take 25467×4 = 101,868 CPU cycles. At our 5.0 MHz nominal CPU
+clock that is 20.37 ms vs the intended 20.00 ms — ~1.9% slow, purely the
+emulator's pre-existing nominal-clock approximation (we run 5.0 MHz, not the
+real 5.093 MHz), the exact same rounding `VideoTiming.cyclesPerVsync` = 83,333
+already carries (= exactly 60.0 Hz at 5.0 MHz vs ~60.1 Hz real). It does not
+affect the auto-repeat fix: the ~102 ms-vs-400 ms threshold separation is
+~4×, dwarfing 1.9%. **Bug history (keyboard-duplication fix):** the VIAs were
 previously ticked at CPU/1, so T1 fired every ~5.09 ms and `TimerTicks` ran
 ~3.93× too fast. The keyboard driver's auto-repeat `RepeatInitial` = 400 ms
 delay (libhw-DRIVERS:543) then elapsed after only ~102 ms of real key-hold —

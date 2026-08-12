@@ -90,9 +90,23 @@ final class AppModel {
 
     private var controller: EmulationController?
 
-    /// Reused across `apply(_:)` calls to avoid a fresh allocation every
-    /// vsync -- sized once the first frame's dimensions are known.
-    private var pixelScratch: [UInt8] = []
+    /// Long-lived, reused across `apply(_:)` calls (perf-fix round, "CGImage
+    /// pipeline reuse") -- sized/recreated only once the first frame's
+    /// dimensions are known (or if they ever change). The OLD `apply(_:)`
+    /// path rebuilt a fresh `Data(scratch) as CFData` (a full 720x364 copy)
+    /// plus a new `CGDataProvider` every single vsync, forever, on top of
+    /// the `CGImage` that's unavoidably fresh every call (SwiftUI needs a
+    /// new image identity to redraw). This context's backing buffer is
+    /// written into directly (`makeCGImage`), and `context.makeImage()`
+    /// hands the result to a `CGImage` copy-on-write -- no copy at that
+    /// call itself, only lazily, the next time this buffer is written to
+    /// (see `makeCGImage`'s in-body comment on re-fetching `ctx.data`) --
+    /// eliminating the per-frame `Data` copy + provider churn while still
+    /// producing a correctly-identitied fresh `CGImage` each call. Also
+    /// subsumes the old separate `rowBuffer`/`pixelScratch`
+    /// pair: rows are expanded straight into this context's buffer, so
+    /// there is no intermediate array to promote/reuse at all.
+    private var pixelContext: CGContext?
 
     /// Latest-frame coalescing slot for `wire(_:)`'s `onFrame` callback
     /// (whole-branch-review Important finding: "unthrottled mode can flood
@@ -181,7 +195,7 @@ final class AppModel {
     }
 
     private func apply(_ frame: Frame) {
-        image = AppModel.makeCGImage(frame: frame, scratch: &pixelScratch)
+        image = AppModel.makeCGImage(frame: frame, context: &pixelContext)
     }
 
     // MARK: - Floppy (M2 Task 7): File > Insert Disk…/Eject, drag-and-drop
@@ -339,8 +353,12 @@ final class AppModel {
             return
         }
         controller.requestScreenshot { frame in
-            var scratch: [UInt8] = []
-            let png = AppModel.encodePNG(frame: frame, scratch: &scratch)
+            // A screenshot is a one-off, user-triggered request (not the
+            // 60Hz hot path `apply(_:)` is), so a fresh `CGContext` here
+            // -- rather than a reused instance property -- is fine: there's
+            // no sustained-churn concern to optimize away.
+            var context: CGContext?
+            let png = AppModel.encodePNG(frame: frame, context: &context)
             DispatchQueue.main.async {
                 completion(png)
             }
@@ -352,9 +370,8 @@ final class AppModel {
 
     /// Expands `frame.bits` (packed 1bpp, MSB-first, set bit = black --
     /// see `expand1bppRow`'s doc comment) into an 8bpp DeviceGray
-    /// `CGImage`. `scratch` is caller-owned reusable storage for the
-    /// expanded pixel buffer, sized/resized here as needed.
-    /// `nonisolated`, deliberately: `AppModel` itself is `@MainActor`, and
+    /// `CGImage`. `nonisolated`, deliberately: `AppModel` itself is
+    /// `@MainActor`, and
     /// static members of a global-actor-isolated type inherit that
     /// isolation by default -- but this function's caller
     /// (`requestScreenshotPNG`'s closure, below) is invoked by
@@ -369,44 +386,77 @@ final class AppModel {
     /// is a pure function of its parameters (no access to any `AppModel`
     /// instance/actor-isolated state), matching `expand1bppRow`'s own
     /// pure-function shape one layer down.
-    nonisolated static func makeCGImage(frame: Frame, scratch: inout [UInt8]) -> CGImage? {
+    ///
+    /// `context` is caller-owned reusable storage (`pixelContext` for the
+    /// hot `apply(_:)` path; a fresh local for the cold screenshot path) --
+    /// created on first use and recreated only if `frame`'s dimensions ever
+    /// change. Perf-fix round ("CGImage pipeline reuse" + "per-scanline
+    /// array elimination"): the OLD implementation allocated a fresh
+    /// `[UInt8]` `rowBuffer` AND `replaceSubrange`'d it into `scratch` AND
+    /// sliced a fresh `Array(frame.bits[...])` per row, THEN wrapped the
+    /// whole `scratch` buffer in a fresh `Data`/`CGDataProvider` -- every
+    /// single vsync, forever. This version expands each row directly out
+    /// of `frame.bits` (no per-row slice) into `context`'s own backing
+    /// buffer (no intermediate row buffer, no final whole-frame copy), and
+    /// hands back `context.makeImage()` -- which still allocates a new
+    /// `CGImage` per call (unavoidable: SwiftUI needs a new image identity
+    /// to redraw), but nothing else.
+    nonisolated static func makeCGImage(frame: Frame, context: inout CGContext?) -> CGImage? {
         let width = frame.width
         let height = frame.height
-        let bytesPerRow = (width + 7) / 8
-        let pixelCount = width * height
-        if scratch.count != pixelCount {
-            scratch = [UInt8](repeating: 0, count: pixelCount)
+        if context == nil || context?.width != width || context?.height != height {
+            // `bytesPerRow: width` (1 byte/pixel, 8bpp DeviceGray, no
+            // padding) is only safe to hand to `expand1bppRow` as a flat
+            // `width * height` buffer below because CGContext honors it
+            // exactly for widths that are already a multiple of the pixel
+            // format's natural alignment -- true for every real Lisa frame
+            // (720 = 90 x 8 bytes). A non-16-byte-aligned width would let
+            // Quartz silently pad each row wider than `width`, which would
+            // desync `outputOffset: y * width` below from the context's
+            // actual per-row stride and skew the image.
+            context = CGContext(
+                data: nil,
+                width: width,
+                height: height,
+                bitsPerComponent: 8,
+                bytesPerRow: width,
+                space: CGColorSpaceCreateDeviceGray(),
+                bitmapInfo: CGImageAlphaInfo.none.rawValue
+            )
         }
-        var rowBuffer = [UInt8](repeating: 0, count: width)
+        guard let ctx = context, let base = ctx.data else { return nil }
+        // Re-fetch `ctx.data` on every call (not cached alongside `context`
+        // itself): `ctx.makeImage()` below hands the CURRENT buffer's
+        // contents to the returned `CGImage` copy-on-write -- the backing
+        // store isn't copied at `makeImage()` time, only lazily, on this
+        // context's NEXT write after that. Quartz may satisfy that lazy
+        // copy by allocating a fresh buffer and repointing `ctx.data`
+        // rather than mutating in place, so a pointer captured on an
+        // earlier call could silently go stale. Re-deriving `buffer` from
+        // `ctx.data` fresh each call means we always write through
+        // whatever pointer is actually live, and is also exactly why the
+        // previously-returned `CGImage` can never tear: it already owns
+        // (or will copy-on-write into) its own snapshot before this
+        // function's next row-write touches anything.
+        let buffer = UnsafeMutableBufferPointer(
+            start: base.assumingMemoryBound(to: UInt8.self),
+            count: width * height
+        )
+        let bytesPerRow = (width + 7) / 8
         for y in 0..<height {
             let rowStart = y * bytesPerRow
             let rowEnd = min(rowStart + bytesPerRow, frame.bits.count)
             guard rowEnd > rowStart else { break }
-            let packedRow = Array(frame.bits[rowStart..<rowEnd])
-            expand1bppRow(packedRow, into: &rowBuffer)
-            scratch.replaceSubrange(y * width..<(y + 1) * width, with: rowBuffer)
+            expand1bppRow(frame.bits, rowByteOffset: rowStart, into: buffer, outputOffset: y * width, width: width)
         }
-        guard let provider = CGDataProvider(data: Data(scratch) as CFData) else { return nil }
-        return CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 8,
-            bytesPerRow: width,
-            space: CGColorSpaceCreateDeviceGray(),
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: false,
-            intent: .defaultIntent
-        )
+        return ctx.makeImage()
     }
 
     /// `nonisolated` for the same reason as `makeCGImage`, above -- also
     /// called from `requestScreenshotPNG`'s closure on the emulation
     /// thread.
-    nonisolated static func encodePNG(frame: Frame, scratch: inout [UInt8]) -> Data? {
-        guard let image = makeCGImage(frame: frame, scratch: &scratch) else { return nil }
+    nonisolated static func encodePNG(frame: Frame, context: inout CGContext?) -> Data? {
+        guard let image = makeCGImage(frame: frame, context: &context) else { return nil }
         let data = NSMutableData()
         guard let dest = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, 1, nil) else {
             return nil

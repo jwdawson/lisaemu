@@ -368,10 +368,56 @@ public final class COPS {
     /// Every recognized power-management command byte, in the order COPS
     /// received them (docs/hardware-notes.md §7 "Power Commands"). "Logged"
     /// per the task brief -- no power semantics are otherwise modeled.
+    ///
+    /// Perf-fix round ("COPS log caps"): unbounded before this -- a
+    /// diagnostic/provenance log with no consumer that ever trims it, so an
+    /// app left running for hours (each power-management command received
+    /// appending one more entry, forever) grew this without bound. Capped
+    /// at `powerCommandLogLimit`, matching the repo's established bounded-
+    /// log idiom (`Bus.unmappedAccesses` cap 1024, `Bus.mmuPortLog` cap
+    /// 8192, `IODispatcher.ioTrace` cap 4096: append while under the cap,
+    /// else drop and count -- see `Self.powerCommandLogLimit`'s own doc
+    /// comment for why 256 is safe against every existing consumer,
+    /// including `ROMWidgetBootTests.checkpointL_...`'s exact-membership
+    /// assertions).
     public private(set) var powerCommandLog: [UInt8] = []
+    /// Count of `powerCommandLog` entries dropped after the cap filled,
+    /// once `Self.powerCommandLogLimit` was reached. Diagnostic only --
+    /// nothing reads this to change behavior.
+    public private(set) var powerCommandLogDropped = 0
+    /// `powerCommandLog`'s cap (perf-fix round, "COPS log caps"). 256 is
+    /// generous against every real caller: a single full boot-to-shutdown
+    /// session (`ROMWidgetBootTests.checkpointL_
+    /// softPowerOSShutsItselfDownFromTheDesktop`) logs on the order of ten
+    /// commands total, so this cap is never even approached by realistic
+    /// traffic -- it only bites under many, many hours of sustained soft
+    /// power-cycle/clock-set churn, which is exactly the "app left open
+    /// for hours" scenario this fix targets.
+    private static let powerCommandLogLimit = 256
+
     /// Low nibble of every `$10|n` "write clock nibble" command received,
-    /// in order.
+    /// in order. Provenance-only (see `processCommand`'s `Command
+    /// .writeClockNibbleBase` case doc comment) -- distinct from, and NOT
+    /// consumed by, `setSequenceNibbles`/`finishSetSequence` (the actual
+    /// in-flight `$2C..$25` set-sequence buffer, below), so capping this
+    /// log can never truncate a set sequence still being assembled.
+    ///
+    /// Perf-fix round ("COPS log caps"): capped at `clockSetNibblesLimit`
+    /// for the same unbounded-over-hours reason as `powerCommandLog`,
+    /// above.
     public private(set) var clockSetNibbles: [UInt8] = []
+    /// Count of `clockSetNibbles` entries dropped after the cap filled.
+    public private(set) var clockSetNibblesDropped = 0
+    /// `clockSetNibbles`'s cap (perf-fix round, "COPS log caps"). 64 is
+    /// four full 16-nibble set-sequences' (TIMERS:659-671) worth of
+    /// provenance -- comfortably more than any single test or realistic
+    /// session needs to inspect, while still bounding hours-long growth.
+    /// Deliberately NOT sized to exactly one sequence (16): capping this
+    /// PROVENANCE log can never corrupt an in-flight set (see this
+    /// property's doc comment), so there is no correctness reason to keep
+    /// it that tight -- 64 is purely a "how much history is useful"
+    /// choice.
+    private static let clockSetNibblesLimit = 64
     /// Set by `$7C` ("enable mouse interrupts (16ms)", hardware-notes.md §4).
     public private(set) var mouseInterruptsEnabled = false
 
@@ -484,7 +530,9 @@ public final class COPS {
         pendingByte = 0xFF
         deliveryScheduled = false
         powerCommandLog.removeAll()
+        powerCommandLogDropped = 0
         clockSetNibbles.removeAll()
+        clockSetNibblesDropped = 0
         mouseInterruptsEnabled = false
         // A battery-backed RTC survives reset with a valid time (TIMERS:596-
         // 598); default it running and unset-by-OS, so `$02` reads live host
@@ -550,39 +598,70 @@ public final class COPS {
         }
     }
 
+    /// Appends to `powerCommandLog` while under `powerCommandLogLimit`, else
+    /// bumps `powerCommandLogDropped` -- the repo's established bounded-log
+    /// idiom (`Bus.mmuPortLog`/`IODispatcher.ioTrace`). Every one of
+    /// `processCommand`'s "logged for provenance" cases funnels through
+    /// here instead of appending directly, so the cap can't be missed by a
+    /// future case that forgets it.
+    private func logPowerCommand(_ command: UInt8) {
+        if powerCommandLog.count < Self.powerCommandLogLimit {
+            powerCommandLog.append(command)
+        } else {
+            powerCommandLogDropped += 1
+        }
+    }
+
+    /// Companion to `logPowerCommand` for `clockSetNibbles` -- the
+    /// PROVENANCE log only. Never touches `setSequenceNibbles` (the actual
+    /// in-flight `$2C..$25` set-sequence buffer `finishSetSequence` reads),
+    /// so this cap can never truncate a set sequence still being
+    /// assembled -- see `clockSetNibbles`'s doc comment.
+    private func logClockSetNibble(_ nibble: UInt8) {
+        if clockSetNibbles.count < Self.clockSetNibblesLimit {
+            clockSetNibbles.append(nibble)
+        } else {
+            clockSetNibblesDropped += 1
+        }
+    }
+
     private func processCommand(_ command: UInt8) {
         switch command {
         case Command.readClock:
             enqueueClockReply()
         case Command.writeClockNibbleBase...(Command.writeClockNibbleBase | 0x0F):
             let nibble = command & 0x0F
-            clockSetNibbles.append(nibble)
+            logClockSetNibble(nibble)
             // Inside a `$2C..$25` set window, this nibble is part of the clock
             // the OS is writing (TIMERS:663-668). Outside one (e.g. the
             // PowerCycle `$2D` reboot-alarm nibbles, MACHINE:466-469), it is
             // still logged above but does not touch the stored clock.
+            // `setSequenceNibbles` (the set-sequence's real input, read by
+            // `finishSetSequence`) is UNCAPPED and entirely separate from the
+            // `clockSetNibbles` provenance log above -- it cannot be truncated
+            // by that log's cap, no matter how full it already is.
             if setSequenceActive { setSequenceNibbles.append(nibble) }
         case Command.disableClockPrepSetClock:
             // `$2C` disable-clock/prep-set (TIMERS:656): opens the set window.
-            powerCommandLog.append(command)
+            logPowerCommand(command)
             setSequenceActive = true
             setSequenceNibbles.removeAll()
         case Command.enableClockDisableTimer:
             // `$25` enable-clock/disable-timer (TIMERS:673): closes the set
             // window and commits the accumulated nibbles as the new clock.
-            powerCommandLog.append(command)
+            logPowerCommand(command)
             finishSetSequence()
         case Command.disableTimerSetRebootAlarm:
             // `$2D` set clock for a reboot alarm (MACHINE:462). Logged for
             // provenance; the physical timed WAKE is not modeled (see below).
-            powerCommandLog.append(command)
+            logPowerCommand(command)
         case Command.powerOffClockOn, Command.powerOffRebootLater:
             // `$21`/`$23` power off with the clock LEFT ON (MACHINE:427/473):
             // the battery-backed RTC keeps its time across the power-off, so
             // the stored clock is PRESERVED. `$23` ("reboot later") also arms
             // a wake alarm on real hardware; that timed WAKE is DEFERRED (see
             // the deferral note below).
-            powerCommandLog.append(command)
+            logPowerCommand(command)
             onPowerOff()
         case Command.powerOffClockOff:
             // `$20` power off with the clock OFF (MACHINE:425): the RTC stops
@@ -591,7 +670,7 @@ public final class COPS {
             // issues `$20` when it already read the clock as unset (PowerDown,
             // MACHINE:423-425), so this is a faithful mirror, not a
             // data-loss surprise.
-            powerCommandLog.append(command)
+            logPowerCommand(command)
             clockRunning = false
             setClockReply = nil
             onPowerOff()

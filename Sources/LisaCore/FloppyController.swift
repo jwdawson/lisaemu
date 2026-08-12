@@ -321,6 +321,42 @@ public final class FloppyController {
         blocksWritten = overlay.count
     }
 
+    // NOTE (M6 Task 4, considered and DEFERRED -- not implemented). An
+    // automatic, per-image-IDENTITY overlay store (FloppyController itself
+    // remembering each diskette's session, keyed by something intrinsic to
+    // the image, and auto-restoring it on re-insertion) was evaluated as a
+    // replacement for this caller-managed export/import pair, so an
+    // arbitrary UI-driven swap (not just the installer's own scripted
+    // sequence) wouldn't lose a diskette's session. Rejected for THIS pass
+    // because every candidate identity key has a real failure mode, not a
+    // merely theoretical one:
+    //   - URL-keyed: `DC42Image` is a value type carrying no URL (loaded
+    //     once, then detached from its source path everywhere but the
+    //     caller) -- would require an API-widening `sourceURL:` parameter on
+    //     `insert`/`insertWhileRunning` across every call site (Emulation-
+    //     Controller, lisadbg, every test helper). Even then, re-inserting
+    //     the SAME URL after the underlying file was edited externally would
+    //     wrongly restore a session onto now-different bytes.
+    //   - Content-digest-keyed (hash the data+tag planes): cheap to compute
+    //     and needs no API change, but conflates two BYTE-IDENTICAL images
+    //     as "the same disk" -- and that is not a theoretical edge case
+    //     here: Apple's install floppies are mass-duplicated, so two
+    //     genuinely distinct physical copies of the same disk (e.g. two
+    //     pristine copies of Office System disk 1) are byte-identical by
+    //     construction. Auto-restoring one's write session onto the OTHER
+    //     copy on first insert would be silently wrong.
+    //   - Composite (URL, content-digest): resolves both failure modes
+    //     above, but combines both costs (the API-widening AND accepting
+    //     "no identity" for any caller that can't supply a URL, e.g. a
+    //     synthetic/in-memory test image) -- real, but wider-reaching than
+    //     a "carried quality fix."
+    // Left as-is: the caller-managed API above already gives the ONE party
+    // who genuinely knows physical identity -- the human/UI layer choosing
+    // to reinsert "the same diskette" -- the tool to preserve it explicitly;
+    // FloppyController/DC42Image cannot reliably infer that identity from
+    // bytes or a path alone. Scope estimate + full writeup: task-4-report.md
+    // ("Fix 4" section).
+
     /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
     /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
     /// `clristat`/`enabstat`/`clrmask`/`goaway` as well as `excmd`'s

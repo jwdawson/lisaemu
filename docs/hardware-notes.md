@@ -419,11 +419,45 @@ Note: Stride differs from VIA1—a common emulation gotcha.
 Source: libhw-DRIVERS:578-588, 595-596
 
 - **Timer1:** System millisecond tick
-  - Pre-Pepsi reload: $CA/$27
-  - Post-Pepsi reload: $7B/$63
+  - Pre-Pepsi reload: $CA/$27 ($27CA = 10186)
+  - Post-Pepsi reload: $7B/$63 ($637B = 25467)
 - **Ports:** Drive contrast DAC and disk-enable signals
 - **Shift Register:** Used for alarm interrupts
 - **Interrupt Level:** 1 (IRQ)
+
+#### VIA phi2 clock = CPU/4 (Pepsi) — the keyboard-auto-repeat / millisecond-clock rate
+
+The 6522 phi2 is **divided down from the CPU clock**, and the T1 reload
+values above pin the divisor exactly. The OS loads VIA1 T1 so one underflow
+period equals **20 ms of real time** (its `Timer1` handler adds 20 to the
+`TimerTicks` millisecond clock per T1 IRQ — libhw-DRIVERS:974/987), and
+libhw-DRIVERS:574-576 states the Pepsi board needs "a larger number ... since
+the clock is running faster":
+
+- **Pre-Pepsi:** 10186 VIA-clocks = 20 ms ⇒ phi2 = 509.3 kHz = **CPU/10**
+  (the classic 6800-family E-clock; CPU = 20.371 MHz / 4 = 5.093 MHz).
+- **Post-Pepsi (this emulator's board):** 25467 VIA-clocks = 20 ms ⇒ phi2 =
+  1.273 MHz = **CPU/4** (= master 20.371 MHz / 16). The ratio 25467/10186 =
+  2.5 = 10/4 confirms the divisor went from /10 to /4.
+
+On real hardware `/4` is EXACT: master 20.371 MHz / 16 = 1.2732 MHz phi2,
+and 25467 / 1.2732 MHz = 20.002 ms. Emulation: `Machine.tickVIAsAndUpdateIRQ`
+feeds both VIAs `cycles/4` (`Machine.viaClockDivisor`, remainder carried), so
+25467 counts take 25467×4 = 101,868 CPU cycles. At our 5.0 MHz nominal CPU
+clock that is 20.37 ms vs the intended 20.00 ms — ~1.9% slow, purely the
+emulator's pre-existing nominal-clock approximation (we run 5.0 MHz, not the
+real 5.093 MHz), the exact same rounding `VideoTiming.cyclesPerVsync` = 83,333
+already carries (= exactly 60.0 Hz at 5.0 MHz vs ~60.1 Hz real). It does not
+affect the auto-repeat fix: the ~102 ms-vs-400 ms threshold separation is
+~4×, dwarfing 1.9%. **Bug history (keyboard-duplication fix):** the VIAs were
+previously ticked at CPU/1, so T1 fired every ~5.09 ms and `TimerTicks` ran
+~3.93× too fast. The keyboard driver's auto-repeat `RepeatInitial` = 400 ms
+delay (libhw-DRIVERS:543) then elapsed after only ~102 ms of real key-hold —
+inside a normal human keypress — so the OS emitted a spurious typematic repeat
+that **duplicated every typed key** at the desktop. lisadbg's `type` held keys
+only ~30 ms (≪ the 102 ms threshold), which is why headless typing looked
+clean while the live app duplicated. Regression pinned by
+`VIAClockDivisorTests`.
 
 ### VIA2 Function
 

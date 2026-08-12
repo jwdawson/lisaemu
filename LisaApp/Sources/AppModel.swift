@@ -98,9 +98,12 @@ final class AppModel {
     /// the `CGImage` that's unavoidably fresh every call (SwiftUI needs a
     /// new image identity to redraw). This context's backing buffer is
     /// written into directly (`makeCGImage`), and `context.makeImage()`
-    /// snapshots it -- eliminating the per-frame `Data` copy + provider
-    /// churn while still producing a correctly-identitied fresh `CGImage`
-    /// each call. Also subsumes the old separate `rowBuffer`/`pixelScratch`
+    /// hands the result to a `CGImage` copy-on-write -- no copy at that
+    /// call itself, only lazily, the next time this buffer is written to
+    /// (see `makeCGImage`'s in-body comment on re-fetching `ctx.data`) --
+    /// eliminating the per-frame `Data` copy + provider churn while still
+    /// producing a correctly-identitied fresh `CGImage` each call. Also
+    /// subsumes the old separate `rowBuffer`/`pixelScratch`
     /// pair: rows are expanded straight into this context's buffer, so
     /// there is no intermediate array to promote/reuse at all.
     private var pixelContext: CGContext?
@@ -402,6 +405,15 @@ final class AppModel {
         let width = frame.width
         let height = frame.height
         if context == nil || context?.width != width || context?.height != height {
+            // `bytesPerRow: width` (1 byte/pixel, 8bpp DeviceGray, no
+            // padding) is only safe to hand to `expand1bppRow` as a flat
+            // `width * height` buffer below because CGContext honors it
+            // exactly for widths that are already a multiple of the pixel
+            // format's natural alignment -- true for every real Lisa frame
+            // (720 = 90 x 8 bytes). A non-16-byte-aligned width would let
+            // Quartz silently pad each row wider than `width`, which would
+            // desync `outputOffset: y * width` below from the context's
+            // actual per-row stride and skew the image.
             context = CGContext(
                 data: nil,
                 width: width,
@@ -413,6 +425,19 @@ final class AppModel {
             )
         }
         guard let ctx = context, let base = ctx.data else { return nil }
+        // Re-fetch `ctx.data` on every call (not cached alongside `context`
+        // itself): `ctx.makeImage()` below hands the CURRENT buffer's
+        // contents to the returned `CGImage` copy-on-write -- the backing
+        // store isn't copied at `makeImage()` time, only lazily, on this
+        // context's NEXT write after that. Quartz may satisfy that lazy
+        // copy by allocating a fresh buffer and repointing `ctx.data`
+        // rather than mutating in place, so a pointer captured on an
+        // earlier call could silently go stale. Re-deriving `buffer` from
+        // `ctx.data` fresh each call means we always write through
+        // whatever pointer is actually live, and is also exactly why the
+        // previously-returned `CGImage` can never tear: it already owns
+        // (or will copy-on-write into) its own snapshot before this
+        // function's next row-write touches anything.
         let buffer = UnsafeMutableBufferPointer(
             start: base.assumingMemoryBound(to: UInt8.self),
             count: width * height

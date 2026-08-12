@@ -2717,8 +2717,12 @@ g 200000000
   alarm is modeled, so `$23` powers off but schedules no wake (M6 Task 2, RTC —
   which will also retire the clock-not-set note).
 - `checkpointL` (env-gated, `ROMWidgetBootTests`) pins the behavioural proof:
-  desktop reached → button → `powerState == .off`, `!halted`, and a documented
-  power-off byte (`$20`/`$21`/`$23`) in `powerCommandLog`. Like `checkpointK` it
+  desktop reached → button → `powerState == .off`, `!halted`, and ~~a documented
+  power-off byte (`$20`/`$21`/`$23`) in `powerCommandLog`~~ **(SUPERSEDED by
+  commit 9e2a378, 2026-08-11: the assertion is now the OS's own clock
+  attestation — `powerCommandLog` contains `$21` (power off, clock believed
+  set) and does NOT contain `$20` (clock unset), not a bare documented-byte
+  check.)** Like `checkpointK` it
   asserts state, not an exact framebuffer, since the desktop is reached through
   feedback-timed dialog clicks.
 
@@ -2878,7 +2882,10 @@ click precision) is deliberately **NOT** pinned to a framebuffer — like K/L it
 would be fragile; the insert is a direct API call whose mount is a plain OS
 consequence, so the assertion is on read-count state. Gated additionally on the
 LisaWrite disk-1 image under `LISAEMU_DISK_DIR` (Apple-derived, never committed;
-absent → early return, the disk-2-swap convention).
+~~absent → early return, the disk-2-swap convention)~~ **(SUPERSEDED by commit
+79d99a2, 2026-08-11: an absent LisaWrite disk-1 image is now an explicit,
+reported SKIP via the test's own `.enabled(if:)` trait, not a silent
+guard-return — same convention as checkpointJ.)**
 
 **Standing frontier at M6 Task 3 close.** The Lisa is now a machine **in daily
 use**: it boots clean off the Widget, keeps a real clock, runs the Filer

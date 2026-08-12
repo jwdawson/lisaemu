@@ -220,7 +220,7 @@ release           # release on the item -> a new folder "Folders 08/11"
 type Reports      # the fresh name is in edit mode -> keyboard rename
 
 # --- install + type into LisaWrite ---
-insert ~/Development/LisaImages/.../682-0093-B_LisaWrite1_3.1.dc42
+insert ~/Development/LisaImages/.../682-0093-B_LisaWrite1_3.1.dc42  # fill in your local Lisa_Office_System_3.1 subdirectory
 g 40000000        # the OS honors bot_in, mounts + reads the diskette
 # (open the diskette window, drag the LisaWrite tool onto the Hard Disk icon,
 #  tear off a document, Open it, then:)

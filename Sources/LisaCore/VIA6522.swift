@@ -35,13 +35,23 @@
 ///
 /// ## Timer model / precision tradeoff
 ///
-/// Both timers are 16-bit down-counters that decrement every VIA clock
-/// (modeled 1:1 with CPU cycles -- the real Lisa's VIA clock is not
+/// Both timers are 16-bit down-counters that decrement every VIA clock.
+/// `tick(cycles:)` is a PURE counter-of-elapsed-VIA-clocks call: it is fed a
+/// count of VIA phi2 clocks and decrements by exactly that.
+///
+/// ~~(modeled 1:1 with CPU cycles -- the real Lisa's VIA clock is not
 /// separately divided down from the CPU clock for this purpose, and no
-/// trace evidence has surfaced requiring anything finer). `tick(cycles:)`
-/// is a PURE counter-of-elapsed-cycles call: it is fed the number of CPU
-/// cycles that elapsed since the previous tick (`Machine` calls it once per
-/// executed CPU slice/step, not once per instruction), so an underflow that
+/// trace evidence has surfaced requiring anything finer).~~ REFUTED (keyboard-
+/// duplication fix): the 6522 phi2 IS divided down from the CPU clock -- CPU/4
+/// on the Pepsi board this emulator models (CPU/10 pre-Pepsi). The OS pins the
+/// ratio by loading VIA1 T1 with $637B = 25467 so that count == 20 ms of real
+/// time (LIBHW-DRIVERS:574-588); at CPU/1 that made every OS millisecond run
+/// ~3.93x fast and fired keyboard auto-repeat inside a normal keypress. The
+/// divider now lives in `Machine.tickVIAsAndUpdateIRQ` (see
+/// `Machine.viaClockDivisor`), so this chip model is still fed a pure clock
+/// count -- it just receives VIA phi2 clocks now, not raw CPU cycles.
+/// `Machine` calls it once per executed CPU slice/step (not once per
+/// instruction), so an underflow that
 /// happens partway through a slice is detected retroactively rather than at
 /// the exact instruction boundary it would occur at on real hardware. This
 /// is a deliberate simplification: modeling exact underflow-cycle interrupt

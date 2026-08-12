@@ -59,6 +59,34 @@ public final class Machine {
     private var queue: [Event] = []   // kept sorted by (cycle, seq)
     private var nextSeq: UInt64 = 0
 
+    /// The 6522 VIAs are clocked at phi2 = CPU clock / 4 on a Pepsi-board Lisa
+    /// (the machine this emulator models -- Rev H boot ROM, boot ROM id >=
+    /// $80). Master oscillator 20.371 MHz -> CPU = /4 = 5.093 MHz; VIA phi2 =
+    /// /16 = 1.273 MHz = CPU/4. The OS itself pins this ratio: it loads VIA1
+    /// T1 with $637B = 25467 (LIBHW-DRIVERS:587-588) SPECIFICALLY so 25467
+    /// VIA-clocks == 20 ms, and its Timer1 handler adds 20 to the millisecond
+    /// clock `TimerTicks` per T1 IRQ (LIBHW-DRIVERS:974/987). At CPU/4 that is
+    /// 25467*4 = ~101,872 CPU cycles = ~20.37 ms per IRQ (correct within the
+    /// existing 5.0-vs-5.093 MHz approximation `VideoTiming.cyclesPerVsync`
+    /// already carries). The comment at DRIVERS:574-576 confirms the divisor:
+    /// pre-Pepsi loads $27CA = 10186 (= CPU/10, the classic 6800 E-clock),
+    /// Pepsi needs the "larger number ... since the clock is running faster"
+    /// -- 25467/10186 = 2.5 = 10/4, i.e. Pepsi phi2 went from CPU/10 to CPU/4.
+    ///
+    /// Ticking the VIAs at CPU/1 (the pre-fix model) made T1 fire every
+    /// ~5.09 ms instead of 20 ms, so `TimerTicks` advanced ~3.93x too fast and
+    /// the keyboard auto-repeat's 400 ms `RepeatInitial` delay
+    /// (LIBHW-DRIVERS:543) elapsed after only ~102 ms of real key-hold --
+    /// inside a normal human keypress -- emitting a spurious auto-repeat that
+    /// duplicated the typed key. See docs/hardware-notes.md "VIA phi2 clock".
+    static let viaClockDivisor = 4
+
+    /// Carries the sub-divisor remainder of CPU cycles not yet delivered to
+    /// the VIAs, so `viaClockDivisor` loses no cycles across slice boundaries
+    /// (a `run(until:)`/`step()` slice is rarely a multiple of 4). Reset with
+    /// the rest of `Machine` state in `reset()`.
+    private var viaPhi2Remainder = 0
+
     public init(ramSize: Int = 0x20_0000) {
         bus = Bus(ramSize: ramSize)
         cpu = M68K(bus: bus)
@@ -122,6 +150,7 @@ public final class Machine {
         bus.via2.reset()
         cpu.reset()
         cycles = 0
+        viaPhi2Remainder = 0
         halted = false
         powerState = .on   // a warm reset / fresh boot powers the machine back on
         queue.removeAll()
@@ -218,8 +247,15 @@ public final class Machine {
     /// ticked -- see `VIA6522`'s doc comment for that precision tradeoff.
     private func tickVIAsAndUpdateIRQ(_ executed: Int) {
         guard executed > 0 else { return }
-        bus.via1.tick(cycles: executed)
-        bus.via2.tick(cycles: executed)
+        // Divide CPU cycles down to VIA phi2 = CPU/4 (see `viaClockDivisor`),
+        // carrying the remainder so no cycles are lost across slices.
+        viaPhi2Remainder += executed
+        let viaCycles = viaPhi2Remainder / Machine.viaClockDivisor
+        viaPhi2Remainder %= Machine.viaClockDivisor
+        if viaCycles > 0 {
+            bus.via1.tick(cycles: viaCycles)
+            bus.via2.tick(cycles: viaCycles)
+        }
         let level1 = (bus.via1.irqAsserted || vsyncPending || floppyPending) ? 1 : 0
         let level2 = bus.via2.irqAsserted ? 2 : 0
         cpu.setIRQ(level: max(level1, level2))

@@ -321,6 +321,42 @@ public final class FloppyController {
         blocksWritten = overlay.count
     }
 
+    // NOTE (M6 Task 4, considered and DEFERRED -- not implemented). An
+    // automatic, per-image-IDENTITY overlay store (FloppyController itself
+    // remembering each diskette's session, keyed by something intrinsic to
+    // the image, and auto-restoring it on re-insertion) was evaluated as a
+    // replacement for this caller-managed export/import pair, so an
+    // arbitrary UI-driven swap (not just the installer's own scripted
+    // sequence) wouldn't lose a diskette's session. Rejected for THIS pass
+    // because every candidate identity key has a real failure mode, not a
+    // merely theoretical one:
+    //   - URL-keyed: `DC42Image` is a value type carrying no URL (loaded
+    //     once, then detached from its source path everywhere but the
+    //     caller) -- would require an API-widening `sourceURL:` parameter on
+    //     `insert`/`insertWhileRunning` across every call site (Emulation-
+    //     Controller, lisadbg, every test helper). Even then, re-inserting
+    //     the SAME URL after the underlying file was edited externally would
+    //     wrongly restore a session onto now-different bytes.
+    //   - Content-digest-keyed (hash the data+tag planes): cheap to compute
+    //     and needs no API change, but conflates two BYTE-IDENTICAL images
+    //     as "the same disk" -- and that is not a theoretical edge case
+    //     here: Apple's install floppies are mass-duplicated, so two
+    //     genuinely distinct physical copies of the same disk (e.g. two
+    //     pristine copies of Office System disk 1) are byte-identical by
+    //     construction. Auto-restoring one's write session onto the OTHER
+    //     copy on first insert would be silently wrong.
+    //   - Composite (URL, content-digest): resolves both failure modes
+    //     above, but combines both costs (the API-widening AND accepting
+    //     "no identity" for any caller that can't supply a URL, e.g. a
+    //     synthetic/in-memory test image) -- real, but wider-reaching than
+    //     a "carried quality fix."
+    // Left as-is: the caller-managed API above already gives the ONE party
+    // who genuinely knows physical identity -- the human/UI layer choosing
+    // to reinsert "the same diskette" -- the tool to preserve it explicitly;
+    // FloppyController/DC42Image cannot reliably infer that identity from
+    // bytes or a path alone. Scope estimate + full writeup: task-4-report.md
+    // ("Fix 4" section).
+
     /// Count of go-bytes fully processed (every `clearDiskCmd()` call, i.e.
     /// every `processGoByte`/`performExCmd` completion -- `nulcmd`/`seek`/
     /// `clristat`/`enabstat`/`clrmask`/`goaway` as well as `excmd`'s
@@ -375,6 +411,49 @@ public final class FloppyController {
         // stale bot_in and spuriously re-trigger DISK_INT's gooddisk/KEYPUSHED.
     }
 
+    /// **User-forced eject (M6 Task 4 decision: bare, no OS-visible
+    /// attention -- cited, not the asymmetric oversight it looks like next
+    /// to `insertWhileRunning`).** Compare the other two eject/insert
+    /// paths: `insertWhileRunning` deliberately raises the media-change
+    /// attention on insertion, and the `unclamp` sub-command (`performExCmd`
+    /// case `.unclamp`) -- the OS's OWN commanded eject -- completes with a
+    /// normal `bot_done` interrupt. This method, by contrast, raises
+    /// NOTHING: no DISKSTAT bits, no level-1 pending. That is the correct
+    /// answer, not a gap, for three reasons:
+    ///
+    /// 1. Real hardware's ONLY commanded-eject path IS `unclamp` -- a
+    ///    68000-driven solenoid (SONY dskunclamp:679-688). There is no
+    ///    independent "the diskette was physically removed" sense line the
+    ///    6504 reports as an interrupt; hardware-notes.md §9 "DISKIN"
+    ///    documents `DISKIN` (`$41`) as a PASSIVE, POLLED presence cell read
+    ///    synchronously at driver init (`ISDISKIN`, SONYASM:437-441), and §9
+    ///    "Media-change attention" is explicit that `insertWhileRunning` is
+    ///    "the ONLY runtime path that flips the cached presence" -- on the
+    ///    INSERT side. No ejection-side counterpart interrupt is documented
+    ///    for anything but the OS's own `unclamp`.
+    /// 2. This emulator's user-menu "Eject" (`EmulationController.
+    ///    ejectFloppy`, `lisadbg`'s `eject` command) therefore models a
+    ///    scenario real hardware cannot physically produce mid-session: on a
+    ///    real Lisa, media leaves the drive ONLY via the motorized eject the
+    ///    OS itself commands, so "the user pulls the diskette while the OS
+    ///    still thinks it's present" has no hardware analog to fault-match
+    ///    in the first place -- there is no real interrupt this method could
+    ///    cite even if we wanted one.
+    /// 3. Given that, the real-hardware-accurate consequence of a stale
+    ///    OS-side presence belief is: nothing tells it, and it finds out on
+    ///    its OWN next access. `performRead`/`performWrite`'s existing
+    ///    `guard image != nil` paths already raise a NORMAL completion
+    ///    interrupt (`bot_int|bot_done`) carrying a read/write-class
+    ///    DISKERR when `image` is nil -- exactly the "that access just
+    ///    failed" signal a real drive with no media would produce on the
+    ///    OS's next `excmd`. Bare `eject()` already reproduces that; it
+    ///    would be WRONG to also synthesize a phantom "media removed"
+    ///    interrupt no real 6504 firmware ever sends.
+    ///
+    /// Pinned by `FloppyControllerTests.bareEjectRaisesNoAttentionOrInterrupt`
+    /// (no DISKSTAT bits, no level-1 pending, and the OS's own subsequent
+    /// read correctly raises completion with a read DISKERR). Mirrored in
+    /// docs/hardware-notes.md §9 "User-forced eject".
     public func eject() {
         image = nil
         window[Cell.diskIn] = 0

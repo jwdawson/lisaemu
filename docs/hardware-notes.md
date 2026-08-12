@@ -610,13 +610,17 @@ Source: libhw-DRIVERS:1074-1252 (COPS/COPSX handlers)
 
 **State 2:** Receive dy → emit MouseMovement, return to state 0
 
-**State 3:** Receive 5 clock bytes (after $E0-$EF seen in state 4) → update ClockHigh/ClockLow
+**State 3:** Receive 5 clock bytes (after $E0-$EF seen in state 4) → update ClockHigh/ClockLow (byte layout: see "Read-Clock ($02) Reply Format" below)
 
 **State 4 (reset dispatch):**
 - $00-$DF: keyboard ID
 - $E0-$EF: clock start (year nibble = low 4 bits)
 - $F0-$FA: reserved
-- $FB: power button (synthesized as key $08 down/up)
+- $FB: power button (synthesized as key $08 down/up) -- CONFIRMED correct by
+  M6 Task 1 (DRIVERS:1196/1230 sets `D0=$08`; `KeyPushed` KEYBD:755/758 emits
+  down `$80` + up `$00`; pseudo-key table KEYBD:732 `08 -- Power Button`). COPS
+  puts `$80,$FB` on the wire; the OS makes the `$08` -- see §7 "Power Button ->
+  shutdown chain" for the full button->PowerDown->COPS-power-off path.
 - $FD: keyboard unplugged
 - $FE-$FF: COPS failure (bit 0: 0 = I/O COPS, 1 = keyboard COPS)
 
@@ -642,6 +646,111 @@ faithful 2-byte `$80, <keyboard ID>` announcement and drops the 5 trailing
 `$00`s; the ROM reaches the byte-identical boot menu either way (the
 power-on stream is not load-bearing for the boot path — see
 docs/rom-trace-notes.md "POST completion (Task 7)").
+
+### Read-Clock ($02) Reply Format and Set-Clock Sequence (M6 Task 2)
+
+Sources: libhw-TIMERS:600-609 (clock/calendar packing), :619-641 (`Clock`,
+the `$02` read), :652-680 (`SetClock`, the set sequence), :695-766
+(`ClockToDate`, the consumer); libhw-DRIVERS:1161-1219 (`COPS3`/`COPS4`, the
+parser); :505-506 (uninitialized init); libhw-MACHINE:419-480 (power-off /
+reboot-alarm clock semantics).
+
+**~~M1b-era placeholder (STRUCK):~~** ~~the `$02` reply was `$80, $E0,
+<4-byte big-endian host Unix time>, $00` — a best-effort guess, no
+byte-level format claimed.~~ SUPERSEDED: the OS parses those raw seconds as
+BCD and gets an invalid day/hour, which is why the Office System showed its
+"clock not set" Note (M6 Task 2 live proof, task-2-report.md). The real
+format is derived below from the OS's own parser — the OS side is the
+contract, every byte cited.
+
+> **Hedge (Task 2, honest):** the causal chain "invalid parsed date → the Note
+> draws" is **empirically dispositive** (the Note is present with the old
+> placeholder reply and gone with the parser-derived reply, otherwise identical)
+> but not fully source-cited: `ClockToDate` (TIMERS:695-766) does not itself reject
+> an invalid BCD date — it only special-cases the `0FFF…` uninitialized sentinel
+> (DRIVERS:505-506). The exact Office System / Desktop Manager validity check that
+> raises the alert is **un-cited** because that source is not in the tree (only the
+> Filer and libhw are). We claim the byte-level `$02` contract (cited below), not
+> the dialog's internal trigger.
+
+**Clock/calendar packing (TIMERS:600-606).** Six nib-packed bytes:
+
+```
+byte0     byte1     byte2     byte3     byte4     byte5
+0000yyyy  dddddddd  ddddhhhh  hhhhmmmm  mmmmssss  sssstttt
+```
+
+- `yyyy` — year, BINARY, `1980 = 0`; 4 bits, rolls over every 16 years
+  (TIMERS:596). `ClockToDate` maps `n -> 1980+n`, range 1980..1995
+  (TIMERS:687,711-713).
+- `dddddddddddd` — day-of-year `1..366`, 3 BCD nibbles (hundreds, tens, ones).
+- `hhhhhhhh`/`mmmmmmmm`/`ssssssss` — hour/minute/second, 2 BCD nibbles each.
+- `tttt` — tenths of a second, 1 BCD nibble.
+- Top nibble `0000` of byte0 is the ALARM field (SetClock zeros it,
+  TIMERS:655); it is dropped in the read reply's selector high nibble.
+- "Not set since battery loss" sentinel: `0FFF FFFFFFFF` (TIMERS:608-609),
+  the value `ClockToDate` treats as uninitialized (DRIVERS:505-506).
+
+**The `$02` reply stream (parser-derived, DRIVERS:1077-1219).** `Clock`
+(TIMERS:619) sends `$02` then spins reading Port A into the `COPS` interrupt
+parser until `ClockReady`. COPS must reply with this 7-byte input stream:
+
+| Byte  | Value            | Parser action (DRIVERS)                                   |
+|-------|------------------|----------------------------------------------------------|
+| 1     | `$80`            | State 0 -> State 4 ("reset code follows", COPS0 @5:1092)  |
+| 2     | `$E0 \| yyyy`    | State 4 clock-start: `ClockReady=0, ClockBytes=5, ClockHigh=year nibble`, -> State 3 (COPS4 @2:1212) |
+| 3     | byte1 `dddddddd` | State 3, ClockBytes==5: `ClockHigh=(ClockHigh<<8)\|b` (:1167) |
+| 4     | byte2            | State 3: `ClockLow=(ClockLow<<8)\|b` (:1173)              |
+| 5     | byte3            | State 3: ditto                                            |
+| 6     | byte4            | State 3: ditto                                            |
+| 7     | byte5            | State 3, ClockBytes->0: `ClockReady=1`, -> State 0 (:1181)|
+
+Result: `ClockHigh = 0000yyyy dddddddd`, `ClockLow = ddddhhhh hhhhmmmm
+mmmmssss sssstttt` — exactly the packing above. So the reply PAYLOAD (after
+the `$80` frame) is `[$E0|yearNibble, byte1..byte5]`, 6 bytes. This is what
+`COPS.clockReplyBytes(from:)` builds from host time and what
+`notSetClockReply = [$EF,$FF,$FF,$FF,$FF,$FF]` builds for the off state.
+
+**Host-year windowing.** Host year `Y` maps by the same 16-year rollover the
+silicon uses: `yearNibble = (Y - 1980) & $0F`. E.g. 2026 -> nibble 14 ->
+displayed 1994; 2023 -> nibble 11 -> displayed 1991. Faithful to the 4-bit
+field and keeps the desktop showing an in-window date. Time-of-day/day-of-
+year are preserved exactly. Decoded in a FIXED UTC Gregorian calendar so the
+byte sequence is a pure function of the injected `Date` (deterministic
+tests).
+
+**Set-clock sequence `$2C -> $10xN -> $25` (TIMERS:652-680).** `SetClock`:
+1. `$2C` — disable clock/timer, prep set (TIMERS:656).
+2. 16x `$10|nibble` (TIMERS:659-671): two 8-iteration loops send, MSN-first,
+   the high clock LONGWORD's 8 nibbles (`0,0,0,0,0,year,dayHi,dayMid` — the
+   5 leading zeros are the `AND #$0FFF` zero-fill of the 16-bit high word
+   promoted to a longword) then the low longword's 8
+   (`dayLo,hourHi,hourLo,minHi,minLo,secHi,secLo,tenths`).
+3. `$25` — enable clock, disable timer (TIMERS:673): commit.
+
+So COPS drops the 5 leading fill nibbles and repacks the last 11 into the
+6-byte reply payload — the exact inverse of the read parse. A committed set
+value is returned by every subsequent `$02` until cleared. (Modeled in
+`COPS.finishSetSequence`.)
+
+**Power-off clock semantics (MACHINE:419-480).** `PowerDown` reads the clock
+and picks the power-off byte by whether it is running (MACHINE:423-427):
+- `$21` — power off, clock ON (clock was running): clock PRESERVED.
+- `$20` — power off, clock OFF (clock read as `$0FFF`): clock CLEARED; next
+  `$02` returns the not-set sentinel. The OS only sends `$20` when it already
+  saw the clock unset, so this is a faithful mirror.
+- `$23` — power off, reboot later (PowerCycle, MACHINE:473): clock ON,
+  PRESERVED; pairs with `$2D` + 5 alarm nibbles (MACHINE:462-471).
+
+**DEFERRED to M7 — the `$23`/`$2D` timed reboot WAKE.** `PowerCycle`
+(MACHINE:447-480) powers off and re-powers after N seconds, but ONLY if the
+clock is already set (MACHINE:451-456 falls back to a plain `PowerDown`
+otherwise). Now that our `$02` reads as set, that path is reachable, but
+modeling the physical wake needs a host-time alarm that RE-POWERS the Machine
+(Task 1's `powerState` in reverse) — out of Task 2's read/set/keep scope. The
+alarm nibbles are captured in `COPS.clockSetNibbles` for provenance; delivery
+source expectation is MACHINE:447-480. (Mirrors Task 1's `$23`/`$2D` deferral
+note in §7.)
 
 ## 5. Interrupts
 
@@ -860,39 +969,86 @@ Source: libhw-MACHINE:413-481
 
 **Overview:** All soft power is mediated by the COPS chip via command interface.
 
-**Power Commands:**
-- $20: Power off (timer off, clock off)
-- $21: Power off (timer off, clock on)
-- $23: Power off, reboot later
-- $2D: Disable timer enable, set clock for reboot alarm
-- $25: Enable clock, disable timer
+**Power / clock commands** (only `$20`/`$21`/`$23` actually power the machine
+OFF; the rest are clock/timer control that the shutdown routines send
+alongside):
+- `$20`: Power off, timer off, clock off (MACHINE:425 -- PowerDown, clock invalid)
+- `$21`: Power off, timer off, clock on (MACHINE:427 -- PowerDown, clock running)
+- `$23`: Power off, reboot later (MACHINE:473 -- PowerCycle, after the alarm nibbles)
+- `$2D`: Disable timer, set clock for the reboot alarm (MACHINE:462 -- PowerCycle)
+- ~~`$25`: power off / "Enable clock, disable timer"~~ **`$25` is NOT a
+  power-off command** (M6 Task 1 correction, cited): a grep of LIBHW finds
+  `$25` only at TIMERS:673 (`MOVE.W #$25,D0 ; enable clock, disable timer`, a
+  clock-control command in the calendar code) and DRIVERS:1058 (`MOVE.W
+  #$2500,SR`, an unrelated status-register write). Neither PowerDown nor
+  PowerCycle sends `$25`. The earlier listing of `$25` among the shutdown
+  commands is struck. (`$2C` "disable clock, prep set-clock" is likewise
+  clock-control, TIMERS:656, not power-off.)
 
-**Shutdown Sequence:**
-- PowerDown/PowerCycle dims contrast to 255
-- Reads clock (validate or use $0FFF sentinel if unset)
-- Sends COPS power-off command
+**Shutdown Sequence (M6 Task 1 -- full chain, cited to LIBHW `/LIBS/LIBHW/`,
+byte-identical to `/LIBHW/`):**
+- `PowerDown` (MACHINE:419-436, OS trap slot 38 per DRIVERS:397): dim contrast
+  to 255 (`SetContrast`, MACHINE:420-421) -> read the hardware clock (`Clock`,
+  MACHINE:422) -> compare against the `$0FFF` "not validly running" sentinel
+  (MACHINE:423) -> send `$20` if invalid (MACHINE:425) or `$21` if the clock is
+  running (MACHINE:427) -> `JSR COPSCMD` (MACHINE:429) -> busy-coast + retry.
+- `PowerCycle` (MACHINE:447-474, trap slot 40, power-off-with-timed-reboot):
+  dim -> read clock -> `$2D` (MACHINE:462) -> loop sending five alarm nibbles
+  each OR'd with `$0010` "write clock" via `COPSCMD` (MACHINE:464-471) ->
+  `$23` "power off, reboot later" (MACHINE:473) -> `COPSCMD` (MACHINE:474). The
+  wake-at-alarm half is NOT modeled here (no RTC alarm -- M6 Task 2 territory);
+  `$23` still powers OFF like `$20`/`$21`.
+- The COPS-command-send primitive is `COPSCMD` (DRIVERS:829); the emulator's
+  COPS HLE drives its exact CRDY handshake (see §4 "M4 Task 1").
 
-**Power Button:**
-- Synthesized by COPS as reset-code $FB
-- Dispatched as key $08 down/up event
+**Power Button -> shutdown chain (M6 Task 1, cited):**
+- COPS puts `$80` then `$FB` on its input stream (a State-4 reset-dispatch
+  packet, §4). The OS's COPS input handler (DRIVERS:1190 `COPS4`, `$FB` branch
+  at DRIVERS:1196) synthesizes pseudo-keycap `$08` (`MOVE.W #$08,D0` at
+  DRIVERS:1230) and calls `KeyPushed` (DRIVERS:1231). **The M1b-era "synthesized
+  as key `$08` down/up" note is CONFIRMED correct** (not struck): `KeyPushed`
+  (KEYBD:741-761) genuinely emits BOTH a down (`$80`, KEYBD:755) and an up
+  (`$00`, KEYBD:758) transition, and the pseudo-key table KEYBD:728-738 line 732
+  reads `08 -- Power Button`. Emulator fidelity note: `COPS.pressPowerButton()`
+  sends the faithful `$80,$FB` (what real COPS puts on the wire), NOT a
+  synthesized `$08` -- the OS makes the `$08` itself, exactly as on hardware.
+- The `$08` event goes onto the ordinary keyboard event queue (via `Key`/
+  `Enqueue`, KEYBD:955-1130). There is NO kernel special-case for keycap `$08`;
+  userland decides to shut down: the Shell's `PowerOff` (nwshell:2143-2162,
+  menu key `'o'/'O'` at nwshell:2232) sets `term_event[1] := 4` and terminates,
+  the Root scheduler (PMSPROCS:315-344) maps event `4` to `kill_power` and
+  calls `FS_ShutDown`, which flushes/unmounts every volume (fsinit:1216) and
+  ends at `GiveUpGhost` (fsinit:1066) -> `powerdown` (fsinit:1115), i.e. the
+  `PowerDown` trap above. (The graphical Office System's Desktop Manager isn't
+  in this source tree, but uses the same `term_event[1]=4`/`kill_power` path --
+  and empirically DOES honor the power button at the desktop; see below.)
 
-**Emulator status (M3 Task 3 -- re-recorded deferral, consciously, to M4):**
+**Emulator status (M6 Task 1 -- IMPLEMENTED; supersedes the M3-Task-3
+deferral below).** Soft power is now real behavior:
+`COPS.pressPowerButton()` injects `$80,$FB`; decoding a power-OFF command
+(`$20`/`$21`/`$23`) fires `COPS.onPowerOff` -> `Bus.powerOffHandler` ->
+`Machine.powerState = .off`, a clean stop distinct from a double-fault
+`halted` (`run(until:)`/`step()` short-circuit; `reset()` powers back on). The
+Power button is reachable from `lisadbg` (`power`), `EmulationController`
+(`.powerButton` mailbox + `EmuStatus.poweredOff`), and LisaApp (Machine >
+Power, ⌘⌥P). **LIVE PROOF (Checkpoint L, rom-trace-notes.md):** at the Office
+System desktop, pressing the button ran the OS's own shutdown, which issued
+COPS `$21` and stopped the machine (`power=OFF`, `halted=false`); rebooting the
+same Widget image then showed NO dirty-volume dialog (the clean shutdown wrote
+the volume back not-in-use). One observed subtlety: the button is honored only
+at the live desktop, NOT at the modal dirty-volume dialog (the dialog's own
+event loop swallows the keycap) -- so the LIVE PROOF/Checkpoint L press the
+button after reaching the desktop. `powerCommandLog` still logs every
+power/clock command byte for provenance (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`),
+regression-pinned by `COPSTests`.
+
+~~**Emulator status (M3 Task 3 -- re-recorded deferral, consciously, to M4):**
 soft power / the Power menu are NOT implemented as behavior -- `COPS`
-recognizes and LOGS every power command byte above (`$20`/`$21`/`$23`/
-`$25`/`$2C`/`$2D`) into `COPS.powerCommandLog` (`Sources/LisaCore/COPS.swift`;
-regression-pinned by `COPSTests.powerCommandsAreLogged`), but no shutdown/
-reboot/clock-for-alarm semantics are modeled -- the log exists purely so a
-future task can verify the ROM/OS issued the right command, not to drive any
-emulated effect. No boot path through M3 (menu, floppy boot, the OS loader
-through its current Checkpoint-D frontier) has been observed to issue a
-Power Command byte, so this remains untested-by-necessity, not
-under-tested. Widget (`dev_widget=3`, docs/hardware-notes.md §9 "Boot
-Path") and ProFile HLE are likewise unimplemented -- no peripheral beyond
-the internal Sony/Twiggy floppy exists in this emulator. Both are
-consciously scoped to M4, not this milestone: M3's plan document (Global
-Constraints) explicitly excludes them ("Widget + Power menu remain
-consciously deferred to M4 unless evidence forces them"), and nothing on
-the M3 boot path through Checkpoint D has forced either.
+recognizes and LOGS every power command byte above into `COPS.powerCommandLog`,
+but no shutdown/reboot/clock-for-alarm semantics are modeled.~~ SUPERSEDED by
+M6 Task 1 above (strike-not-erase): the log-only model is replaced by a real
+power-off transition; the reboot-later ALARM half of `$23`/`$2D` remains
+deferred (M6 Task 2, RTC).
 
 ### NMI and Debugger Break-In
 
@@ -1162,6 +1318,27 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
   eject/reinsert of the SAME disk via `export/importSessionOverlay` (so the boot
   disk's MDDF `overmount_stamp` survives for `boot_remount`, FSINIT2:466-468);
   the `.dc42` file is still never mutated.
+- **User-forced eject — bare, no OS-visible attention (M6 Task 4 decision,
+  cited).** `FloppyController.eject()` (the emulator's user-menu "Eject" /
+  `lisadbg eject`, reached via `EmulationController.ejectFloppy()`) raises
+  NOTHING — no DISKSTAT bits, no level-1 pending — unlike `unclamp` above
+  (the OS's OWN commanded eject, which completes with `bot_done`) or
+  insertion's media-change attention just above. This is deliberate, not the
+  asymmetry it looks like: real hardware's ONLY commanded-eject path IS
+  `unclamp`, a 68000-driven solenoid; there is no independent "diskette
+  physically removed" sense line the 6504 reports as an interrupt, and
+  `DISKIN` above is documented as a PASSIVE, POLLED cell, not an
+  interrupt-backed one. A "user pulls the diskette while the OS still thinks
+  it's present" scenario therefore has no real-hardware interrupt to
+  fault-match in the first place — this emulator's forced-eject menu command
+  models something a real Sony 400K drive on a Lisa cannot physically
+  produce mid-session. The real-hardware-accurate consequence already
+  happens for free: the OS finds out on its own next access, because
+  `performRead`/`performWrite`'s `image == nil` guards already raise a
+  normal completion interrupt carrying a read/write-class DISKERR — exactly
+  what a real drive with no media returns to a `readdisk`/`writedisk`.
+  Pinned by `FloppyControllerTests.bareEjectRaisesNoAttentionOrInterrupt`;
+  full citation trail in `FloppyController.eject()`'s doc comment.
 - **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
   change).** The busy-rejection guard (`FloppyController.commandInFlight`)
   only spans the command-decode delay, not the SEPARATE completion-wait

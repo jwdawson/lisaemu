@@ -2654,3 +2654,284 @@ RTC so the clock/calendar note stops appearing (the north star's "working clock"
 clause, the natural M6 headline), and the multi-block/`T_Widget` protocol path
 (§10.6, unimplemented by design). See `docs/m5-demo.md` for the full milestone
 walkthrough and the M6 candidate roster.
+
+## Checkpoint L (M6 Task 1) — SOFT POWER: the OS shuts itself down, cleanly ⭐
+
+The Office System desktop, booted off the Widget (Checkpoint K), now responds to
+the **soft-power button** by running its **own** shutdown — and the clean
+shutdown makes the next boot of the same image skip the dirty-volume dialog.
+
+### The chain, cited (LIBHW `/LIBS/LIBHW/`, byte-identical to `/LIBHW/`)
+
+`COPS.pressPowerButton()` puts `$80,$FB` on the COPS input stream (a State-4
+reset-dispatch packet, hardware-notes §4). The OS decodes it:
+`COPS4` (DRIVERS:1190) branches on `$FB` (DRIVERS:1196) → `MOVE.W #$08,D0`
+(DRIVERS:1230) → `KeyPushed` (DRIVERS:1231), which synthesizes pseudo-keycap
+`$08` **down+up** (KEYBD:755/758) onto the keyboard event queue. Userland turns
+that into a shutdown request (Shell `PowerOff` nwshell:2143-2162 / Desktop
+Manager, same `term_event[1]=4` path) → Root scheduler `kill_power`
+(PMSPROCS:315-344) → `FS_ShutDown` flush/unmount (fsinit:1216) → `GiveUpGhost`
+(fsinit:1066) → `powerdown` (fsinit:1115) = `PowerDown` (MACHINE:419-436):
+contrast→255, read clock, and — clock running — send COPS **`$21`** via `COPSCMD`
+(MACHINE:427/429, DRIVERS:829). See hardware-notes §7 for the full citation set.
+
+### OBSERVED (live, `lisadbg` + release build)
+
+```
+... boot to the Office System desktop (Checkpoint K path) ...
+power                     # COPS $80,$FB
+g 120000000
+      ... halted=false power=OFF powerCmds=[$21] ...   PC=5208A4 (COPSCMD rts)
+g 200000000
+      ... power=OFF ...   cycles UNCHANGED (664318646) — CPU executes no further
+```
+
+- The OS issued **`$21`** (PowerDown's clock-running path, MACHINE:427). The
+  emulator's `COPS` decoded it and drove `Machine.powerState = .off` — a clean
+  stop, `halted=false` (distinct from a double-fault HALT). A subsequent `g`
+  advanced **zero** cycles: a powered-off machine executes nothing.
+- Shutdown UI: `PowerDown`/`GiveUpGhost` dims contrast to 255 and blanks the
+  screen — the framebuffer goes fully black (artifact `m6-power-05-shutdown.png`).
+
+### THE DIRTY-VOLUME PROOF (the deliverable's headline)
+
+1. Fresh copy of `OS31-installed.widget`, booted → **dirty-volume dialog**
+   ("The startup disk was in use when the Lisa failed…", `m6-power-02`). This is
+   why every prior boot showed it: the volume was left marked in-use.
+2. Reach the desktop (dismiss dirty + clock dialogs), press the power button →
+   the OS runs its shutdown → `$21` → machine stops. `FS_ShutDown` wrote the
+   volume back **not-in-use**.
+3. **Reboot the SAME image → the dirty-volume dialog is GONE** (`m6-power-07`
+   shows the normal "Wait — Office System Release 3.1" boot progress; `m6-power-08`
+   the desktop with only the clock-not-set note, no dirty dialog).
+
+### Boundary / carry-forward
+
+- **The button is honored only at the LIVE DESKTOP, not at the modal
+  dirty-volume dialog** (observed: pressing it at that dialog does nothing — the
+  dialog's own event loop swallows the keycap). So Checkpoint L / the LIVE PROOF
+  press the button after reaching the desktop. Not an emulator fault — matches
+  how the OS routes the pseudo-keycap through the ordinary event queue that the
+  frontmost modal owns.
+- The **reboot-later alarm** half of `$23`/`$2D` (PowerCycle) is deferred: no RTC
+  alarm is modeled, so `$23` powers off but schedules no wake (M6 Task 2, RTC —
+  which will also retire the clock-not-set note).
+- `checkpointL` (env-gated, `ROMWidgetBootTests`) pins the behavioural proof:
+  desktop reached → button → `powerState == .off`, `!halted`, and ~~a documented
+  power-off byte (`$20`/`$21`/`$23`) in `powerCommandLog`~~ **(SUPERSEDED by
+  commit 9e2a378, 2026-08-11: the assertion is now the OS's own clock
+  attestation — `powerCommandLog` contains `$21` (power off, clock believed
+  set) and does NOT contain `$20` (clock unset), not a bare documented-byte
+  check.)** Like `checkpointK` it
+  asserts state, not an exact framebuffer, since the desktop is reached through
+  feedback-timed dialog clicks.
+
+**Standing frontier at M6 Task 1 close.** The machine now powers ON (boot) and
+OFF (clean OS shutdown) — a real machine's power cycle. The remaining M6 north-
+star clause is the **working clock** (RTC): modeling the COPS real-time clock so
+the clock-not-set note stops appearing and `PowerCycle`'s reboot alarm can wake.
+
+## Checkpoint M (M6 Task 3) — THE DESKTOP IN USE: Filer work, and LisaWrite typed-into ⭐
+
+The clean-booting Office System desktop (Checkpoints K/L, Tasks 1–2's clock) is
+now **driven as a machine in use** — real Filer operations, and the LisaWrite
+tool installed, launched, and typed into. This closes M5 Task 5's honest gap
+(keyboard-at-desktop): text typed through the COPS keyboard path is visible in a
+live application document.
+
+All of the below is **OBSERVED** live (`lisadbg` + release build, working copy
+`/tmp/lisa-work.widget` — Apple-derived, kept out of the repo, persisted across
+the whole task so the install/folder changes carry). Screenshots in
+`~/Development/LisaEmu-artifacts/m6-desktop-*.png` and `m6-lisawrite-*.png`.
+Where the Desktop Manager's own internals would be the explanation, they stay
+**inferred** and are labelled so — the Desktop Manager source is NOT in the tree
+(M6 Task 1 finding); only the Filer (`lmfiler`) has source + linkmaps.
+
+### New `lisadbg` driving primitives (this task)
+
+The desktop's real interaction model needed input verbs the M5 `click`/`type`
+pair didn't cover, so `lisadbg` gained (all thin wrappers over existing
+`COPS.postMouse`/`postKey` and `FloppyController`, parse-tested in
+`MonitorTests`):
+
+- `press <x> <y>` / `release` / `moveto <x> <y>` — mouse-button-DOWN-and-hold,
+  button-UP-in-place, and steer-without-touching-the-button. Office System menus
+  are **press-drag-release pull-downs** (NOT click-latched — verified: a bare
+  click on a menu title drops AND closes it); a menu is screenshotted by
+  `press`ing its title (button held across `lisadbg` commands, since no cycles
+  run between them), stepping `moveto` down to the item, and `release`-ing on it.
+- `drag <x1> <y1> <x2> <y2>` — press, steer, release (menu selection and
+  icon-to-disk copy both use it).
+- `insert <path.dc42>` / `eject` — the **media-change path**
+  (`FloppyController.insertWhileRunning`, M5 Task 3 round 2 — raises `bot_in`),
+  the runtime counterpart of `--disk`; identical call to the app's
+  `insertFloppy` mailbox. Used to insert the LisaWrite diskette at the live
+  desktop.
+
+Two driving gotchas, ledgered so the next task doesn't re-derive them: (1) the
+framebuffer is **720 wide** — a click with `x ≥ 720` is off-screen and
+`osCursor`'s `≤ 720` guard silently drops it (cost me the Preferences-note
+`Cancel` at a mis-estimated `x=795`; real button was `x≈600`). (2) menu
+highlight tracking needs **incremental** `moveto` steps — a single big jump to a
+deep item skips the OS's per-move highlight, and menu rows are ~16 px apart so
+`Open` sits at cursor `y≈80` in File/Print, not the ~56 an eyeballed row-count
+suggests.
+
+### Filer work, OBSERVED (Step 1)
+
+- **Open the Internal Hard Disk window** via the **Desk menu** (it lists the
+  desktop's objects — Clipboard, Internal Hard Disk, Preferences, Wastebasket,
+  plus any mounted disk; selecting one opens it). Double-click does NOT open on
+  this synthetic-input path — the OS's time-based double-click detector doesn't
+  fire on injected click pairs at any gap tried (0 / 400k / 1M cycles); the menu
+  route is the reliable open. Window shows `Empty Folders`, `Clock`, `Calculator`.
+- **All four menus pulled down** (`m6-desktop-menu-*`): **Desk** (objects),
+  **File/Print** (Set Aside Everything/Set Aside, Save & Put Away, Open,
+  Duplicate ⌘D, Attributes of…, Tear Off Stationery, Make Stationery Pad,
+  Monitor the Printer…), **Edit** (Undo, Cut/Copy/Copy Reference/Paste, Select
+  All Icons), **Housekeeping** (Eject Micro Diskette ⌘E). Items are
+  context-sensitive (grey out per selection).
+- **Create a folder**: `Empty Folders` is a **stationery pad** — `File/Print ▸
+  Tear Off Stationery` tears off a new folder, auto-named **`Folders 08/11`**
+  (the date stamp is Task 2's RTC, live). **Rename**: the fresh name is in edit
+  mode, so typing replaces it — typed `Reports` (COPS keyboard → Filer name
+  field; a real keyboard-at-desktop interaction in its own right).
+- **Duplicate** and its modal: `File/Print ▸ Duplicate` starts a copy that must
+  be **placed before anything else** ("…you must move the duplicate before you
+  do anything else"); a stray click raised that modal — cited here as the real
+  Filer duplicate flow, `Cancel` terminates it.
+- **Preferences** opened (Desk menu): notes a **card in slot 1** (our emulated
+  expansion) not yet connected, then the panel — Set Conveniences, Select
+  Defaults, Connect Devices, Install/Remove Device Software.
+- **Boundary**: opening a *sub*-folder via `File/Print ▸ Open` is finicky on
+  synthetic input (narrow hit row next to greyed items + separators); disk-window
+  and menu navigation are solid, nested-folder open is documented as a
+  precision limit, not an emulator fault.
+
+### The §4 payoff — live `UNIT.PROC` symbol resolution (Linkmap overlay)
+
+During Filer work the overlay resolves the running PC to **named Filer
+procedures**, live (`lisadbg` annotated `PC=` / `t`):
+
+- `flrAll.WALKTREE`, `flrAll.UPDATEFI`, `flrAll.UPDATETE`, `flrAll.VALIDSCR`,
+  `flrAll.INDIALOG`, `flrAll.IGNOREDE`, `flrAll.ERASEOBJ`, `flrAll.FLUSHOBJ`,
+  `flrAll.ISCONTAI` (the Filer's main unit; ~40+ hits/burst)
+- `flrDm.DOMOVEDE` (Filer desktop-manager unit), `lmfiler.DOCCONSI`,
+  `lmfiler.DOFILERE` (Filer main program)
+- `lmlist.DFILTER / GET_PHYS / IN_RANGE` (list manager — folder listings),
+  `CiDlg.SPECREDR` (dialog), `Core2.GETVRTSE`, `NEWSEG1.MMPAGEBR / ARGINSCR`
+  (segment loader)
+
+These are **high-confidence** because the running app IS the Filer and
+`flrAll`/`flrDm`/`lmfiler` are unique to the filer linkmap — running-app ==
+symbol-app.
+
+### The merged-symbol-table ambiguity — CONFIRMED live, handled per its note
+
+`LinkmapSymbols` merges all 22 app/library linkmaps into one flat table with
+`baseOffset` defaulting to 0 (`assume link-time == runtime`); its own doc
+(the "base-offset story") warns different apps' same-numbered segments **collide
+at the same link-time address** and are "only meaningful one file at a time."
+This task drove that live: **while LisaWrite is the frontmost app**, sampled PCs
+STILL resolve to **`flrAll.*` / `lmfiler.*`** (ERASEOBJ, FLUSHOBJ, ISCONTAI,
+DOCCONSI, DOFILERE) plus `NEWSEG1` (the segment loader). Two readings, both
+consistent with the note: (a) genuinely the **resident Filer/Desktop-Manager
+event loop + segment loader** running under/for LisaWrite, or (b) a **merged-
+table collision** mis-attributing LisaWrite's relocated code to the nearest-
+below Filer symbol in the shared slot. Without per-app relocation the overlay
+**cannot distinguish** which — so the honest rule (ledgered, matching
+`LinkmapSymbols`'s self-doc; **no code change** — `symbase` is the manual lever):
+a resolved name is trustworthy only when the **running app is known to be that
+symbol's app** (true for Filer-during-Filer-work; NOT assured for a name shown
+while a *different* app is frontmost). Not "fixed" here — a real fix is per-app
+`baseOffset`, out of this task's scope.
+
+### LisaWrite, OBSERVED end-to-end (Step 2 — keyboard-at-desktop CLOSED)
+
+1. **Insert disk 1 at the live desktop** (`insert …/682-0093-B_LisaWrite1_3.1
+   .dc42`) through the media-change path → the OS honors the `bot_in` attention,
+   mounts the volume and reads its catalog **with no UI interaction** (`blocksRead`
+   0→305), and draws the diskette icon **`LisaWrite 1 - 3.1`**
+   (`m6-lisawrite-01-inserted`).
+2. **Open the diskette window** (Desk menu) → `LisaWrite Paper` (stationery pad),
+   `LisaWrite Examples`, `LisaWrite` (the tool), `American Dictionary`.
+3. **The Office System's own copy/install flow**: dragging the `LisaWrite` tool
+   icon onto the Internal Hard Disk icon raises the OS's **"The Lisa is moving
+   'LisaWrite' to 'Internal Hard Disk'"** Wait dialog; the tool is installed onto
+   the Widget (leaves the floppy window; the working `.widget` gains 141,606
+   changed bytes — the install persisted).
+4. **Tear off a document** from `LisaWrite Paper` → `File/Print ▸ Tear Off
+   Stationery` creates **`LisaWrite Paper 08/11`** (RTC date-stamped again).
+5. **Launch**: `File/Print ▸ Open` on that document boots the LisaWrite tool —
+   the menu bar becomes LisaWrite's (Type Style, Format ¶, Page Layout, Search,
+   Spelling) and a blank document opens with a blinking insertion caret
+   (`m6-lisawrite-06-launch`).
+6. **TYPE INTO IT**: `Hello from LisaEmu-- M6 Task 3.` renders in the document
+   (`m6-lisawrite-07/08`) — caps, digits, spaces, punctuation through the COPS
+   make/break + Final-US KeyMap path. **Keyboard-at-desktop closed.** Disk 2 was
+   **not** requested — a single-diskette tool copy + tear-off sufficed; the
+   disk-2 media is on hand if a future flow asks.
+
+### What Checkpoint M pins (`ROMWidgetBootTests`, env-gated)
+
+`checkpointM_disketteInsertedAtDesktopMounts` pins the **deterministic** slice —
+boot to the desktop (K/L path), `insertWhileRunning` the LisaWrite diskette, and
+assert the OS mounts + reads it (`isInserted`, `blocksRead` grew, `!halted`,
+`powerState == .on`). The Filer/LisaWrite *UI* work (drag/menu, feedback-timed
+click precision) is deliberately **NOT** pinned to a framebuffer — like K/L it
+would be fragile; the insert is a direct API call whose mount is a plain OS
+consequence, so the assertion is on read-count state. Gated additionally on the
+LisaWrite disk-1 image under `LISAEMU_DISK_DIR` (Apple-derived, never committed;
+~~absent → early return, the disk-2-swap convention)~~ **(SUPERSEDED by commit
+79d99a2, 2026-08-11: an absent LisaWrite disk-1 image is now an explicit,
+reported SKIP via the test's own `.enabled(if:)` trait, not a silent
+guard-return — same convention as checkpointJ.)**
+
+**Standing frontier at M6 Task 3 close.** The Lisa is now a machine **in daily
+use**: it boots clean off the Widget, keeps a real clock, runs the Filer
+(navigate/create/rename/Preferences), installs a tool from its diskette, and is
+**typed into** in a live LisaWrite document — then powers off clean (Checkpoint
+L). The north star ("working mouse, keyboard, and clock") is met end-to-end. What
+remains unexercised is breadth, not a wall: the other tools (LisaCalc/Draw/…),
+printing (`Monitor the Printer…`), and — the one honest overlay caveat above —
+per-app symbol relocation so the merged table names a *non-Filer* app's code
+correctly.
+
+## M6 milestone close (Task 5) — the standing frontier of the document
+
+**Checkpoint M is this document's current frontier statement.** M6 Task 4 was
+quality work with no new checkpoint (explicit env-gated test skips, throwing
+`WidgetImage` writes, the bare-eject and session-overlay decisions documented with
+citations — see `task-4-report.md`); Task 5 is the milestone close (this note,
+`docs/m6-demo.md`, the README status + milestone table, and the spec's north-star
+and §5 M4-Desktop annotations). There is **no stalled boundary** at M6 close — the
+frontier is not a wall the trace hit but the surface not yet exercised.
+
+**The north star is met in full.** Boot from power-on through the real Rev H ROM
+and Lisa OS 3.1 to the Office System desktop, with **working mouse** (M5 /
+Checkpoint K), **keyboard** (M6 Task 3 / Checkpoint M — folder rename + LisaWrite
+typing), and **clock** (M6 Task 2 — real COPS RTC), plus a whole **power cycle**
+(M6 Task 1 / Checkpoint L — the OS's own soft-power shutdown). See `docs/m6-demo.md`
+for the milestone walkthrough.
+
+**OQ roster: fully answered, none carried.** Every open question raised on the
+boot-trace journey is ANSWERED and struck to its resolution: OQ1/OQ1′/OQ1″ (the
+domain-model / supervisor-domain-0 / captured-DATA-access questions, M3–M4), OQ2
+(ROM+special-space SLIM/SORG, M1b Task 5), OQ3 (board-ID `$C031` path, M1b Task 5).
+No open *trace* question is carried into M7 — the M7 candidates below are **feature
+deferrals**, not unresolved trace boundaries.
+
+**M7 candidates (feature deferrals, each cited where a source exists):**
+
+- **Timed reboot-alarm wake** — `PowerCycle`'s `$23`/`$2D` "reboot later" schedules
+  no wake yet (no RTC alarm modeled; the alarm nibbles are captured). Cited
+  MACHINE:447-480.
+- **Per-app symbol relocation** — a per-app `baseOffset` so the merged Linkmap
+  table names a non-Filer app's code correctly (the merged-table collision
+  confirmed live under LisaWrite; `symbase` is today's manual lever).
+- **Deeper app coverage** — LisaCalc/LisaDraw/…, and printing
+  (`Monitor the Printer…`).
+- **The long-parked niceties** — `$C015`/800K double-sided, the `$FE099C` 1 MB-POST
+  divergence, session-overlay retention by disk identity, and a synthetic
+  double-click detector (the OS's time-based detector does not fire on injected
+  click pairs).

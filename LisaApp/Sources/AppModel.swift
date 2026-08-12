@@ -271,6 +271,22 @@ final class AppModel {
         controller?.start()
     }
 
+    /// Machine > Power (M6 Task 1, ⌘⌥P): presses the Lisa's soft-power button.
+    /// The OS sees the COPS `$FB` reset-dispatch byte, runs its own clean
+    /// shutdown, and issues a COPS power-off command -- the emulated machine
+    /// then stops (`poweredOff` flips true via the next status publish).
+    /// Closes M1c/M2's consciously-deferred "power on/off via COPS" Power-menu
+    /// item (spec §4). A thin passthrough, matching every other menu action's
+    /// "controller is private; reach it through AppModel" boundary.
+    func pressPowerButton() {
+        controller?.pressPowerButton()
+    }
+
+    /// Whether the emulated Lisa has cleanly powered itself off (M6 Task 1) --
+    /// derived from the latest `EmuStatus`, so it updates reactively as the
+    /// shutdown completes. Distinct from `status?.halted` (a fatal fault).
+    var poweredOff: Bool { status?.poweredOff ?? false }
+
     /// Explicit clean-shutdown hook (M1c Task 5 polish: "clean shutdown --
     /// emulation thread joined on window close"). Releasing `controller`
     /// here drops the last strong reference to `EmulationController`,

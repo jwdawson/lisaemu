@@ -103,7 +103,8 @@ final class IODispatcher {
             scheduleEvent: { [weak bus] delay, action in bus?.scheduleEvent(delay, action) },
             currentCycle: { [weak bus] in bus?.cycleProvider() ?? 0 },
             raiseInterrupt: { [weak via2Ref] in via2Ref?.setInterruptFlag(COPS.interruptFlagBit) },
-            clearInterrupt: { [weak via2Ref] in via2Ref?.clearInterruptFlag(COPS.interruptFlagBit) }
+            clearInterrupt: { [weak via2Ref] in via2Ref?.clearInterruptFlag(COPS.interruptFlagBit) },
+            onPowerOff: { [weak bus] in bus?.powerOffHandler() }
         )
         // `videoTiming` doesn't capture `self` (only `bus`, weakly), so --
         // unlike the `via2.onPortAAccess` closure just below -- it could in

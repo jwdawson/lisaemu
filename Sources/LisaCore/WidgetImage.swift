@@ -161,14 +161,25 @@ public final class WidgetImage {
     /// (`WidgetDrive` validates block range against `blockCount` and always
     /// supplies exactly 512/20 bytes before calling this).
     ///
-    /// - Throws: a Foundation file error if the write fails.
+    /// Uses the THROWING `FileHandle` APIs (`seek(toOffset:)`/
+    /// `write(contentsOf:)`, not the legacy `seek(toOffset:)`/`write(_:)`
+    /// pair, which raise an uncatchable Objective-C exception on failure
+    /// instead of a Swift error) so a real failure here -- e.g. a full disk
+    /// or a volume that went away mid-session -- surfaces as a normal Swift
+    /// `throw` that propagates out to `WidgetDrive.commitWrite`'s `catch`
+    /// (M6 Task 4 carried fix; the crash-vs-catchable-throw distinction is
+    /// exactly the one `read(offset:length:)` above deliberately does NOT
+    /// need to make, since a short read there is a programmer/system fault
+    /// against our OWN backing file, not recoverable caller input).
+    ///
+    /// - Throws: a Foundation file error if the seek or write fails.
     public func write(block: Int, data: Data, tag: Data) throws {
         precondition(block >= 0 && block < blockCount, "block \(block) out of range [0..<\(blockCount)]")
         precondition(data.count == Self.dataBytesPerBlock, "data must be \(Self.dataBytesPerBlock) bytes, got \(data.count)")
         precondition(tag.count == Self.tagBytes, "tag must be \(Self.tagBytes) bytes, got \(tag.count)")
 
         try handle.seek(toOffset: UInt64(block * Self.bytesPerBlock))
-        handle.write(Data(data) + Data(tag))
+        try handle.write(contentsOf: Data(data) + Data(tag))
     }
 
     /// Flushes buffered writes to stable storage (fsync). Called per completed

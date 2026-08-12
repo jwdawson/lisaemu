@@ -29,6 +29,20 @@ private let wWidgetImagePath = wWidgetDir.map { $0 + "/OS31-installed.widget" }
 private let wWidgetImageExists =
     wWidgetImagePath.map { FileManager.default.fileExists(atPath: $0) } ?? false
 
+/// Checkpoint M additionally needs the LisaWrite disk-1 image under
+/// `LISAEMU_DISK_DIR` (a DIFFERENT env var than this suite's own
+/// `LISAEMU_ROM_DIR`/`LISAEMU_WIDGET_DIR` gate) -- folded the same way as
+/// `wWidgetImageExists` above, so a missing `LISAEMU_DISK_DIR` or a missing
+/// LisaWrite image is an explicit, reported SKIP via `.enabled(if:)` on the
+/// test itself, not a guard-return that quietly returns without asserting
+/// anything (M6 Task 4 carried fix, same convention as checkpoint J in
+/// ROMFloppyBootTests).
+private let mDiskDir = ProcessInfo.processInfo.environment["LISAEMU_DISK_DIR"]
+private let mLisaWriteDiskPath = mDiskDir.map {
+    $0 + "/Lisa_Office_System_3.1/682-0093-B_LisaWrite1_3.1/682-0093-B_LisaWrite1_3.1.dc42"
+}
+private let mLisaWriteDiskExists = mLisaWriteDiskPath.map { FileManager.default.fileExists(atPath: $0) } ?? false
+
 extension MusashiSuites {
     @Suite(.enabled(if: wRomDir != nil && wWidgetImageExists,
                     "Set LISAEMU_ROM_DIR and LISAEMU_WIDGET_DIR to a directory holding OS31-installed.widget to run Widget-boot tests"))
@@ -56,6 +70,32 @@ extension MusashiSuites {
             m.run(until: m.cycles + 300_000)
             m.bus.cops.postKey(code: 0x06, down: false)
             m.run(until: m.cycles + 300_000)
+        }
+
+        /// The live cursor: the OS cursor (`MousX`/`MousY`, physical $3CF0)
+        /// once the OS is running, else the ROM boot-menu cursor -- same as
+        /// lisadbg's `osCursor`. Needed to click the OS's own modal dialogs
+        /// (dirty-volume, clock-not-set), whose cursor the ROM cells don't
+        /// track.
+        private func osCursor(_ m: Machine) -> (Int, Int) {
+            let ox = Int(m.bus.physicalRead16(0x3CF0)), oy = Int(m.bus.physicalRead16(0x3CF2))
+            if ox <= 720 && oy <= 364 && (ox > 0 || oy > 0) { return (ox, oy) }
+            return (Int(m.bus.read16(0x496)), Int(m.bus.read16(0x498)))
+        }
+
+        /// Feedback-steer the OS cursor to `(tx,ty)` then click -- ported from
+        /// lisadbg's `clickAt` (the half-step on X damps the OS mouse driver's
+        /// 3/2 coarse scaling). Self-correcting, so it's robust to exact timing.
+        private func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+            for _ in 0..<80 {
+                let (cx, cy) = osCursor(m)
+                let dx = tx - cx, dy = ty - cy
+                if abs(dx) <= 1 && abs(dy) <= 1 { break }
+                m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
+                                     dy: Int8(max(-100, min(100, dy))))
+                m.run(until: m.cycles + 200_000)
+            }
+            click(m)
         }
 
         /// Loads the ROM, attaches a throwaway COPY of the installed Widget
@@ -127,6 +167,130 @@ extension MusashiSuites {
             #expect(fnv1a(fb) != 0xd092_34d2_5516_d0b8 && set != 78100,
                     "the framebuffer must have left the boot-menu anchor; set pixels = \(set)")
             #expect(set > 2000, "the OS drew substantial UI off the Widget boot; set pixels = \(set)")
+        }
+
+        /// **Checkpoint L (M6 Task 1, extended by Task 2) -- soft power +
+        /// the clock the OS believes.** Boots the installed Office System off
+        /// the Widget, dismisses the dirty-volume dialog, and reaches the live
+        /// desktop -- which, since M6 Task 2's real `$02` clock reply, NO
+        /// LONGER shows the "clock not set" Note (the M1b placeholder's garbage
+        /// BCD triggered it; the parser-derived host-time reply reads as a
+        /// valid date). Then presses the soft-power button
+        /// (`COPS.pressPowerButton()` = the `$FB` reset-dispatch byte): the OS
+        /// runs its OWN shutdown -- DRIVERS synthesizes keycap `$08`, the
+        /// Office System requests shutdown, and PowerDown (libhw-MACHINE:419-
+        /// 436) issues a COPS power-off command -- which drives
+        /// `Machine.powerState` to `.off`, a clean stop (NOT a `halted` double
+        /// fault). See docs/rom-trace-notes.md "Checkpoint L" and
+        /// docs/hardware-notes.md §4/§7.
+        ///
+        /// **Task 2's added proof:** the shutdown byte is now `$21` (power off,
+        /// clock ON), not `$20` (clock off). PowerDown reads the clock and
+        /// branches on `$0FFF` (MACHINE:423-427): `$21` when the clock is
+        /// running, `$20` when it isn't. A `$21` shutdown is therefore direct
+        /// evidence the OS read our clock as SET -- the same fact that removes
+        /// the Note. (Expected-movement re-anchor: pre-Task-2 this was `$20`;
+        /// the clock fix legitimately moves it to `$21`.)
+        ///
+        /// The proof this closes: after this clean shutdown, the volume is
+        /// written back not-in-use, so rebooting the same image no longer shows
+        /// the dirty-volume dialog (demonstrated live in the task report; not
+        /// re-asserted here to keep this a single-boot test).
+        @Test func checkpointL_softPowerOSShutsItselfDownFromTheDesktop() throws {
+            let m = try machineWithInstalledWidgetCopy()
+            m.run(until: 18_000_000)                              // POST -> boot menu
+            moveCursor(m, to: 420, 182); click(m)                // "STARTUP FROM..."
+            m.run(until: m.cycles + 6_000_000)
+            moveCursor(m, to: 88, 33); click(m)                  // top item = the Widget
+
+            m.run(until: m.cycles + 160_000_000)                 // boot -> dirty-volume dialog
+            clickAt(m, 595, 72)                                  // "Don't Check"
+            m.run(until: m.cycles + 390_000_000)                 // Desktop Manager builds the desktop
+            // No clock-not-set Note to dismiss anymore (Task 2): the desktop is
+            // reached clean. (The M1b placeholder needed a clickAt(585,118)
+            // here; verified live-gone in task-2-report.md, m6-clock-02.)
+            m.run(until: m.cycles + 40_000_000)
+
+            // At the live desktop, no halt, still powered on.
+            #expect(!m.halted, "reached the desktop without a fatal halt")
+            #expect(m.powerState == .on, "still powered on at the desktop")
+
+            // Press the soft-power button; run until the OS's shutdown issues a
+            // power-off command and the machine stops, or a generous cap.
+            m.bus.cops.pressPowerButton()
+            for _ in 0..<40 {
+                m.run(until: m.cycles + 8_000_000)
+                if m.powerState == .off { break }
+            }
+
+            #expect(m.powerState == .off,
+                    "the OS ran its own shutdown and the COPS power-off command stopped the machine")
+            #expect(!m.halted, "a clean soft power-off is distinct from a double-fault halt")
+            // The command the OS actually sent is $21 (power off, clock ON):
+            // PowerDown only sends that when it read the clock as running
+            // (MACHINE:423-427), so this doubles as proof the OS believes our
+            // clock. $20 (clock off) would mean it read the clock as unset.
+            let log = m.bus.cops.powerCommandLog.map { String(format: "$%02X", $0) }
+            #expect(m.bus.cops.powerCommandLog.contains(0x21),
+                    "shutdown sent $21 (clock believed set); log = \(log)")
+            #expect(!m.bus.cops.powerCommandLog.contains(0x20),
+                    "$20 (clock-off) would mean the OS read the clock as unset; log = \(log)")
+        }
+
+        /// **M6 Task 3 -- "Checkpoint M: a diskette inserted at the live desktop
+        /// mounts."** Reaching the Office System desktop (Checkpoint K/L path),
+        /// a floppy inserted through the media-change path
+        /// (`FloppyController.insertWhileRunning`, M5 Task 3 round 2 -- the same
+        /// call lisadbg's `insert` and the app's `insertFloppy` mailbox make)
+        /// raises the `bot_in` floppy attention, and the resident Desktop
+        /// Manager mounts the new volume and reads its catalog WITHOUT any
+        /// further UI interaction. This pins that end-to-end path deterministic-
+        /// ally: unlike the drag/menu Filer work (feedback-timed clicks, kept
+        /// out of the suite), the insert is a direct API call and the OS's mount
+        /// response is a plain consequence, so the assertion is on read-count
+        /// state, not an exact framebuffer.
+        ///
+        /// Gated additionally on the LisaWrite disk-1 image existing under
+        /// `LISAEMU_DISK_DIR` (Apple-derived, never committed): folded into
+        /// this test's own `.enabled(if:)` predicate (`mLisaWriteDiskExists`)
+        /// so an absent image is an explicit, reported SKIP rather than a
+        /// guard-return early-out (M6 Task 4) -- same convention as
+        /// `ROMFloppyBootTests`' disk-2 swap test (checkpoint J).
+        @Test(.enabled(if: mLisaWriteDiskExists,
+                      "Set LISAEMU_DISK_DIR to a directory holding the LisaWrite disk-1 image to run checkpoint M"))
+        func checkpointM_disketteInsertedAtDesktopMounts() throws {
+            // LisaWrite disk-1 presence is guaranteed by this test's
+            // .enabled(if:) predicate (mLisaWriteDiskExists), so no silent
+            // early-return guard here (M6 Task 4).
+            let lwPath = mLisaWriteDiskPath!
+
+            let m = try machineWithInstalledWidgetCopy()
+            m.run(until: 18_000_000)                              // POST -> boot menu
+            moveCursor(m, to: 420, 182); click(m)                // "STARTUP FROM..."
+            m.run(until: m.cycles + 6_000_000)
+            moveCursor(m, to: 88, 33); click(m)                  // top item = the Widget
+            m.run(until: m.cycles + 160_000_000)                 // boot -> dirty-volume dialog
+            clickAt(m, 595, 72)                                  // "Don't Check"
+            m.run(until: m.cycles + 390_000_000)                 // Desktop Manager builds the desktop
+            m.run(until: m.cycles + 40_000_000)
+
+            #expect(!m.halted && m.powerState == .on, "at the live desktop")
+            let readsBefore = m.bus.floppy.blocksRead
+            #expect(!m.bus.floppy.isInserted, "no floppy before the insert")
+
+            // Insert the LisaWrite tool diskette THROUGH the media-change path.
+            let image = try DC42Image.load(url: URL(fileURLWithPath: lwPath))
+            m.bus.floppy.insertWhileRunning(image)
+            // Let the bot_in attention wake the Desktop Manager's mount.
+            for _ in 0..<12 {
+                m.run(until: m.cycles + 8_000_000)
+                if m.bus.floppy.blocksRead > readsBefore + 4 { break }
+            }
+
+            #expect(m.bus.floppy.isInserted, "the diskette is present after insert")
+            #expect(m.bus.floppy.blocksRead > readsBefore,
+                    "the OS mounted the new volume and read its catalog off the diskette (media-change attention honored at the live desktop)")
+            #expect(!m.halted, "the live mount did not fault the machine")
         }
     }
 }

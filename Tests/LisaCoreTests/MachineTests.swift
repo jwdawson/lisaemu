@@ -86,6 +86,37 @@ extension MusashiSuites {
         }
 
         @Test
+        func powerOffStopsExecutionDistinctFromHaltedAndClearsOnReset() {
+            // M6 Task 1 (soft power): a power-OFF command decoded by COPS
+            // fires `bus.powerOffHandler`, which drives `powerState` to `.off`
+            // -- a clean, OS-requested stop, distinct from a double-fault
+            // `halted`. A powered-off machine executes no further cycles;
+            // `reset()` (a fresh boot) powers it back on.
+            let m = Machine(ramSize: 0x10000)
+            loadSpin(m)                                  // BRA.s spin at $400
+            m.run(until: 100)
+            #expect(m.powerState == .on)
+            #expect(m.cycles >= 100)
+
+            // Simulate what a real $20/$21/$23 write does 400 cycles later
+            // (COPS.processCommand -> onPowerOff -> bus.powerOffHandler).
+            m.bus.powerOffHandler()
+            #expect(m.powerState == .off)
+
+            let cyclesAtOff = m.cycles
+            m.run(until: cyclesAtOff + 1_000_000)
+            #expect(m.cycles == cyclesAtOff, "a powered-off machine executes no further cycles")
+            #expect(m.step() == 0, "step() is a no-op when powered off")
+            #expect(m.halted == false, "powered off is distinct from a fatal halt")
+
+            m.reset()
+            #expect(m.powerState == .on, "a warm reset / fresh boot powers back on")
+            #expect(m.cycles == 0, "reset zeroes the cycle counter")
+            m.run(until: 100)
+            #expect(m.cycles >= 100, "runs again after reset")
+        }
+
+        @Test
         func haltedFlagClearedOnReset() {
             let m = Machine(ramSize: 0x10000)
             loadSpin(m)

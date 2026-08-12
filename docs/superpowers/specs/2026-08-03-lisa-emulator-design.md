@@ -14,6 +14,21 @@ IDLE) are references and cross-check oracles, not competitors.
 **North star:** boot from power-on through the real Rev H boot ROM and Lisa OS 3.1
 to the Office System desktop, with working mouse, keyboard, and clock.
 
+*(Project-history note, 2026-08-11: **MET IN FULL** by the project's own M6
+(`docs/m6-demo.md`). The desktop is reached from a power-on boot off the installed
+Widget (M5), and there all three input clauses are live: **mouse** (M5 — modal
+answered by a click, cursor steered via COPS), **keyboard** (M6 Task 3 — a folder
+keyboard-renamed "Reports" and a LisaWrite document typed into), and **clock**
+(M6 Task 2 — a real COPS RTC derived byte-for-byte from the OS's own parser; the
+"clock/calendar is not set" note is gone). M6 also gave the machine a whole power
+cycle — the soft-power button runs the OS's own `FS_ShutDown`/`GiveUpGhost`/
+`PowerDown` shutdown (M6 Task 1). Two honest caveats stand, both documented, both
+faithful-to-hardware rather than shortcuts: the RTC's **year is a 4-bit field**
+(1980-based, rolls every 16 years — a 2026 host clock displays as 1994,
+TIMERS:596), and there is **no timed reboot-alarm wake** yet (`$23`/`$2D`
+`PowerCycle`, deferred to M7, cited MACHINE:447-480). See `docs/rom-trace-notes.md`
+"Checkpoint L"/"Checkpoint M" and `docs/hardware-notes.md` §4/§7.)*
+
 **Secondary product:** a debugger that makes the Lisa OS source *legible while
 running* — MMU domain inspection and symbol overlay from the shipped Linkmaps.
 
@@ -125,6 +140,13 @@ The MMU is built first and sits in the bus path from day one.
 speed), menus (power on/off via COPS, reset, insert/eject floppy, choose Widget
 image). Speed toggle (real-time vs unthrottled). Drag-and-drop disk images.
 Deferred: sound, full-screen, config UI.
+
+> **CLOSED (M6 Task 1):** "power on/off via COPS" — deferred four times since
+> M1c — is now implemented: LisaApp Machine > Power (Shut Down, ⌘⌥P) presses the
+> soft-power button (`COPS.pressPowerButton()`), the OS runs its own shutdown,
+> and `Machine.powerState` → `.off` (surfaced as `EmuStatus.poweredOff` /
+> `AppModel.poweredOff`). "Power on" = a Reset / fresh boot. See
+> rom-trace-notes "Checkpoint L" and hardware-notes §7.
 
 **Debugger (bring-up tool from day one),** separate window:
 
@@ -249,5 +271,21 @@ Milestones (each a demo):
    Office System draws a "clock/calendar is not set" note on each boot — the
    "working clock" is the natural M6 headline, not an M5 boot blocker. See
    `docs/rom-trace-notes.md` "Checkpoint K" and `task-4-report.md`.)*
+   *(Project-history note, 2026-08-11: this line is now **MET IN FULL** by the
+   project's own M6 (`docs/m6-demo.md`). The two clauses M5 left open both closed:
+   **"clock live"** — M6 Task 2 models the COPS RTC (the `$02` reply derived
+   byte-for-byte from the OS's own parser), so the "clock/calendar is not set" note
+   is **gone** and the OS date-stamps the desktop live; and **keyboard-at-desktop**
+   — M6 Task 3 keyboard-renames a torn-off folder "Reports" and types
+   `Hello from LisaEmu-- M6 Task 3.` into a launched LisaWrite document. M6 Task 1
+   also closed the carried-forward **soft-power/Power menu** (the OS's own
+   `FS_ShutDown`/`GiveUpGhost`/`PowerDown`, honored as COPS `$21`; LisaApp
+   Machine > Power ⌘⌥P — see the §4 CLOSED note). Honest residue, all deferred to
+   M7 with citations: the RTC **year is a 4-bit field** (2026 displays as 1994,
+   TIMERS:596); **no timed reboot-alarm wake** (`$23`/`$2D`, MACHINE:447-480); the
+   merged Linkmap table has **no per-app relocation**; and `$C015`/800K and the
+   parked `$FE099C` remain untouched. Pinned by `ROMWidgetBootTests` checkpoints
+   **L** (soft power) and **M** (desktop-in-use). See `docs/rom-trace-notes.md`
+   "Checkpoint L"/"Checkpoint M".)*
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.

@@ -4,11 +4,16 @@ A from-scratch **Apple Lisa 2/10 emulator** written in Swift for macOS — built
 understand the Lisa hardware and the Lisa OS source code released by Apple and the
 Computer History Museum in 2023.
 
-**Current status:** the real Rev H boot ROM completes its power-on self-test, boots the
-Lisa Office System 3.1 install floppy, and runs the Lisa OS — through its own MMU
-bootstrap, driver initialization, live interrupts, and multi-domain scheduler — all the
-way to the **Lisa 7/7 Office System 3.0 installer dialog**, drawn by the OS itself and
-responsive to mouse and keyboard.
+**Current status:** the real Rev H boot ROM completes its power-on self-test and boots
+the Lisa Office System 3.1 the whole way to a **working machine you can use** — the full
+daily loop runs end to end. The Office System installs from its floppies onto a blank
+Widget hard-disk image, boots clean off that hard disk to the **Office System desktop**,
+and there responds to a **live mouse, keyboard, and clock**: real Filer work (open the
+disk, tear off and keyboard-rename a folder), a LisaWrite tool installed from its diskette
+and **typed into**, and a **soft-power shutdown** through the OS's own path (which leaves
+the next boot free of the dirty-volume dialog). The clock is the emulated COPS real-time
+clock, faithful to the Lisa's 4-bit year field — it rolls every 16 years, so a 2026 host
+clock is displayed by the OS as 1994.
 
 ## Milestones
 
@@ -21,9 +26,11 @@ responsive to mouse and keyboard.
 | M2 — Floppy boot | The OS 3.1 install disk boots; the OS loader runs off the real disk image |
 | M3 — OS executes | Three MMU-semantics fixes; the loaded OS image executes its own kernel code |
 | M4 — OS alive | Live interrupts, OS scheduler, floppy write-through, real-68000 fault frames; **boots to the Office System installer** |
-| M5 — next | Widget/ProFile hard-disk controller — the installer needs a disk to install onto |
+| M5 — Widget HD | Widget/ProFile hard-disk HLE; the Office System installs onto a blank Widget image and **boots off the hard disk to the desktop**, mouse live |
+| M6 — Real machine | The full daily loop: RTC (real clock), OS-driven soft-power shutdown, Filer work + LisaWrite typed into — **mouse, keyboard, and clock all live** |
+| M7 — next | Timed reboot-alarm wake; per-app symbol relocation; deeper app coverage (LisaCalc/Draw, printing) |
 
-Each milestone has a demo document under [`docs/`](docs/) (`m1b-demo.md` … `m4-demo.md`)
+Each milestone has a demo document under [`docs/`](docs/) (`m1b-demo.md` … `m6-demo.md`)
 with reproduction steps, and the project keeps two citation-backed engineering records:
 [`docs/hardware-notes.md`](docs/hardware-notes.md) (every register, address, and constant,
 with sources) and [`docs/rom-trace-notes.md`](docs/rom-trace-notes.md) (the boot-trace
@@ -39,9 +46,10 @@ never erased).
     the anchored, fail-loud [`Scripts/vendor-musashi.sh`](Scripts/vendor-musashi.sh).
   - `Machine` / `Bus` / `MMU` — single master clock, cycle-stamped event queue, and the
     Lisa's segmented MMU (128 segments × 4 domains) in the bus path from day one.
-  - Devices — two register-accurate 6522 VIAs, COPS keyboard/mouse/clock controller (HLE),
-    Sony 400K floppy controller (HLE, DC42 images, session-scoped write-through), video
-    timing with vertical-retrace interrupts.
+  - Devices — two register-accurate 6522 VIAs, COPS keyboard/mouse/clock/soft-power
+    controller (HLE, host-time RTC), Sony 400K floppy controller (HLE, DC42 images,
+    session-scoped write-through), Widget/ProFile hard-disk controller (HLE, persistent
+    image), video timing with vertical-retrace interrupts.
 - **`LisaShell`** — emulation-thread harness: drift-corrected 5 MHz governor, frame
   publication, input mailbox.
 - **`LisaApp`** — SwiftUI macOS app (Xcode project generated with
@@ -86,7 +94,7 @@ local path only and never bundled.
 ## Testing
 
 ```sh
-swift test                      # 211 tests; suites needing real ROMs/disks/linkmaps skip
+swift test                      # 252 tests; suites needing real ROMs/disks/linkmaps skip
 
 # Full matrix with real assets:
 LISAEMU_ROM_DIR=~/Development/LisaROMs \

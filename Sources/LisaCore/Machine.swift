@@ -7,6 +7,19 @@ public final class Machine {
     /// interrupt) is *not* halted and does not set this flag. Cleared by
     /// `reset()`.
     public private(set) var halted = false
+
+    /// Soft-power state (M6 Task 1). `.on` normally; `.off` once the OS's own
+    /// shutdown sequence issues a COPS power-off command (`$20`/`$21`/`$23` --
+    /// hardware-notes.md §7), which `COPS` routes here via
+    /// `Bus.powerOffHandler` (wired in `init` below). A powered-off machine
+    /// executes NO further instructions: `run(until:)` and `step()` both
+    /// short-circuit, exactly like a real Lisa whose COPS cut the CPU's power.
+    ///
+    /// Deliberately DISTINCT from `halted` (which is a fatal double-bus-fault
+    /// HALT): powering off is the clean, OS-requested stop -- `halted` stays
+    /// `false` across it. Cleared back to `.on` by `reset()` (a fresh boot).
+    public enum PowerState { case on, off }
+    public private(set) var powerState: PowerState = .on
     /// Level-1 IRQ source alongside VIA1 (docs/hardware-notes.md §5:
     /// "Level 1: VIA1 ... Sources: VIA1 timer, vertical retrace, parallel
     /// port, Twiggy"). Defaults `false`; driven for real by `VideoTiming`
@@ -61,6 +74,7 @@ public final class Machine {
         }
         bus.vsyncInterruptHandler = { [weak self] pending in self?.vsyncPending = pending }
         bus.floppyInterruptHandler = { [weak self] pending in self?.floppyPending = pending }
+        bus.powerOffHandler = { [weak self] in self?.powerState = .off }
         bus.videoTiming.onVsyncTick = { [weak self] in self?.onVsync?() }
     }
 
@@ -109,6 +123,7 @@ public final class Machine {
         cpu.reset()
         cycles = 0
         halted = false
+        powerState = .on   // a warm reset / fresh boot powers the machine back on
         queue.removeAll()
         // COPS.reset() / VideoTiming.reset() schedule their own recurring
         // events -- must happen AFTER queue.removeAll() above, or that
@@ -160,7 +175,7 @@ public final class Machine {
     private static let irqPollQuantum: UInt64 = 1024
 
     public func run(until targetCycle: UInt64) {
-        while cycles < targetCycle {
+        while cycles < targetCycle && powerState == .on {
             let eventStop = queue.first?.cycle ?? targetCycle
             let stop = min(targetCycle, eventStop, cycles + Machine.irqPollQuantum)
             let slice = Machine.boundedSlice(from: cycles, to: stop)
@@ -171,6 +186,12 @@ public final class Machine {
                 queue.removeFirst()
                 first.action(self)
             }
+            // A power-off command decoded during that event drain (COPS's
+            // ack fires `onPowerOff` -> `powerState = .off`) stops the run
+            // promptly, without executing another burst -- the clean,
+            // OS-requested stop (see `powerState`'s doc comment). Distinct
+            // from the `halted` return just below (fatal double fault).
+            if powerState == .off { return }
             if cpu.isHalted {
                 halted = true
                 return
@@ -209,7 +230,9 @@ public final class Machine {
     /// Returns 0 immediately -- without touching the CPU -- once `halted`.
     @discardableResult
     public func step() -> Int {
-        guard !halted else { return 0 }
+        // Powered off (M6 Task 1) is a no-op just like `halted`, but distinct
+        // from it (`halted` stays false) -- see `powerState`'s doc comment.
+        guard !halted, powerState == .on else { return 0 }
         let executed = cpu.step()
         cycles &+= UInt64(executed)
         tickVIAsAndUpdateIRQ(executed)

@@ -417,6 +417,98 @@ private func readClockStream(_ cops: COPS, _ scheduler: FakeScheduler) -> [UInt8
     #expect(cops.powerCommandLog == commands)
 }
 
+/// Perf-fix round ("COPS log caps"): `powerCommandLog` grows once per
+/// power/timer command received (`$20`/`$21`/`$23`/`$25`/`$2C`/`$2D`) --
+/// unbounded over an app run left open for hours, matching the repo's
+/// established bounded-log idiom (`Bus.unmappedAccesses` cap 1024,
+/// `Bus.mmuPortLog` cap 8192, `IODispatcher.ioTrace` cap 4096: a fixed
+/// cap + a dropped-count once full, never truncating or evicting existing
+/// entries). Uses `$2C`/`$25` (a no-op power-off-free pair, so this loop
+/// never trips `onPowerOff` or needs a fresh `COPS` per iteration) well
+/// past the cap to prove growth stops and the drop counter tracks the
+/// overflow exactly.
+@Test func powerCommandLogStopsGrowingAtCapAndCountsDrops() {
+    let (cops, scheduler, _) = makeCOPS()
+    let cap = 256   // must match COPS's private powerCommandLogLimit
+    for i in 0..<(cap + 50) {
+        let command: UInt8 = i.isMultiple(of: 2) ? 0x2C : 0x25
+        cops.handlePortAAccess(index: 15, value: command, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+    }
+    #expect(cops.powerCommandLog.count == cap)
+    #expect(cops.powerCommandLogDropped == 50)
+}
+
+/// Companion cap for `clockSetNibbles` -- one entry per `$10|n` "write
+/// clock nibble" command, sent 16-at-a-time per set-sequence (TIMERS:659-
+/// 671); a machine that's had its clock set/re-set many times over an
+/// hours-long run should not grow this without bound either.
+@Test func clockSetNibblesStopsGrowingAtCapAndCountsDrops() {
+    let (cops, scheduler, _) = makeCOPS()
+    let cap = 64   // must match COPS's private clockSetNibblesLimit
+    for i in 0..<(cap + 20) {
+        let nibble = UInt8(i % 16)
+        cops.handlePortAAccess(index: 15, value: 0x10 | nibble, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+    }
+    #expect(cops.clockSetNibbles.count == cap)
+    #expect(cops.clockSetNibblesDropped == 20)
+}
+
+/// The cap must never truncate an IN-FLIGHT `$2C..$25` set-sequence: the
+/// 16 nibbles between them have to all reach `setSequenceNibbles`
+/// (`finishSetSequence`'s input) regardless of how full the unrelated
+/// `clockSetNibbles` PROVENANCE log already is, or the OS's actual set
+/// clock would silently corrupt. Drives `clockSetNibbles` to (cap - 5) via
+/// unrelated stray `$10` nibbles OUTSIDE any set window first, so a real
+/// 16-nibble set sequence starting right at the boundary straddles the cap
+/// -- and still must be read back correctly via `$02`.
+@Test func capNeverTruncatesAnInFlightSetSequenceEvenStraddlingTheBoundary() {
+    let (cops, scheduler, _) = makeCOPS(clockSource: { Date(timeIntervalSince1970: 0) })
+    let cap = 64   // must match COPS's private clockSetNibblesLimit
+    for _ in 0..<(cap - 5) {
+        cops.handlePortAAccess(index: 15, value: 0x10 | 0x5, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+    }
+    cops.handlePortAAccess(index: 15, value: 0x2C, isWrite: true)   // prep set-clock
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+    let setNibbles: [UInt8] = [0, 0, 0, 0, 0, 0xB, 1, 0, 0, 1, 3, 4, 5, 3, 0, 5]
+    for n in setNibbles {
+        cops.handlePortAAccess(index: 15, value: 0x10 | n, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+    }
+    cops.handlePortAAccess(index: 15, value: 0x25, isWrite: true)   // enable clock, commits the set
+    scheduler.advance(by: COPS.commandAckDelayCycles)
+
+    let received = readClockStream(cops, scheduler)
+    #expect(received == [0x80, 0xEB, 0x10, 0x01, 0x34, 0x53, 0x05],
+            "the set sequence committed correctly even though it straddled clockSetNibbles' cap boundary")
+}
+
+/// `checkpointL`-relevant: a single real boot-to-shutdown session
+/// (`ROMWidgetBootTests.checkpointL_softPowerOSShutsItselfDownFromTheDesktop`)
+/// sends only a handful of power/timer commands total -- nowhere near
+/// `powerCommandLogLimit` (256) -- so the cap introduced here has no
+/// effect on that checkpoint's `powerCommandLog.contains(0x21)`/
+/// `!contains(0x20)` assertions in practice. This test pins that
+/// "realistic volume, well under the cap" case directly: every command a
+/// full boot-through-shutdown could plausibly send, logged in full, none
+/// dropped -- the cap only ever bites under the FAR higher, hours-of-
+/// uptime volume `powerCommandLogStopsGrowingAtCapAndCountsDrops` (above)
+/// covers.
+@Test func realisticSessionVolumeStaysWellUnderTheCapAndNothingIsDropped() {
+    let (cops, scheduler, _) = makeCOPS()
+    let commands: [UInt8] = [0x2C, 0x25, 0x2D, 0x21]
+    for c in commands {
+        cops.handlePortAAccess(index: 15, value: c, isWrite: true)
+        scheduler.advance(by: COPS.commandAckDelayCycles)
+    }
+    #expect(cops.powerCommandLog == commands)
+    #expect(cops.powerCommandLog.contains(0x21))
+    #expect(!cops.powerCommandLog.contains(0x20))
+    #expect(cops.powerCommandLogDropped == 0)
+}
+
 @Test func powerOffCommandsFireTheSeamAndAreLogged() {
     // hardware-notes.md §7 "Soft Power Control": $20/$21/$23 are the three
     // POWER-OFF commands (MACHINE:425/427/473). Each must fire the onPowerOff

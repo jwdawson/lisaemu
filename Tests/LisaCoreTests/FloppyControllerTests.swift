@@ -452,6 +452,47 @@ private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeSch
     #expect(floppy.isInserted == false)
 }
 
+/// **M6 Task 4 -- the user-forced eject / OS-commanded unclamp asymmetry is
+/// INTENTIONAL, pinned here.** `insertWhileRunning` raises a media-change
+/// attention on insertion, and the `unclamp` sub-command (the OS's OWN
+/// commanded eject) completes with a `bot_done` interrupt -- but a bare
+/// `eject()` (the emulator's user-menu "Eject", `EmulationController.
+/// ejectFloppy`) raises NOTHING: no DISKSTAT bits, no level-1 pending. This
+/// is not a gap to close -- see `FloppyController.eject()`'s doc comment
+/// "User-forced eject" and docs/hardware-notes.md §9: real hardware's ONLY
+/// commanded-eject path IS `unclamp` (a 68000-driven solenoid), so a "user
+/// just pulls the diskette while the OS thinks it's present" scenario has
+/// no real-hardware interrupt to match in the first place -- the OS finds
+/// out on its own next access (a `readdisk`/`writedisk` against `image ==
+/// nil` already raises a normal completion interrupt carrying a read/write
+/// DISKERR, exactly a real drive's "that didn't work" signal).
+@Test func bareEjectRaisesNoAttentionOrInterrupt() {
+    let (floppy, scheduler, level1) = makeController()
+    floppy.insert(makeSyntheticImage())
+
+    floppy.eject()
+
+    #expect(floppy.read(FloppyController.Cell.diskStat) == 0,
+            "a bare eject must not set bot_int/bot_done/bot_in -- no phantom attention")
+    #expect(level1() == false, "a bare eject must not raise the level-1 floppy pending line")
+    #expect(!floppy.isInserted, "the disk IS gone -- only the OS-visible attention is withheld")
+
+    // The OS's own next access already reports the failure correctly: a
+    // readdisk against no media raises a normal completion interrupt
+    // carrying a read-class DISKERR -- the real-hardware-accurate discovery
+    // path (no separate "removed" event is needed or exists).
+    floppy.write(FloppyController.Cell.diskTrak, 0)
+    floppy.write(FloppyController.Cell.diskSec, 0)
+    floppy.write(FloppyController.Cell.diskHead, 0)
+    floppy.write(FloppyController.Cell.diskParm, FloppyController.SubCommand.readdisk.rawValue)
+    floppy.write(FloppyController.Cell.diskCmd, FloppyController.GoByte.excmd.rawValue)
+    scheduler.advance(by: FloppyController.commandDelayCycles)
+    scheduler.advance(by: FloppyController.completionDelayCycles)
+    #expect(level1() == true, "the OS's own next-access read now correctly raises completion")
+    #expect(floppy.lastError == FloppyController.ErrorCode.read,
+            "and reports a read-class DISKERR -- the OS discovers the absence on next access")
+}
+
 @Test func resetDropsInFlightCommandButKeepsDiskInserted() {
     let (floppy, scheduler, level1) = makeController()
     floppy.insert(makeSyntheticImage())

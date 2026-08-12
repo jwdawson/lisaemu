@@ -1308,6 +1308,27 @@ accordingly. See docs/rom-trace-notes.md "Floppy boot (checkpoint C)".
   eject/reinsert of the SAME disk via `export/importSessionOverlay` (so the boot
   disk's MDDF `overmount_stamp` survives for `boot_remount`, FSINIT2:466-468);
   the `.dc42` file is still never mutated.
+- **User-forced eject — bare, no OS-visible attention (M6 Task 4 decision,
+  cited).** `FloppyController.eject()` (the emulator's user-menu "Eject" /
+  `lisadbg eject`, reached via `EmulationController.ejectFloppy()`) raises
+  NOTHING — no DISKSTAT bits, no level-1 pending — unlike `unclamp` above
+  (the OS's OWN commanded eject, which completes with `bot_done`) or
+  insertion's media-change attention just above. This is deliberate, not the
+  asymmetry it looks like: real hardware's ONLY commanded-eject path IS
+  `unclamp`, a 68000-driven solenoid; there is no independent "diskette
+  physically removed" sense line the 6504 reports as an interrupt, and
+  `DISKIN` above is documented as a PASSIVE, POLLED cell, not an
+  interrupt-backed one. A "user pulls the diskette while the OS still thinks
+  it's present" scenario therefore has no real-hardware interrupt to
+  fault-match in the first place — this emulator's forced-eject menu command
+  models something a real Sony 400K drive on a Lisa cannot physically
+  produce mid-session. The real-hardware-accurate consequence already
+  happens for free: the OS finds out on its own next access, because
+  `performRead`/`performWrite`'s `image == nil` guards already raise a
+  normal completion interrupt carrying a read/write-class DISKERR — exactly
+  what a real drive with no media returns to a `readdisk`/`writedisk`.
+  Pinned by `FloppyControllerTests.bareEjectRaisesNoAttentionOrInterrupt`;
+  full citation trail in `FloppyController.eject()`'s doc comment.
 - **DISKCMD-during-completion-window (M3 Task 3 doc note, no behavior
   change).** The busy-rejection guard (`FloppyController.commandInFlight`)
   only spans the command-decode delay, not the SEPARATE completion-wait

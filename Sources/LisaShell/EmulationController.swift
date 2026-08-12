@@ -296,9 +296,23 @@ public final class EmulationController {
     /// doc comment for the test-only seam that CAN block for that).
     public func insertFloppy(url: URL) { shared.mailbox.post(.insertFloppy(url)) }
 
-    /// Symmetric with `insertFloppy(url:)`: posts a mailbox command that
-    /// calls `Machine.bus.floppy.eject()` on the emulation thread. A no-op
-    /// (per `FloppyController.eject()`) if nothing is currently inserted.
+    /// Posts a mailbox command that calls `Machine.bus.floppy.eject()` on
+    /// the emulation thread. A no-op if nothing is currently inserted.
+    ///
+    /// **NOT symmetric with `insertFloppy(url:)`, deliberately (M6 Task 4
+    /// decision).** `insertFloppy` raises the OS-visible media-change
+    /// attention (`insertWhileRunning`); this calls bare `eject()`, which
+    /// raises nothing. That is correct, not a bug: see
+    /// `FloppyController.eject()`'s doc comment "User-forced eject" (and
+    /// docs/hardware-notes.md §9) -- a real Lisa's Sony drive has no
+    /// independent "diskette physically removed" interrupt at all, only the
+    /// OS's OWN commanded eject (`unclamp`, a 68000-driven solenoid), so
+    /// this menu command already models a scenario with no real-hardware
+    /// interrupt to raise even in principle. The OS discovers the stale
+    /// presence on its own next disk access (a failed read/write already
+    /// raises a normal completion interrupt with a read/write DISKERR --
+    /// see `FloppyController.performRead`/`performWrite`'s `image == nil`
+    /// paths), exactly as it would on real hardware.
     public func ejectFloppy() { shared.mailbox.post(.ejectFloppy) }
 
     /// Posts a mailbox command that attaches a Widget hard-disk image at `url`
@@ -494,6 +508,10 @@ public final class EmulationController {
                         shared.onDiskError?("Could not load disk image at \(url.path): \(error)")
                     }
                 case .ejectFloppy:
+                    // Deliberately the bare eject, not an OS-attention path --
+                    // see `ejectFloppy()`'s doc comment (M6 Task 4 decision):
+                    // real hardware has no "physically removed" interrupt to
+                    // raise here at all.
                     machine.bus.floppy.eject()
                 case .attachWidget(let url):
                     do {

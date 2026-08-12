@@ -655,6 +655,11 @@ while let line = readLine(strippingNewline: true) {
             print("      insert: cannot load \(path): \(error)")
         }
     case .ejectFloppy:
+        // Bare eject, no OS-visible media-change attention -- deliberate and
+        // correct, NOT asymmetric-by-oversight with `insert` above. See
+        // `EmulationController.ejectFloppy()`'s doc comment and hardware-notes
+        // §9 (M6 Task 4): a real Sony drive has no "diskette removed" interrupt;
+        // the OS discovers the stale presence on its next disk access.
         machine.bus.floppy.eject()
         print("      ejected floppy")
     case .quit:

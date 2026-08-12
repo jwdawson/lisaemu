@@ -663,6 +663,16 @@ BCD and gets an invalid day/hour, which is why the Office System showed its
 format is derived below from the OS's own parser — the OS side is the
 contract, every byte cited.
 
+> **Hedge (Task 2, honest):** the causal chain "invalid parsed date → the Note
+> draws" is **empirically dispositive** (the Note is present with the old
+> placeholder reply and gone with the parser-derived reply, otherwise identical)
+> but not fully source-cited: `ClockToDate` (TIMERS:695-766) does not itself reject
+> an invalid BCD date — it only special-cases the `0FFF…` uninitialized sentinel
+> (DRIVERS:505-506). The exact Office System / Desktop Manager validity check that
+> raises the alert is **un-cited** because that source is not in the tree (only the
+> Filer and libhw are). We claim the byte-level `$02` contract (cited below), not
+> the dialog's internal trigger.
+
 **Clock/calendar packing (TIMERS:600-606).** Six nib-packed bytes:
 
 ```

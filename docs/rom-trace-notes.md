@@ -2889,3 +2889,42 @@ remains unexercised is breadth, not a wall: the other tools (LisaCalc/Draw/…),
 printing (`Monitor the Printer…`), and — the one honest overlay caveat above —
 per-app symbol relocation so the merged table names a *non-Filer* app's code
 correctly.
+
+## M6 milestone close (Task 5) — the standing frontier of the document
+
+**Checkpoint M is this document's current frontier statement.** M6 Task 4 was
+quality work with no new checkpoint (explicit env-gated test skips, throwing
+`WidgetImage` writes, the bare-eject and session-overlay decisions documented with
+citations — see `task-4-report.md`); Task 5 is the milestone close (this note,
+`docs/m6-demo.md`, the README status + milestone table, and the spec's north-star
+and §5 M4-Desktop annotations). There is **no stalled boundary** at M6 close — the
+frontier is not a wall the trace hit but the surface not yet exercised.
+
+**The north star is met in full.** Boot from power-on through the real Rev H ROM
+and Lisa OS 3.1 to the Office System desktop, with **working mouse** (M5 /
+Checkpoint K), **keyboard** (M6 Task 3 / Checkpoint M — folder rename + LisaWrite
+typing), and **clock** (M6 Task 2 — real COPS RTC), plus a whole **power cycle**
+(M6 Task 1 / Checkpoint L — the OS's own soft-power shutdown). See `docs/m6-demo.md`
+for the milestone walkthrough.
+
+**OQ roster: fully answered, none carried.** Every open question raised on the
+boot-trace journey is ANSWERED and struck to its resolution: OQ1/OQ1′/OQ1″ (the
+domain-model / supervisor-domain-0 / captured-DATA-access questions, M3–M4), OQ2
+(ROM+special-space SLIM/SORG, M1b Task 5), OQ3 (board-ID `$C031` path, M1b Task 5).
+No open *trace* question is carried into M7 — the M7 candidates below are **feature
+deferrals**, not unresolved trace boundaries.
+
+**M7 candidates (feature deferrals, each cited where a source exists):**
+
+- **Timed reboot-alarm wake** — `PowerCycle`'s `$23`/`$2D` "reboot later" schedules
+  no wake yet (no RTC alarm modeled; the alarm nibbles are captured). Cited
+  MACHINE:447-480.
+- **Per-app symbol relocation** — a per-app `baseOffset` so the merged Linkmap
+  table names a non-Filer app's code correctly (the merged-table collision
+  confirmed live under LisaWrite; `symbase` is today's manual lever).
+- **Deeper app coverage** — LisaCalc/LisaDraw/…, and printing
+  (`Monitor the Printer…`).
+- **The long-parked niceties** — `$C015`/800K double-sided, the `$FE099C` 1 MB-POST
+  divergence, session-overlay retention by disk identity, and a synthetic
+  double-click detector (the OS's time-based detector does not fire on injected
+  click pairs).

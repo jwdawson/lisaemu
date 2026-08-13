@@ -292,19 +292,33 @@ public final class ImageWriterInterpreter {
         state = remaining <= 1 ? .ground : .graphics(remaining: remaining - 1)
     }
 
-    /// Paint one 8-dot column at the current cursor. Bit 7 = top dot
+    /// Paint one 8-dot column at the current cursor. Bit 7 = top pin
     /// (modeling decision, §12.4). Elongated (`wide`) doubles the column
     /// horizontally (§12.1, CiSetWide). Advances the cursor; clips to page.
+    ///
+    /// **Two-pass interlace geometry (§12.5, CiDeltaV CiDev:468-476).** The
+    /// print head is a **72-dpi 8-pin column**: pin `p` sits `2/144"` below the
+    /// band origin, so its vertical position on the 144ths grid is `y144 + 2*p`
+    /// (NOT `y144 + p`). At 144 spi the driver prints one band, advances the
+    /// **half-pitch 1/144** (then `15/144` to the next band pair), and prints a
+    /// second band — the two half-bands' pins interleave (`y, y+1, y+2, …`) into
+    /// a solid 144-dpi stroke. At 72 spi a single band's pins land on adjacent
+    /// 72-vpi rows. Mapping the 144ths position through `config.dpiV` yields both
+    /// exactly. The earlier `y144 + p` mapping (pins 1/144 apart) made the two
+    /// half-bands *overlap* instead of interleave — a within-band "comb". (NB:
+    /// this corrects the interlace geometry only; a separately-observed
+    /// whole-line 2× duplication is upstream in the emitted stream, not here —
+    /// docs/hardware-notes.md §12.6 decision 3 SCOPE note.)
     private func writeColumn(_ columnByte: UInt8) {
-        let rowTop = y144 * config.dpiV / 144
         let reps = wide ? 2 : 1
         for _ in 0..<reps {
             let x = cursorX
             if x >= 0, x < config.widthDots, columnByte != 0 {
-                for bit in 0..<8 {
-                    // bit 7 (0x80) = top dot.
-                    if columnByte & (0x80 >> UInt8(bit)) != 0 {
-                        setInk(x: x, y: rowTop + bit)
+                for pin in 0..<8 {
+                    // bit 7 (0x80) = top pin (p = 0); pins are 2/144" apart.
+                    if columnByte & (0x80 >> UInt8(pin)) != 0 {
+                        let row = (y144 + 2 * pin) * config.dpiV / 144
+                        setInk(x: x, y: row)
                     }
                 }
             }

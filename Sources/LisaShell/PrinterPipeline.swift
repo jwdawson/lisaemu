@@ -104,6 +104,16 @@ public final class PrinterPipeline {
         _ = adapter.consumeSawByte()
     }
 
+    /// Optional raw-byte tap: every byte transmitted on Serial B is also handed
+    /// here, in order, before the interpreter consumes it. A debug facility for
+    /// capturing the exact ImageWriter wire stream the OS emits (`lisadbg`'s
+    /// `--printer-raw`), used to derive/verify the escape-code geometry against
+    /// the real driver.
+    public var rawByteSink: ((UInt8) -> Void)? {
+        get { adapter.rawByteSink }
+        set { adapter.rawByteSink = newValue }
+    }
+
     /// The thin `PrinterPort` conformance: channel-B bytes in, interpreter
     /// fed in order, with a byte-activity flag the pipeline polls each tick.
     /// Modeled as an infinitely-fast sink (`isReady` always true), matching the
@@ -111,8 +121,9 @@ public final class PrinterPipeline {
     private final class Adapter: PrinterPort {
         private let interpreter: ImageWriterInterpreter
         private var sawByte = false
+        var rawByteSink: ((UInt8) -> Void)?
         init(interpreter: ImageWriterInterpreter) { self.interpreter = interpreter }
-        func transmit(_ byte: UInt8) { interpreter.feed(byte); sawByte = true }
+        func transmit(_ byte: UInt8) { rawByteSink?(byte); interpreter.feed(byte); sawByte = true }
         /// Returns whether a byte arrived since the last call, and clears it.
         func consumeSawByte() -> Bool { let s = sawByte; sawByte = false; return s }
         var isReady: Bool { true }

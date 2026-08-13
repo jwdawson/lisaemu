@@ -258,6 +258,19 @@ final class PrinterSink: @unchecked Sendable {
     }
 }
 
+/// Accumulates the raw Serial-B wire bytes for `--printer-raw` (debug escape-
+/// stream capture). Single-threaded in lisadbg; the box just defers the file
+/// write to an explicit flush.
+final class RawByteBox {
+    private(set) var bytes: [UInt8] = []
+    func append(_ b: UInt8) { bytes.append(b) }
+    func write(to path: String) {
+        do { try Data(bytes).write(to: URL(fileURLWithPath: path))
+             print("      printer: wrote \(bytes.count) raw Serial-B bytes to \(path)") }
+        catch { print("      printer: raw write failed: \(error)") }
+    }
+}
+
 /// Coarse ~90x45 block-averaged ASCII preview of a framebuffer snapshot,
 /// printed straight to the terminal (`sca`) -- a quick "is anything drawn
 /// yet" sanity check without leaving the shell. Each output cell averages
@@ -604,10 +617,17 @@ if let widgetPath {
 // force-flushes for a deterministic capture at end of a scripted print.
 var printerPipeline: PrinterPipeline?
 var printerSink: PrinterSink?
+// `--printer-raw <path>` (debug): tee the raw Serial-B wire bytes to a file for
+// escape-stream analysis. Accumulated in memory, flushed by the `printer`/`q`.
+let printerRawPath = ProcessInfo.processInfo.environment["LISAEMU_PRINTER_RAW"]
+let printerRawBox = RawByteBox()
 if let printerDir {
     let pipeline = PrinterPipeline()
     let sink = PrinterSink(dir: printerDir)
     pipeline.onJob = { [sink] job in sink.write(job) }
+    if printerRawPath != nil {
+        pipeline.rawByteSink = { [printerRawBox] b in printerRawBox.append(b) }
+    }
     machine.bus.scc.channelB.printerPort = pipeline.printerPort
     printerPipeline = pipeline
     printerSink = sink
@@ -787,6 +807,7 @@ while let line = readLine(strippingNewline: true) {
         if !sink.lastPaths.isEmpty {
             print("      printer: last job PNGs -> \(sink.lastPaths.joined(separator: ", "))")
         }
+        if let printerRawPath { printerRawBox.write(to: printerRawPath) }
     case .reset:
         machine.reset()
         print("      warm reset -- CPU at ROM entry, cycles=\(machine.cycles), media/printer survive")

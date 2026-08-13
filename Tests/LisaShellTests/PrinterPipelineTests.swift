@@ -76,6 +76,19 @@ struct PrinterPipelineTests {
     }
 
     @Test
+    func rawByteSinkTapsEveryByteInOrder() {
+        // The --printer-raw debug tap: every transmitted byte is teed, in order,
+        // before the interpreter consumes it (used to capture the OS's wire
+        // stream for escape-geometry analysis).
+        let pipeline = PrinterPipeline()
+        var raw: [UInt8] = []
+        pipeline.rawByteSink = { raw.append($0) }
+        let stream: [UInt8] = [27, UInt8(ascii: "G"), 0x30, 0x30, 0x30, 0x31, 0x80, 12]
+        for b in stream { pipeline.printerPort.transmit(b) }
+        #expect(raw == stream, "the raw tap sees exactly the transmitted bytes, in order")
+    }
+
+    @Test
     func portReportsReadyAndForwardsEveryByteInOrder() {
         // The adapter is an infinitely-fast sink (matches SCC RR0 Tx-empty).
         let pipeline = PrinterPipeline()

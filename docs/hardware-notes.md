@@ -2615,10 +2615,35 @@ affect the byte-level command parsing:
    so no mid-page resize is needed.)
 2. **Bit 7 = top dot** within each graphics column byte (see 12.4 — not
    recoverable from the Pascal source).
-3. **Vertical grid = the config's V dpi**, driven by the 144ths accumulator
-   (`row = pos144 × dpiV ÷ 144`). Interlace half-band advances (1/15) land on
-   adjacent rows rather than physically interleaved passes — a raster-fidelity
-   simplification, not a parsing one.
+3. **Vertical grid = the config's V dpi**, driven by the 144ths accumulator.
+   ~~Interlace half-band advances (1/15) land on adjacent rows rather than
+   physically interleaved passes — a raster-fidelity simplification, not a
+   parsing one.~~ **[CORRECTED — M7 Task 4 fix round 2.]** The simplification
+   made the two 144-spi half-bands **overlap** instead of interleave (a
+   within-band "comb"): the head is a **72-dpi 8-pin column**, so a pin `p` sits
+   `2/144"` below the band origin — its 144ths vertical position is
+   **`y144 + 2·p`**, canvas row `(y144 + 2·p) × dpiV ÷ 144`. The driver
+   (`CiPrBMVert`, LibPr-cidev:484-502) splits each hi-res band into two passes
+   via `PrHBand`/`PrVBand` (every-other source scanline) and prints them
+   `advance-1-then-15` (CiDeltaV, §12.5); with `2·p` pitch the two passes'
+   pins interleave (`row y, y+1, y+2, …`) into a solid 144-dpi stroke. At 72 spi
+   a single band's pins map through `dpiV=72` to consecutive rows (LO-res raster
+   unchanged). The old `y144 + p` mapping put the passes 1/144 apart so they
+   overlapped (rows 0..7 then 1..8). Pinned by
+   `interlacedHalfBandsProduceASolidVerticalStroke` (16 contiguous inked rows)
+   and the moved hi-res golden FNVs.
+
+   > **SCOPE (honest).** This corrects the *within-band* interlace geometry
+   > only. The **whole-line vertical doubling** a user reported on a live
+   > LisaWrite print (the text appearing as two stacked copies, ~2× the screen
+   > height) is **NOT** this geometry and is not fixed by it: raw-stream capture
+   > (`lisadbg --printer-raw`) shows the OS emits the text region as a single
+   > 64-scanline `CiPrBMVert` block (8 interleaved sub-bands, print rows
+   > 64-127) whose upper and lower 32-scanline halves are **different** rasters
+   > (~3% aligned overlap) yet each read as the full line — i.e. the emitted
+   > raster is ~2× the screen height. That duplication is **upstream** of the
+   > `ImageWriterInterpreter` (the QuickDraw print-spool/banding path), which
+   > renders the wire bytes faithfully. Flagged for a separate investigation.
 4. **Page emission triggers**: (a) the LF accumulator forward-crossing the page
    length (the real form-feed mechanism, 12.5); (b) `flush()` for an
    end-of-stream partial page; (c) `ESC c` reset flushes any dirty page. A bare

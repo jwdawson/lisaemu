@@ -108,15 +108,19 @@ struct ImageWriterInterpreterTests {
 
     @Test
     func standardGraphicsColumnBitOrderTopIsBit7() {
-        // A single column 0x81 = bit7 + bit0 → top and bottom dots of the band.
+        // A single column 0x81 = bit7 (pin 0, top) + bit0 (pin 7, bottom). The
+        // head is a 72-dpi 8-pin column, so on the 144-vpi canvas the pins sit
+        // 2 rows apart (§12.5): pin 0 → row 0, pin 7 → row 14. (The intervening
+        // odd rows are where the SECOND interlace half-band's pins land.)
         let pages = Self.run { interp in
             interp.feed(Self.stdBand([0x81]))
             interp.flush()
         }
         let p = pages[0]
-        #expect(Self.inked(p, 0, 0))       // bit7 = top
-        #expect(!Self.inked(p, 0, 1))
-        #expect(Self.inked(p, 0, 7))       // bit0 = bottom of the 8-dot band
+        #expect(Self.inked(p, 0, 0))        // bit7 = top pin, row 0
+        #expect(!Self.inked(p, 0, 1))       // 2/144 pitch — no dot on the interlace row
+        #expect(!Self.inked(p, 0, 7))       // (was the bug's location under the 1/144 mapping)
+        #expect(Self.inked(p, 0, 14))       // bit0 = bottom pin, 7 × 2 = row 14
         #expect(Self.inkCount(p) == 2)
     }
 
@@ -168,6 +172,34 @@ struct ImageWriterInterpreterTests {
         #expect(Self.inked(p, 0, 0))
         #expect(Self.inked(p, 1, 0))
         #expect(Self.inkCount(p) == 2)
+    }
+
+    // MARK: - Two-pass interlace geometry (§12.5) — the regression that would
+    // have caught the "double-struck comb" bug the user hit on real content.
+
+    @Test
+    func interlacedHalfBandsProduceASolidVerticalStroke() {
+        // The driver prints a hi-res 144-vpi column as TWO 8-pin bands offset by
+        // the half-pitch: band 1 at y, advance 1/144 (ESC T 01 + LF), band 2 at
+        // y+1 (CiDeltaV 1-then-15, §12.5). Each band's pins are 2/144 apart, so
+        // the two bands INTERLEAVE into 16 contiguous inked rows — a solid
+        // vertical stroke. Under the old `y144+p` mapping the bands OVERLAPPED
+        // (rows 0..7 then 1..8), leaving rows 9..15 blank: the comb/doubling.
+        let pages = Self.run { interp in
+            interp.feed(Self.stdBand([0xFF]))     // band 1: pins at rows 0,2,…,14
+            interp.feed(Self.setLineHeight(1))    // half-pitch advance
+            interp.feed(Self.lf)                  // y144 → 1
+            interp.feed(Self.tab(0))              // LF is not CR (§12.5)
+            interp.feed(Self.stdBand([0xFF]))     // band 2: pins at rows 1,3,…,15
+            interp.flush()
+        }
+        let p = pages[0]
+        // All 16 rows 0..15 in column 0 must be inked — a solid stroke, no comb.
+        for y in 0...15 {
+            #expect(Self.inked(p, 0, y), "interlaced stroke must be solid at row \(y)")
+        }
+        #expect(!Self.inked(p, 0, 16), "the stroke ends at row 15 (16/144 = one band pair)")
+        #expect(Self.inkCount(p) == 16)
     }
 
     // MARK: - Density modes (each bpi ciprint uses, §12.2/§12.3)
@@ -408,7 +440,11 @@ struct ImageWriterInterpreterTests {
         }
         #expect(pages.count == 1)
         // Locked fingerprint — asserts the whole raster is byte-stable.
-        #expect(Self.fnv(pages[0].bits) == 0x3371_688a_729d_0777)
+        // SUPERSEDED (M7 Task 4 fix round 2): was 0x3371_688a_729d_0777 under the
+        // 1/144 pin mapping; the corrected two-pass interlace geometry (§12.5 —
+        // pins 2/144 apart) legitimately moves every hi-res multi-pin raster, so
+        // the pin was re-locked from a known-good run of the fixed mapping.
+        #expect(Self.fnv(pages[0].bits) == 0x3cf1_f467_7fef_02f7)
     }
 
     @Test
@@ -427,7 +463,12 @@ struct ImageWriterInterpreterTests {
         #expect(hi.dpi == PrinterPage.DPI(h: 160, v: 144))
         #expect(lo.dpi == PrinterPage.DPI(h: 96, v: 72))
         #expect(Self.fnv(hi.bits) != Self.fnv(lo.bits))   // distinct geometry ⇒ distinct raster
-        #expect(Self.fnv(hi.bits) == 0xd58a_571e_f5ed_0189)
+        // SUPERSEDED (M7 Task 4 fix round 2): the HI pin was 0xd58a_571e_f5ed_0189
+        // under the 1/144 mapping and legitimately moves with the corrected
+        // two-pass interlace (§12.5); re-locked from the fixed mapping. The LO
+        // (72-vpi, single-pass, NOT interleaved) pin is UNCHANGED — proof the fix
+        // only affects the 144-vpi interleaved path.
+        #expect(Self.fnv(hi.bits) == 0xe6ff_27c5_9c36_d389)
         #expect(Self.fnv(lo.bits) == 0x543e_21ca_4839_3989)
     }
 }

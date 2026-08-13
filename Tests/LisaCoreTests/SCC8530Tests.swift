@@ -166,12 +166,66 @@ private func writeReg(_ ch: SCCChannel, _ reg: Int, _ value: UInt8) {
     #expect(ch.pointer == 0, "pointer clean after the ack sequence")
 }
 
-@Test func txInterruptStaysClearWhenTxInterruptsDisabled() {
+@Test func txEmptyLatchSetsOnEveryWriteButOnlyAssertsWhenEnabled() {
+    // M7 Task 4 transport rework: `txInterruptPending` is the Z8530
+    // Tx-buffer-empty LATCH (set on every data write — the buffer goes
+    // full→empty instantly for our host sink), distinct from the CPU /INT
+    // assertion (`irqAsserted`), which additionally requires Tx interrupts
+    // enabled (WR1 bit1) AND the master interrupt enable (WR9 bit3, MIE).
     let ch = SCCChannel(id: .b)
     ch.printerPort = CapturePrinterPort()
-    // WR1 left at 0 -> Tx interrupts disabled.
+    // WR1 = 0 (Tx int disabled), WR9 not programmed (MIE off).
     ch.writeData(0x01)
-    #expect(!ch.txInterruptPending, "no Tx-int-pending latch when Tx interrupts are disabled")
+    #expect(ch.txInterruptPending, "the Tx-empty latch sets on any data write (buffer full→empty)")
+    #expect(!ch.irqAsserted, "but /INT is not asserted while Tx interrupts / MIE are off")
+}
+
+// MARK: - M7 Task 4: Level-6 Tx-empty interrupt state machine (the live
+// print's transport). Grounded in the rsASM XMIT ISR (§11.4 step 5): the
+// driver sends the first byte polled, then each Tx-empty interrupt drives the
+// next byte until the transfer completes.
+
+@Test func txEmptyInterruptAssertsGatedByWR1AndMIE() {
+    let ch = SCCChannel(id: .b)
+    ch.printerPort = CapturePrinterPort()
+
+    // dinit: WR9 = $4A (channel-B reset + MIE + NV). Our reset preserves the
+    // mode bits (MIE) programmed in that same write.
+    writeReg(ch, 9, 0x4A)
+    #expect(ch.wr[9] & 0x08 == 0x08, "WR9=$4A leaves MIE (bit3) set after the channel reset")
+    writeReg(ch, 1, 0x17)          // Tx/Rx/status interrupts enabled
+
+    // First byte (polled RSOUT) latches Tx-empty; with WR1 bit1 + MIE, /INT asserts.
+    ch.writeData(0x41)
+    #expect(ch.irqAsserted, "a byte sent with Tx ints + MIE enabled asserts Level 6")
+
+    // XMIT ISR: WR0=$29 (reset Tx int pending) → /INT drops; WR1=0 (disable);
+    // WR0=$38 (reset IUS). Then RSOUT sends the next byte WHILE WR1=0.
+    ch.writeControl(0x29)
+    #expect(!ch.irqAsserted, "WR0=$29 clears the latch, dropping /INT inside the ISR")
+    ch.writeControl(0x00)          // WR1 = 0
+    ch.writeControl(0x38)
+    ch.writeData(0x42)             // next byte, Tx int currently disabled
+    #expect(!ch.irqAsserted, "the next byte re-latches but /INT stays low while WR1 bit1 is 0")
+
+    // RESTORE writes WR1=$17 → the pending Tx-empty latch re-asserts /INT,
+    // driving the following byte. This is the per-byte re-arm the ISR relies on.
+    writeReg(ch, 1, 0x17)
+    #expect(ch.irqAsserted, "RESTORE re-enabling WR1=$17 re-asserts /INT for the next byte")
+
+    // Completion: the ISR clears the latch (WR0=$29) and sends NO further byte,
+    // so /INT stays low even with WR1=$17 still enabled — no interrupt storm.
+    ch.writeControl(0x29)
+    #expect(!ch.irqAsserted, "with the latch cleared and no new byte, /INT stays low at end of transfer")
+}
+
+@Test func sccIRQAssertedIsTheORofBothChannels() {
+    let scc = SCC8530()
+    #expect(!scc.irqAsserted, "idle: neither channel asserts")
+    writeReg(scc.channelB, 9, 0x4A)   // MIE
+    writeReg(scc.channelB, 1, 0x17)   // Tx int enable
+    scc.channelB.writeData(0x55)
+    #expect(scc.irqAsserted, "channel B's Tx-empty interrupt propagates to the chip-level /INT")
 }
 
 // MARK: - Unknown-register bounded log

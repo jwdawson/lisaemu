@@ -263,7 +263,12 @@ public final class Machine {
         }
         let level1 = (bus.via1.irqAsserted || vsyncPending || floppyPending) ? 1 : 0
         let level2 = bus.via2.irqAsserted ? 2 : 0
-        cpu.setIRQ(level: max(level1, level2))
+        // M7 Task 4: the SCC serial controller is CPU Level 6 (docs/hardware-
+        // notes.md §5, §11.4). Its only asserted source in the printer model
+        // is the channel-B Tx-empty interrupt that drives the OS's XMIT ISR --
+        // without it the printer driver sends one byte and waits forever.
+        let level6 = bus.scc.irqAsserted ? 6 : 0
+        cpu.setIRQ(level: max(level1, level2, level6))
     }
 
     /// Executes a single CPU instruction, advancing `cycles` by the amount

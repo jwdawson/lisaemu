@@ -35,14 +35,22 @@
 /// test at §11.4 step 3). A host sink is infinitely fast, so RR0 bit 2 is
 /// pinned 1 and bit 5 pinned 0: transmit always proceeds. A channel-B **data**
 /// write forwards the byte to `channelB.printerPort` in order; Tx-buffer-empty
-/// stays ready. If the driver uses the Tx-empty interrupt path
-/// (`WR0=$29 / WR1=0 / WR0=$38`, §11.4 step 5) the reset/ack commands are
-/// honored (they clear the internal Tx-int-pending latch) -- but the SCC is
-/// **not** wired to the CPU IRQ. That is deliberate and sufficient: the polled
-/// fast path never blocks because RR0 bit 2 is always set, so the driver drains
-/// its buffer synchronously and never waits on a Level-6 interrupt. Per the
-/// brief, IRQ plumbing is touched only if the printing path *requires* it; it
-/// does not. (See the report for the full argument.)
+/// stays ready.
+///
+/// ## Level-6 Tx-empty interrupt (M7 Task 4 — REQUIRED for printing)
+///
+/// The OS RS-232 driver sends only the **first** byte polled; every byte after
+/// that is driven by the **Level-6 Tx-empty interrupt** (`XMIT` ISR, §11.4
+/// step 5). So the SCC asserts `/INT` (→ CPU Level 6, via `irqAsserted` OR'd
+/// into `Machine.tickVIAsAndUpdateIRQ`) whenever a channel's Tx-empty latch is
+/// set AND Tx interrupts are enabled (WR1 bit 1) AND MIE is set (WR9 bit 3).
+/// The latch (`txInterruptPending`) sets on *every* data write and is cleared
+/// by the ISR's `WR0=$29`; the ISR re-arms it by writing the next byte and
+/// `RESTORE`-ing `WR1=$17`. Task 2's earlier "not wired to the CPU IRQ" note
+/// was correct for the boot path (channel B is never inited at boot, so Level 6
+/// never asserts and the FNV checkpoints are byte-identical) but is superseded
+/// for the printing path: without this wiring a live print emits exactly one
+/// byte and stalls (observed). Ext/status and Rx interrupts are not modeled.
 ///
 /// ## Unknown accesses (bounded, inert)
 ///
@@ -57,6 +65,12 @@ public final class SCC8530 {
         channelA = SCCChannel(id: .a)
         channelB = SCCChannel(id: .b)
     }
+
+    /// True while either channel asserts the Z8530 `/INT` line -- the Lisa's
+    /// **Level 6** CPU interrupt (docs/hardware-notes.md §5). `Machine` ORs
+    /// this into the CPU IRQ level so the OS RS-232 driver's Level-6 `XMIT`
+    /// ISR runs and drives the printer byte stream (M7 Task 4, §11.4 step 5).
+    public var irqAsserted: Bool { channelA.irqAsserted || channelB.irqAsserted }
 
     /// Decodes an IODispatcher offset in the `$D200-$D2FF` window to the
     /// channel it addresses (address bit 1) and whether it is the data
@@ -120,10 +134,18 @@ public final class SCCChannel {
     /// access (§11.2). A bare read/first-write therefore hits WR0/RR0.
     public private(set) var pointer: Int = 0
 
-    /// Internal Tx-empty interrupt-pending latch. Set when a byte is
-    /// transmitted with Tx interrupts enabled (WR1 bit 1); cleared by the
-    /// driver's `WR0 = $29` (reset Tx int pending) ack (§11.4 step 5). Modeled
-    /// for ack fidelity only -- NOT wired to the CPU IRQ (see type doc).
+    /// The Z8530 **Tx-buffer-empty interrupt latch**. Set on **every** data
+    /// write -- the host sink is infinitely fast, so the Tx buffer goes
+    /// full→empty instantly (§11.4). Cleared by the driver's `WR0 = $29`
+    /// (reset Tx int pending) ack (§11.4 step 5) and by a channel reset.
+    ///
+    /// M7 Task 4: this is the *latch* (buffer state), deliberately independent
+    /// of whether interrupts are enabled -- the CPU /INT assertion is the
+    /// separate, gated `irqAsserted` below. Setting it unconditionally is what
+    /// lets the XMIT ISR's per-byte re-arm work: the ISR sends the next byte
+    /// while WR1 Tx-int is momentarily disabled (latch sets, /INT stays low),
+    /// then `RESTORE` re-enables WR1=$17 and the still-set latch re-asserts
+    /// /INT for the following byte (see `irqAsserted`).
     public private(set) var txInterruptPending = false
 
     /// Count of bytes forwarded to `printerPort` (or absorbed while detached) --
@@ -210,7 +232,30 @@ public final class SCCChannel {
             // each channel through its own port, and at POST time channel A is
             // not yet programmed (§11.5).
             softReset()
+            // M7 Task 4: a channel reset applies the reset AND the mode bits
+            // programmed in the SAME WR9 write -- the driver's dinit relies on
+            // WR9=$4A (ch-B reset + MIE bit3 + NV bit1) leaving MIE set, since
+            // it never re-writes WR9 afterward (source-rs232.text:545). Keep
+            // the low 6 bits (MIE/NV/status-hi/DLC); only the reset command
+            // bits 7-6 are transient. Without this, `softReset`'s blanket clear
+            // would drop MIE and the Level-6 Tx-empty interrupt would never
+            // assert, stalling the printer after a single byte.
+            wr[9] = value & 0x3F
         }
+    }
+
+    /// Whether this channel is currently asserting the Z8530 `/INT` line to the
+    /// CPU (the Lisa's **Level 6** -- docs/hardware-notes.md §5, §11.4 step 5).
+    ///
+    /// Modeled for the **Tx-buffer-empty** interrupt ONLY: it is the sole SCC
+    /// interrupt source the transmit-only printer path uses (the rsASM `XMIT`
+    /// ISR). Asserted while the Tx-empty latch is set (`txInterruptPending`),
+    /// Tx interrupts are enabled (**WR1 bit 1**), and the master interrupt
+    /// enable is set (**WR9 bit 3, MIE**). Ext/status (CTS/DCD/Break) and Rx
+    /// interrupts are never asserted -- nothing in the printer model changes a
+    /// modem line or feeds the receiver, so there is no source to raise them.
+    public var irqAsserted: Bool {
+        txInterruptPending && (wr[1] & 0x02) != 0 && (wr[9] & 0x08) != 0
     }
 
     func readControl() -> UInt8 {
@@ -258,9 +303,11 @@ public final class SCCChannel {
     func writeData(_ byte: UInt8) {
         printerPort?.transmit(byte)
         transmittedCount += 1
-        if wr[1] & 0x02 != 0 {
-            txInterruptPending = true
-        }
+        // The byte transmits instantly (infinitely-fast host sink), so the Tx
+        // buffer goes full→empty and the Tx-empty latch sets UNCONDITIONALLY.
+        // Whether that latch actually asserts /INT is gated separately in
+        // `irqAsserted` (WR1 bit1 + WR9 MIE) -- see `txInterruptPending`'s doc.
+        txInterruptPending = true
     }
 
     /// Data-register read = the Rx byte. Nothing feeds the receiver in the

@@ -873,6 +873,16 @@ Source: libhw-DRIVERS (various), OS/source-mover.text.unix.txt, OS/source-INITRA
 - **Level 5:** Expansion slot 0
 
 - **Level 6:** RS-232 SCC (mover:822-849, INITRAP:136-137)
+  - **M7 Task 4 (WIRED):** the SCC now asserts CPU Level 6 when a channel has a
+    pending, enabled Tx-empty interrupt (`SCC8530.irqAsserted`, OR'd into
+    `Machine.tickVIAsAndUpdateIRQ`). This is REQUIRED for printing: the OS's
+    `XMIT` ISR (§11.4 step 5) sends the first byte polled, then drives every
+    subsequent byte off the Level-6 Tx-empty interrupt — without it a live
+    print emits exactly ONE byte and stalls (observed). Task 2's "SCC not wired
+    to the CPU IRQ" note is superseded here: it was correct for the boot path
+    (channel B is never inited at boot, so no Level-6 ever asserts — the FNV
+    checkpoints confirm boot is byte-identical), but the *printing* path does
+    require it. Autovectored (`$78`), like every other Lisa interrupt.
 
 - **Level 7:** NMI (INIT_NMI_TRAPV, INITRAP:43,73)
   - Debugger break-in via low-core $7C — LDASM:68-106
@@ -2236,6 +2246,28 @@ Order the OS driver programs when a Serial-B device is opened
    → rsASM DRIVER `XMIT`): `WR0 = $29` (reset Tx-int-pending + point WR1) →
    `WR1 = 0` → `WR0 = $38` (reset IUS) (source-rsASM.TEXT.unix.txt:98-103).
 
+**M7 Task 4 — our interrupt model (SOURCE-DERIVED from the `XMIT` ISR, and
+LIVE-VERIFIED).** The ISR (source-rsASM.TEXT.unix.txt:96-133) is the load-bearing
+detail: only the **first** byte is sent by the polled `RSOUT` above; every
+byte after that is sent from inside the Level-6 ISR, which does `WR0=$29`
+(clear the Tx-empty latch), `WR1=0` (disable), `WR0=$38`, then `RSOUT` the
+**next** byte *while Tx-int is disabled*, and finally `RESTORE` writes
+`WR1=$17` to re-enable — at which point the still-set Tx-empty latch re-asserts
+`/INT` for the following byte. So our SCC models the Tx-empty as a **level
+latch, not an edge**: `SCC8530.writeData` sets `txInterruptPending` on *every*
+data write (the host sink empties the buffer instantly), and
+`SCCChannel.irqAsserted = txInterruptPending && WR1 bit1 && WR9 bit3 (MIE)`
+gates the CPU assertion. `WR9=$4A` (the ch-B reset that dinit issues, §11.3
+step 2) carries MIE (bit3) + NV (bit1); our channel reset preserves those mode
+bits (`wr[9] = value & $3F`) since the driver never re-writes WR9. The final
+ISR clears the latch (`WR0=$29`) and sends no further byte, so `/INT` drops and
+there is **no interrupt storm** at end-of-transfer. **Live proof:** without
+this wiring a LisaWrite print emitted exactly 1 byte on Serial B and stalled;
+with it, the same print emitted 9229 bytes and produced a full page raster
+(m7-print-01.png). Ext/status (CTS/DCD/Break) and Rx interrupts are **not**
+modeled/asserted — nothing in the transmit-only printer path changes a modem
+line or feeds the receiver.
+
 So the driver's notion of **"connected and ready to accept a byte"** is:
 **RR0 bit 2 (Tx buffer empty) set**, and — under hardware handshake — **RR0 bit 5
 (CTS) asserted**. It learns of CTS/DCD/Break transitions via the Level-6
@@ -2375,6 +2407,36 @@ cross-power-cycle persistence is the boot-volume snapshot.**
   - *Full fidelity (medium):* also model the `pmem_state` checksum/snapshot
     reconciliation so RAM-vs-disk divergence behaves exactly as `SOURCE-PMEM`
     describes. Not needed for a working printer config; only for edge-case parity.
+
+**M7 Task 4 — LIVE-VERIFIED (closes the Task-4 verification point above).**
+Driving the real Preferences → **Connect Devices** flow live: the device list
+for a serial connector is `Nothing / Serial Cable / Modem A / Imagewriter · ‖
+DMP / Daisy Wheel Printer`; selecting **Serial B Connector → Imagewriter / ‖
+DMP** attaches the dot-matrix printer, and **Set Aside** (which calls
+`Write_PMem`) persists it. **Persistence works via the disk snapshot with ZERO
+new emulator code:** a *fresh boot of the same Widget image* (a full power
+cycle — new process, fresh `Machine.reset()` that zeroes shared-RAM PM) still
+shows "Serial B Connector — Imagewriter / ‖ DMP", because `INIT_CDS`/`READ_PMEM`
+reload the config from the `PMSnapshot` written to the write-through Widget and
+`pmem_state` takes the RAM-bad/snapshot-good (`PMb_SSg`) path. This is the
+"reuse image across boots" outcome (≈0 code) predicted above, now confirmed.
+**Verdict on the PM-sparing `reset()` fix: NOT required** — neither for the
+headless `lisadbg` flow (separate-process reboot re-reads the disk) nor, by the
+same `pmem_state` reconciliation, for the app's warm `reset()` (RAM PM zeroes,
+disk snapshot survives on the attached Widget, `READ_PMEM` rebuilds). The
+faithful match to real hardware (which also loses battery-less shared-RAM PM on
+power loss and rebuilds from the boot-volume snapshot) is exactly this
+zero-code behavior, so the fix is deliberately **not** taken. The one standing
+limitation: a config made against a *floppy*-only or *non-write-through* boot
+volume would not persist; our Widget is write-through (§10.10), so it does.
+The exact `pm_DevConfig` bytes were observed as a CDS-style table on the odd
+lanes from `$FCC181` (record-separated by `$F8` markers, e.g. `$FCC183=04`,
+`…95=1E $97=F8 …`); a precise (slot,chan,dev) decode was not pinned because the
+monitor's CPU-context read of `$FCC180` is domain-dependent (reads cleanly only
+when the current context maps the disk-controller window) — the load-bearing,
+reproducible fact is the **round-trip**: the config the Preferences UI writes
+survives a power cycle and re-enables channel B, which the live print proves
+end to end.
 
 
 ## 12. ImageWriter escape contract (as ciprint emits it) — M7 Task 3

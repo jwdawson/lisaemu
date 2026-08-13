@@ -2988,6 +2988,20 @@ Cross-power-cycle persistence on real hardware is the boot-volume **snapshot**
 `INIT_CDS`/`READ_PMEM`, CD:1758) — and our Widget write-through already carries
 that path. Verdict + cost estimate: §11.6.
 
+**Probe method (re-runnable without re-deriving the harness).** The SCC/PM trace
+used a scratch `Tests/LisaCoreTests/_ScratchSerialProbe.swift` (deleted) that
+copied the ROMWidgetBootTests Checkpoint-L boot harness verbatim, with
+`IODispatcher.ioTraceLimit` temporarily raised `4096 → 8_000_000` (reverted) so
+the full boot trace survives uncapped. Two assertions: (1) *SCC/PM scan* —
+`machine.bus.ioTrace.filter { (0xD200...0xD2FF).contains($0.offset) }` (SCC) and
+`{ (0xC180...0xC1FF).contains($0.offset) }` (PM), printing `offset/isWrite/value/
+cycles` and `Set(offset)`; power-on stub read via `machine.bus.read8(0xFCD201…07)`
+(setup-mode routes `$FCxxxx` to `IODispatcher`). (2) *PM write→reset→read* — on a
+bare `Machine`, write `$A0+i` to the 64 odd lanes `0xFCC181 + i*2` (mirroring
+`W_PARAM_MEM`'s `MOVEP`), read back (`== $A0`), call `machine.reset()`, read again
+and assert all-`$00`. Reproduces: PM backed pre-reset, zeroed by
+`floppy.reset()`.
+
 **Standing frontier at M7 Task 1 close.** The SCC is *characterized* but still a
 `0xFF` stub. Task 2's job is the real Z8530 (RR0 Tx-empty/CTS, the WR file, the
 data register at `$FCD205`) so the OS driver can transmit a byte on Serial B.

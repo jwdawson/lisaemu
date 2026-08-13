@@ -2306,10 +2306,25 @@ battery-backed NVRAM:
 - PM layout (source-PMEM.TEXT.unix.txt:29-49): version/timestamp, screen/beep/
   mouse prefs, `pm_cdCount` (byte 9), **`pm_DevConfig` (bytes 10-59)** — the
   device-connection table the Preferences serial-B printer entry would occupy —
-  and a checksum (bytes 62-63). The built-in SCC is device **slot 10, chan 0**
-  (source-PMEM.TEXT.unix.txt:267-276); built-in devices are *never* written into
-  the configurable region (:445), so a Serial-B **printer** entry is a
-  configurable `pm_DevConfig` record keyed to slot 10.
+  and a checksum (bytes 62-63). The built-in SCC **card** is CD position
+  **(slot 10, chan 0, dev 0)** — the single auto-generated entry `GetNxtConfig`
+  emits for it (source-PMEM.TEXT.unix.txt:267-276) — and `PutNxtConfig`
+  **refuses to store any config record at exactly `(slot=10, chan=0)`**
+  (source-PMEM.TEXT.unix.txt:445, the `(pos.slot=10) and (pos.chan=0)` guard),
+  because that coordinate is the built-in port itself, rebuilt from scratch every
+  boot. So a configurable Serial-B **printer** record is **not** keyed on
+  `(10, 0)`. What *is* source-certain about how Serial B is distinguished: the SCC
+  driver splits the two channels by **`iochannel`** — `iochannel = 0` → channel
+  **B**, non-zero → channel **A** (SOURCE-SERCARD.TEXT.unix.txt:151) — and CD sets
+  `iochannel := chan` from the device's position channel (SOURCE-CD.TEXT.unix.txt:741,
+  `chan_offset = $800` per channel at :521-527). The exact `(slot, chan, dev)`
+  triple the Preferences "Device Connections" tool assigns a Serial-B printer —
+  and precisely how it clears the `(10,0)` guard (a non-zero `chan`/`dev` on the
+  SCC card, or a distinct pseudo-slot) — is **not** unambiguously derivable from
+  SERCARD/CD/PMEM alone (it lives in the Preferences tool's CD-building logic, not
+  in these units). **Flagged as a Task-4 live-verification point**: capture the
+  actual `pm_DevConfig` bytes a live "printer on Serial B" save produces and read
+  back the stored position, rather than asserting a channel number here.
 
 **Persistence on real hardware is the disk snapshot, not NVRAM (SOURCE-DERIVED).**
 `Write_PMem` does **two** things: `Paramem_Write` (→ the volatile `$FCC181`

@@ -4,6 +4,27 @@
 **Status:** Approved design, pre-implementation
 **Author:** jdawson + Claude
 
+> **ACHIEVED (M7 close, 2026-08-13).** This design shipped: the emulated Lisa
+> prints from the live Office System through a register-level Z8530 SCC on Serial
+> B into `ImageWriterInterpreter`/`PrintJobSpooler`, captured as `lisadbg` PNGs
+> and the LisaApp macOS print panel. Three design assumptions were **overturned by
+> the OS source** and are annotated inline below (strike-not-erase):
+> 1. **No form-feed byte.** The spec assumed "page emitted on form feed" + a
+>    "form-feed + serial-idle" job boundary. The `CiDev` driver emits **no
+>    `chr(12)`**; a page ejects on line-feed accumulation MOD the page length, and
+>    jobs close on a host-time idle window alone (§12.5, Task 3).
+> 2. **Level-6 Tx-empty interrupt, not transmit-side polling.** The driver polls
+>    only the first byte and drives bytes 2..N off the **Level-6 Tx-empty
+>    interrupt** (§11.4, Task 4) — the "transmit-buffer-empty status the driver
+>    expects" is an interrupt path, not a poll.
+> 3. **PM persistence: resolved FREE, not a separate roster item.** The open
+>    question (below) resolved to ≈0 emulator code — the boot-volume snapshot the
+>    Widget already writes through carries the config across a power cycle (§11.6,
+>    Tasks 1+4).
+>
+> See `docs/m7-demo.md`, `docs/rom-trace-notes.md` "Checkpoint N", and
+> `task-1..5-report.md`.
+
 ## Purpose
 
 Print from the Lisa Office System (LisaWrite et al.) to the user's real
@@ -28,8 +49,12 @@ LisaWrite ▸ Print
   → PrinterPort byte sink (Device seam, like COPS/floppy/Widget)
   → ImageWriterInterpreter (pure Swift, UI-free) — escape codes → dot rows
     → 1-bit page rasters; page emitted on form feed
+      [M7 DEVIATION: no form-feed byte exists — page ejects on LF accumulation
+       MOD page-length; §12.5]
   → Job spooler — pages accumulate; job closes on form-feed + serial-idle
     window (the ImageWriter protocol has no end-of-job marker)
+      [M7: correct that there's no end-of-job marker; the boundary is the
+       serial-idle window ALONE — there is no form-feed byte to combine it with]
   → LisaApp: standard macOS print panel (NSPrintOperation) with the
     rendered pages ("Save as PDF" comes free)
   → lisadbg: same tap headlessly — pages written as PNGs (test vehicle)
@@ -43,7 +68,9 @@ LisaWrite ▸ Print
   first implementation task, the established evidence-first method, every
   constant cited). Scope: **transmit-side printing only** — the WR/RR
   register subset the OS driver actually exercises, transmit-buffer-empty
-  status/interrupts per what the driver expects, modem/handshake status
+  status/interrupts per what the driver expects [M7: the "interrupts" clause is
+  load-bearing — the driver polls only byte 1 and drives bytes 2..N off the
+  Level-6 Tx-empty interrupt, wired in Task 4; §11.4], modem/handshake status
   lines pinned "printer ready," baud rate accepted and ignored (no real
   wire). Receive path remains a stub. The ROM's existing SCC probe (the
   `$D241`-era 0xFF stub satisfies POST today) must keep passing — POST/menu
@@ -57,9 +84,13 @@ LisaWrite ▸ Print
   rendered with the printer's font behavior as derived from the `ciprint`
   driver's actual usage — the OS source is the contract, the printer manual
   the cross-check) → fixed-size 1-bit page raster at printer dpi → emits
-  completed pages (form feed or page-length overflow).
+  completed pages (form feed or page-length overflow). [M7: shipped as
+  page-length (LF-accumulation MOD `cPg144ths`) overflow ONLY — no form-feed byte
+  exists in the `CiDev` path; §12.5. Text renders through a hand-authored
+  synthetic 5x7 font (real column data lives in external asm).]
 - **Job spooler** (LisaShell) — collects pages; closes the job after
-  form-feed + a short transmit-idle window; publishes the job to the app the
+  form-feed + a short transmit-idle window [M7: on the transmit-idle window ALONE
+  — no form-feed byte; `PrintJobSpooler`, §12.5]; publishes the job to the app the
   same way frames/status publish today (thread-safe, main-thread hand-off).
 - **LisaApp** — print-job presentation: NSPrintOperation with the standard
   panel per job; a Machine-menu indicator for "Printer connected (Serial B)"
@@ -83,6 +114,20 @@ whose physical home this project has never chased (M5 established the OS
 retains it across power-off is unknown). If PM persistence is cheap, it
 joins this milestone; if not, per-boot reconfiguration is documented as a
 known limitation and PM persistence becomes its own roster item.
+
+> **RESOLVED (M7, FREE — §11.6).** PM lives in disk-controller shared RAM
+> (`$FCC180`), which `floppy.reset()` zeroes, so the RAM copy is volatile — but
+> real cross-power-cycle persistence is the boot-volume **snapshot**
+> (`Write_PMem` = `Paramem_Write` + `PMSnapshot`; reloaded at `INIT_CDS`/
+> `READ_PMEM`), and our Widget write-through already carries it. So the config
+> survives a power cycle **with zero emulator code** — the "cheap, joins this
+> milestone" branch, at its limit. Task 1 had flagged a possible ~20–40-line
+> `reset()` PM-sparing fix as *maybe required*; it was **not** required and was
+> deliberately not taken (§11.6, strike-not-erase). Caveat: the config→reboot flow
+> requires a **full power cycle of the SAME image** (a fresh boot, not a warm
+> `Machine.reset()`), faithful to real hardware. The exact `pm_DevConfig`
+> (slot,chan,dev) triple was not decoded (CPU-domain-dependent monitor read);
+> the load-bearing proof is the observed round-trip.
 
 ## Error handling
 

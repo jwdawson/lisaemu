@@ -129,6 +129,17 @@ The MMU is built first and sits in the bus path from day one.
   exercised by `source-PROFILE` logic.
 - **SCC (Z8530)** — register-level stub first (satisfy ROM/OS probes); later
   bridged to host PTYs (LisaTerminal, LisaBug serial console).
+  *(Project-history note, M7 close 2026-08-13: **no longer a stub.** `SCC8530`
+  (`Sources/LisaCore/SCC8530.swift`) is a register-level Z8530 at the chased base
+  `RSBASE = $FCD201` — two-step WR pointer protocol, the WR file, RR0 Tx-empty,
+  the data register at `$FCD205`, and the **Level-6 Tx-empty interrupt** the OS
+  driver uses to move bytes 2..N. It replaced the `0xFF` stub with POST/menu FNVs
+  byte-identical (the POST probe is presence-only). **Transmit path is real**
+  (the Lisa prints on Serial B — M7 ⭐, `docs/m7-demo.md`); the **receive path is
+  still a stub**, so the "bridged to host PTYs (LisaTerminal, LisaBug serial
+  console)" clause remains future — the register-level SCC built here is its
+  foundation. See `docs/hardware-notes.md` §11 and `docs/rom-trace-notes.md`
+  "Checkpoint N".)*
 - **System glue** — interrupt priority encoder to 68000 levels, parity-error
   latch (inert initially), power/config latches, **serial-number PROM**
   (synthesized valid serial; OS reads machine ID — FS stores it for theft
@@ -289,3 +300,12 @@ Milestones (each a demo):
    "Checkpoint L"/"Checkpoint M".)*
 6. **Stretch (any order)** — SCC→PTY + LisaBug console; boot Workshop 3.0 and
    rebuild the OS source in-emulator; LLE COPS; LLE 6504 floppy; Lisa 1/Twiggy.
+   *(Project-history note, M7 close 2026-08-13: the SCC half of "SCC→PTY + LisaBug
+   console" now has its **foundation** — the project's own M7 ("The Printer",
+   `docs/m7-demo.md`) built the register-level Z8530 and the emulated Lisa
+   **prints** from the Office System out Serial B to a PNG / the macOS print
+   panel. That exercised only the **transmit** side; the receive path (→ host
+   PTY, LisaTerminal, LisaBug serial console) is the remaining stretch work, now
+   resting on a real SCC rather than a stub. Not on the printing path from this
+   list but shipped by M7: the ImageWriter/`ciprint` device and printer-config
+   persistence across a power cycle.)*

@@ -787,6 +787,9 @@ while let line = readLine(strippingNewline: true) {
         if !sink.lastPaths.isEmpty {
             print("      printer: last job PNGs -> \(sink.lastPaths.joined(separator: ", "))")
         }
+    case .reset:
+        machine.reset()
+        print("      warm reset -- CPU at ROM entry, cycles=\(machine.cycles), media/printer survive")
     case .quit:
         exit(0)
     case .help:

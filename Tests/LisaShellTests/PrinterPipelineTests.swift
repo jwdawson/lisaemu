@@ -18,20 +18,44 @@ struct PrinterPipelineTests {
     }
 
     @Test
-    func bytesThroughThePortBecomeAGroupedJobOnIdle() {
+    func bytesThroughThePortBecomeAGroupedJobOnByteIdle() {
         let pipeline = PrinterPipeline()
         var jobs: [[PrinterPage]] = []
         pipeline.onJob = { jobs.append($0) }
 
-        pipeline.tick(now: 0)
         Self.inkOnePageThenFormFeed(pipeline.printerPort)   // page 1
         Self.inkOnePageThenFormFeed(pipeline.printerPort)   // page 2
-        #expect(pipeline.spooler.hasOpenJob)
-        #expect(jobs.isEmpty, "no job before the idle window elapses")
+        pipeline.tick(now: 0)                               // observes the bytes → activity at t=0
+        #expect(jobs.isEmpty, "no job while bytes are still recent")
 
-        pipeline.tick(now: 2.0)                             // idle → close
+        pipeline.tick(now: 1.0)                             // 1s idle < 2s → still open
+        #expect(jobs.isEmpty)
+        pipeline.tick(now: 2.0)                             // 2s byte-idle → flush + close
         #expect(jobs.count == 1)
         #expect(jobs[0].count == 2, "both form-fed pages land in one job")
+    }
+
+    /// The M7 Task 4 regression this pipeline exists to prevent: a print whose
+    /// last page never reaches an LF page-length overflow (a one-line document)
+    /// leaves a DIRTY PARTIAL page in the interpreter that only a flush emits.
+    /// Byte-idle must flush the interpreter, not just tick the spooler — else
+    /// the job never closes (the live-print bug: bytes flowed, no PNG/panel).
+    @Test
+    func aPartialUnejectedPageIsFlushedAndClosedOnByteIdle() {
+        let pipeline = PrinterPipeline()
+        var jobs: [[PrinterPage]] = []
+        pipeline.onJob = { jobs.append($0) }
+
+        // Ink a band but send NO form-feed and NO page-length LFs — exactly the
+        // one-line-print shape. The page is dirty but never emitted on its own.
+        let esc: UInt8 = 27
+        for b in [esc, UInt8(ascii: "G"), 0x30, 0x30, 0x30, 0x31, 0x80] { pipeline.printerPort.transmit(b) }
+        pipeline.tick(now: 0)                               // activity
+        #expect(jobs.isEmpty, "nothing closed while the page is only partial")
+
+        pipeline.tick(now: 2.0)                             // byte-idle → flush the partial page + close
+        #expect(jobs.count == 1, "the unejected partial page still becomes a job on idle")
+        #expect(jobs[0].count == 1)
     }
 
     @Test

@@ -69,6 +69,11 @@ public struct Monitor {
         /// pipeline itself lives in lisadbg (LisaShell), not `Monitor`; this
         /// case is just the parsed signal, like every other command here.
         case printer
+        /// `reset` (M7 Task 4) -- warm-reset the Machine (`machine.reset()`),
+        /// the same path `EmulationController.reset()` takes: CPU back to the
+        /// ROM entry, attached media (floppy/Widget/printer port) survives.
+        /// Used to reproduce the config→reboot→print flow in one process.
+        case reset
         case quit, help
     }
 
@@ -149,6 +154,7 @@ public struct Monitor {
             return .insertFloppy(parts[1...].joined(separator: " "))
         case "eject": return .ejectFloppy
         case "printer": return .printer
+        case "reset": return .reset
         case "q": return .quit
         case "?": return .help
         default:  return nil

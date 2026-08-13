@@ -3005,3 +3005,97 @@ and assert all-`$00`. Reproduces: PM backed pre-reset, zeroed by
 **Standing frontier at M7 Task 1 close.** The SCC is *characterized* but still a
 `0xFF` stub. Task 2's job is the real Z8530 (RR0 Tx-empty/CTS, the WR file, the
 data register at `$FCD205`) so the OS driver can transmit a byte on Serial B.
+
+## Checkpoint N (M7 Task 4) — THE LISA PRINTS: Office System → Serial B → pages ⭐
+
+The characterized-but-stubbed SCC (Checkpoint N prep) is now the real thing, and
+the desktop that could do everything but print (Checkpoints K/L/M) **prints**.
+The live Office System's ImageWriter driver renders a LisaWrite document to an
+escape-code raster, transmits it out **channel B** (`$FCD205`), and the emulator
+reassembles it into pages. Full derivation + citations: `hardware-notes.md` §11.4
+(the driver transmit discipline + the Level-6 interrupt), §11.6 (PM persistence),
+§12 (the ImageWriter contract); this note records the trace facts.
+
+### The transmit path, cited (rsASM `XMIT`/`RSOUT`, §11.4)
+- `RSOUT` sends the **first** byte by polling RR0 bit 2 (Tx buffer empty) + the
+  handshake mask, then writing `$FCD205`.
+- Every byte **after** the first rides the **Level-6 Tx-empty interrupt**: the
+  `XMIT` ISR (rsASM:96-152) sends the next byte with Tx-int momentarily off, then
+  `RESTORE`s `WR1=$17` so /INT re-asserts for the following byte. The final ISR
+  clears the latch and sends no byte → no interrupt storm.
+- The Level-6 `RSINT` dispatch reads **RR2** on channel B (mover:824-848), masks
+  `$0E`, and dispatches on the modified vector — modeled explicitly (`rr2()`),
+  no longer served by the lucky-zero unknown-register fallback.
+
+### OBSERVED (live, M7 Task 4 release build; Rev H ROM + OS31-installed Widget)
+1. **Config, OBSERVED persistent.** Preferences → Connect Devices → Serial B →
+   ImageWriter → Set Aside writes PM + the disk snapshot. A **power cycle** (fresh
+   Machine, same write-through Widget) reloads the config at `INIT_CDS`/
+   `READ_PMEM` off the `PMSnapshot` — **zero emulator PM code** — and channel B is
+   now built and inited (contrast Checkpoint N prep, where the no-Preferences path
+   never inited channel B). Artifact `m7-reboot-serialb-persisted.png`.
+2. **The print, OBSERVED end-to-end.** LisaWrite ▸ Print ▸ OK. The first byte
+   polls out; then the Level-6 Tx-empty interrupt drives the rest. A single page
+   is **9229 bytes** on the wire → one 1bpp raster page → `m7-print-01.png`.
+   Before the Level-6 wiring the same print stalled at **one byte** (the ISR never
+   fired) — the load-bearing rework, structurally boot-inert (every gate reads
+   zero until the OS arms channel B; POST/menu FNV + all 13 full-env checkpoints
+   byte-identical).
+
+### The Task-2 refutation (strike-not-erase, recorded here for the journey)
+Checkpoint N prep and Task 2 both reasoned "no Level-6 IRQ by design — the polled
+path never blocks." That was **wrong about the driver's transmit model** (the
+driver polls only byte 1) and merely **harmless at boot** (channel B is never
+armed at boot). Annotated REFUTED in `task-2-report.md`, `hardware-notes §5`, and
+the `SCC8530` class doc: *"wrong in reasoning, harmless in effect at boot."* The
+boot inertness itself is unchanged and still proven by identical FNVs.
+
+### What Checkpoint N pins (`ROMPrinterTests`, env-gated)
+Boots the installed OS, scripts Preferences → Serial B → ImageWriter → Set Aside,
+**reboots** (a fresh Machine on the same write-through Widget), opens LisaWrite and
+prints — asserting Serial-B `transmittedCount > 1000`. That threshold (a
+deterministic 2048) is the robust proof of the whole chain: **config persistence
+across the reboot** *and* the **Level-6 transport** — without either it is 0 or 1
+byte. (An in-process *second* Machine stalls at a 2 KB boundary — a Musashi-
+singleton-state **hypothesis**, only the observable confirmed — so the two-boot
+test can't capture the full page in-process; the full-page raster is pinned
+robustly by `PrinterPipelineTests` + the headless `m7-print-01.png`.)
+
+## M7 milestone close (Task 5) — the standing frontier of the document
+
+**Checkpoint N is this document's current frontier statement.** M7 Task 5 was
+docs + regression only (this section, `docs/m7-demo.md`, the spec annotations, the
+README, and the full test matrix); it added no trace facts of its own.
+
+**The north star for M7 is met:** *the emulated Lisa prints* — configured through
+its own Preferences, persisting the config across a power cycle, streaming a real
+ImageWriter raster out Serial B (the register-level Z8530, Level-6 driven) to a
+PNG (`lisadbg`) or the macOS print panel (`LisaApp`). See `docs/m7-demo.md`.
+
+**OQ roster: none carried from the boot-trace journey.** As at M6 close, every
+open question raised on the boot trace (OQ1/OQ1′/OQ1″, OQ2, OQ3) remains ANSWERED
+and struck to its resolution; M7 opened no new boot-trace OQ (the SCC/PM work is a
+device frontier, not a domain/MMU question). What M7 leaves is a **roster of
+device follow-ups**, not open questions about the boot:
+
+- **Interlace vertical doubling** — the printed page is legible/correct but the
+  two-pass 144-vpi interlace lands adjacent half-bands on adjacent rows under the
+  interpreter's simplified vertical mapping (Task 3 decision 3). Pixel-true
+  geometry needs the external `PrVBand`/`PrHBand` asm. M8.
+- **Warm-reset + Widget-boot → boot error 42** — a **pre-existing** interaction
+  (the M7 diff touches no reset paths; FNVs identical), surfaced but not caused by
+  the printer work; the config→reboot flow uses a fresh power cycle. A real defect
+  for M8.
+- **2 KB second-Machine stall** — an in-process second Machine stalls at a 2 KB
+  buffer boundary; **hypothesis** = residual Musashi global state, only the
+  observable confirmed. Test-harness-only (production is single-Machine).
+- **`pm_DevConfig` (slot,chan,dev) triple** — observed only as a CDS-style
+  odd-lane table (`$FCC181…`, `$F8`-separated); precise decode not pinned (the
+  monitor's `$FCC180` read is CPU-domain-dependent). The round-trip is the
+  load-bearing proof.
+- **RR2 `011` (no-interrupt-pending) state** — unreachable on observed paths,
+  left unmodeled; `WR2`/`WR9` chip-wide-vs-per-channel modeling is local by
+  design (never diverges on observed paths).
+- **Receive-side serial** (LisaTerminal / LisaBug console) — future; the
+  transmit-side SCC built here is its foundation. **Daisy wheel / Canon** — future
+  via the `PrinterPort` seam.

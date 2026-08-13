@@ -906,6 +906,80 @@ extension LisaShellMusashiSuites {
     }
 }
 
+// MARK: - M7 Task 4: printer pipeline attached through EmulationController.
+// The interpreter+spooler are attached to bus.scc.channelB.printerPort on the
+// emulation thread; bytes written to the channel-B data register ($FCD205)
+// flow through the ImageWriter interpreter into the spooler, and a closed job
+// is republished via onPrintJob. ROM-gated only (needs a live Machine on the
+// controller's own thread); the byte stream is a synthetic one-page ImageWriter
+// band, NOT a real OS print -- that end-to-end path is ROMPrinterTests.
+
+extension LisaShellMusashiSuites {
+    @Suite(.enabled(if: romDir != nil, "Set LISAEMU_ROM_DIR to run the printer-pipeline controller test"))
+    struct EmulationControllerPrinterTests {
+        private func makeController() throws -> EmulationController {
+            try EmulationController(romDirectory: URL(fileURLWithPath: romDir!))
+        }
+
+        /// One inked ImageWriter band + form-feed = one page, using the same
+        /// `ESC G 0001 <col>` grammar `PrintJobSpoolerTests`/`PrinterPipelineTests`
+        /// document. Written a byte at a time to the channel-B **data** register
+        /// ($FCD205), exactly where the OS RS-232 driver's RSOUT pushes each
+        /// byte (hardware-notes.md §11.4) -- so this drives the real SCC decode
+        /// + PrinterPort forward, not the interpreter directly.
+        private func transmitOnePage(_ controller: EmulationController) {
+            let stream: [UInt8] = [27, UInt8(ascii: "G"), 0x30, 0x30, 0x30, 0x31, 0x80, 12]
+            controller.debugSync { m in
+                for b in stream { m.bus.write8(0x00FC_D205, b) }
+            }
+        }
+
+        /// A page transmitted on Serial B closes into a job (after the spooler's
+        /// 2 s host-time idle window) and is delivered through `onPrintJob` on
+        /// the controller's own thread. Proves the whole M7 attach: SCC channel-B
+        /// data write → PrinterPort → interpreter → spooler → onPrintJob.
+        @Test
+        func transmittedPageIsPublishedAsAPrintJob() throws {
+            let controller = try makeController()
+
+            let sem = DispatchSemaphore(value: 0)
+            let lock = NSLock()
+            var jobs: [[PrinterPage]] = []
+            controller.onPrintJob = { job in
+                lock.lock(); jobs.append(job); lock.unlock()
+                sem.signal()
+            }
+
+            // The loop must be running so it ticks the spooler's host-time
+            // idle clock; unthrottled so the tick cadence is brisk.
+            controller.throttled = false
+            controller.start()
+            transmitOnePage(controller)
+
+            // Idle window is 2 s host-time; allow generous slack for the
+            // real-time close.
+            let closed = sem.wait(timeout: .now() + 15) == .success
+            #expect(closed, "a transmitted page should close into a job within the idle window")
+            lock.lock(); let captured = jobs; lock.unlock()
+            #expect(captured.count == 1, "exactly one job for one quiet burst")
+            #expect(captured.first?.count == 1, "the job holds the single form-fed page")
+            #expect(captured.first?.first?.width == 1280,
+                    "the page is the default Portrait Hi-Res canvas (1280 dots wide)")
+        }
+
+        /// The channel-B `transmittedCount` counts every byte forwarded to the
+        /// PrinterPort -- a cheap proof the SCC is actually routing to our sink
+        /// (not the old 0xFF stub), independent of the idle-close timing above.
+        @Test
+        func channelBForwardsBytesToTheAttachedPrinterPort() throws {
+            let controller = try makeController()
+            transmitOnePage(controller)   // 8 bytes
+            let count = controller.debugSync { $0.bus.scc.channelB.transmittedCount }
+            #expect(count == 8, "all 8 transmitted bytes reached the printer sink; got \(count)")
+        }
+    }
+}
+
 // MARK: - M2 Task 7: ROM+DISK-gated integration test -- the M2 demo, made
 // automatic through the app-facing (EmulationController public) surface.
 

@@ -142,6 +142,18 @@ private final class Shared {
         set { lock.lock(); defer { lock.unlock() }; _onDiskError = newValue }
     }
 
+    /// M7 Task 4: closed print jobs, republished from the emulation thread
+    /// (where the `PrinterPipeline`'s spooler closes them) to the app. Same
+    /// lock-protected get/set + `@Sendable` shape as `onStatus`/`onDiskError`
+    /// above, for the identical cross-thread-reassignment reason (assigned by
+    /// the app at startup, read+invoked on the emulation thread inside the
+    /// spooler's `onJob`).
+    private var _onPrintJob: (@Sendable ([PrinterPage]) -> Void)?
+    var onPrintJob: (@Sendable ([PrinterPage]) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onPrintJob }
+        set { lock.lock(); defer { lock.unlock() }; _onPrintJob = newValue }
+    }
+
     /// Set only from the emulation thread's startup failure path (before
     /// `startupGate.signal()`), read only from `EmulationController.init`
     /// after `startupGate.wait()` returns -- the semaphore itself is the
@@ -223,6 +235,20 @@ public final class EmulationController {
     public var onDiskError: (@Sendable (String) -> Void)? {
         get { shared.onDiskError }
         set { shared.onDiskError = newValue }
+    }
+
+    /// M7 Task 4: fires ON THE EMULATION THREAD (same contract as
+    /// `onStatus`/`onFrame` — the app hops threads itself) once per **closed
+    /// print job**, with that job's pages in feed order. A job is the run of
+    /// pages the OS's ImageWriter driver emitted on Serial B with no more than
+    /// the spooler's idle window (2 s host-time) between them; there is no
+    /// form-feed byte, so "the printer went quiet" is the only end-of-job
+    /// signal (docs/hardware-notes.md §12.5). `LisaApp` presents each job in
+    /// an `NSPrintOperation`; `lisadbg --printer-dir` writes each page to a
+    /// PNG. Never fires for a still-open job.
+    public var onPrintJob: (@Sendable ([PrinterPage]) -> Void)? {
+        get { shared.onPrintJob }
+        set { shared.onPrintJob = newValue }
     }
 
     /// Mailbox-set (see `Mailbox.throttledSnapshot`'s doc comment): the
@@ -427,6 +453,17 @@ public final class EmulationController {
             shutdownGate.signal()
             return
         }
+
+        // M7 Task 4: the printer pipeline lives on THIS thread (it owns the
+        // SCC). Attach its `PrinterPort` to channel B, republish each closed
+        // job through `shared.onPrintJob` (read fresh under its lock, so a
+        // late app assignment still wins), and tick it once per loop iteration
+        // below with host wall-clock time. The SCC keeps the port across
+        // `machine.reset()` (SCC8530.reset), so this survives a warm reset.
+        let printer = PrinterPipeline()
+        machine.bus.scc.channelB.printerPort = printer.printerPort
+        printer.onJob = { job in shared.onPrintJob?(job) }
+
         startupGate.signal()
 
         var running = false
@@ -531,10 +568,19 @@ public final class EmulationController {
                 case .powerButton:
                     machine.bus.cops.pressPowerButton()
                 case .shutdown:
+                    // Flush any inked-but-unclosed page + open job so a print
+                    // in flight at quit isn't silently lost.
+                    printer.flush()
                     shutdownGate.signal()
                     return
                 }
             }
+
+            // M7 Task 4: advance the printer's idle clock every iteration with
+            // host wall-clock time (the idle window is a real-time gap, not an
+            // emulated-cycle one — §12.5). Runs in every state: even while
+            // paused/halted, a job that just went quiet must still close.
+            printer.tick(now: ProcessInfo.processInfo.systemUptime)
 
             guard running, !machine.halted, machine.powerState == .on else {
                 // Avoid a hot spin while paused/halted/powered-off; mailbox is

@@ -286,7 +286,13 @@ Checkpoint-F stall's root cause. `$C031` now returns `$88` (Lisa 2/10); the
 ROM re-takes the bit7-set Pepsi contrast branch, which is framebuffer-neutral
 — every ROM anchor re-verified green. See "Checkpoint G (round 4)".)**
 
-### `$D241` — unidentified controller, passes the stub (not blocking)
+### `$D241` — ~~unidentified controller~~ CONFIRMED the RS-232 SCC (M7 Task 1), passes the stub (not blocking)
+
+**M7 Task 1 update:** confirmed to be the built-in **Z8530 SCC** reached through
+the `$FCD241` channel-B-control **mirror** (`= RSBASE $FCD201 | $40`; higher
+address bits undecoded). The probe is a bus-error-guarded **presence** test — the
+`0xFF` stub passes by ACKing the cycle (no bus error), and no register value is
+compared. See "Checkpoint N prep" below and docs/hardware-notes.md §11.5.
 
 `$FCD241` is probed at `$FE10D0`: a short command sequence is written from a
 table (`move.b (A2)+,(A0)`), and on failure the ROM loads boot **error code
@@ -2935,3 +2941,53 @@ deferrals**, not unresolved trace boundaries.
   divergence, session-overlay retention by disk identity, and a synthetic
   double-click detector (the OS's time-based detector does not fire on injected
   click pairs).
+
+## Checkpoint N prep (M7 Task 1) — the serial frontier ⭐
+
+M7 ("The Printer") begins at the SCC. This is not a stalled boundary — the boot
+reaches the desktop with the SCC fully stubbed — but the **contract** for making
+Serial B actually move bytes is now pinned. Full derivation + citations:
+docs/hardware-notes.md **§11 "SCC / Serial B"** and task-1-report.md; this note
+records only the trace facts.
+
+**RSBASE chased.** `RSBASE = IOMMU + $0D201 = $FCD201` (source-mover:46). The
+four Z8530 registers sit at odd addresses stride 2: `$FCD201` (B ctrl),
+`$FCD203` (A ctrl), `$FCD205` (B data), `$FCD207` (A data); higher address bits
+are undecoded, so `$FCD241` is a channel-B-control **mirror** (`$FCD201 | $40`).
+
+**The `$D241` probe is the SCC — CONFIRMED, upgraded from "candidate".** The
+`$FE10D0` probe (write table `$02,$00,$09,$C0,$05,$82` = WR2/WR9-force-reset/WR5,
+error `$37/$38`, guard `$FE100C`) documented earlier in this file is now
+confirmed to be the built-in Z8530 accessed through the `$FCD241` mirror. It is a
+**bus-error-guarded presence probe**: the sole failure path is a bus *timeout*
+(device absent). The `0xFF` stub ACKs the cycle → no bus error → no `$37/$38` →
+POST proceeds. The write values and the two RR0 reads are **never compared**, so
+`0xFF` is sufficient forever for POST. See §11.5.
+
+**OBSERVED (live, M7 Task 1 release build, Rev H ROM + OS31-installed Widget →
+desktop; a raised `ioTraceLimit` scratch probe, reverted):**
+- POST touches the SCC exactly once, `$FCD241` at cyc ≈ 692674 (8 accesses:
+  `R $FF`, `W $02,$00,$09,$C0,$05,$82`, `R $FF`) — matching the earlier
+  `$FE10D0` static read.
+- The OS then runs the RS-232 `dinit` against **channel A** (`$FCD203`) at
+  cyc ≈ 53.1M: `WR9=$8A, WR4=$44, WR11=$50, WR14/12/13/14` (baud TC 11 ≈ 9600),
+  `WR10=$00, WR3=$C1, WR5=$EA, WR15=$00, WR1=$00` — the §11.2-11.3 discipline
+  exactly.
+- **Channel B (`$FCD201`) is never initialized** on the no-Preferences path: PM
+  is empty, so `INIT_CDS` builds no Serial-B device (196 PM reads, all `$00`, no
+  PM writes). 29 SCC accesses total to the desktop, all absorbed by the `0xFF`
+  stub with no fault.
+
+**PM (parameter memory) lives in the disk-controller shared RAM**, not NVRAM:
+`PMEMAD = $FCC180` (source-mover:42), written to odd lanes via `MOVEP.L`
+(mover:617-633). It maps into our FloppyController window, so PM writes are
+backed — but `Machine.reset()` → `floppy.reset()` **zeroes** it
+(FloppyController:495-496), so PM does not survive a power-on today.
+Cross-power-cycle persistence on real hardware is the boot-volume **snapshot**
+(`Write_PMem` = `Paramem_Write` + `PMSnapshot`, PMEM:156-157; reloaded at
+`INIT_CDS`/`READ_PMEM`, CD:1758) — and our Widget write-through already carries
+that path. Verdict + cost estimate: §11.6.
+
+**Standing frontier at M7 Task 1 close.** The SCC is *characterized* but still a
+`0xFF` stub. Task 2's job is the real Z8530 (RR0 Tx-empty/CTS, the WR file, the
+data register at `$FCD205`) so the OS driver can transmit a byte on Serial B.

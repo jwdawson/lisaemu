@@ -1652,7 +1652,12 @@ zone/track/sector/side:
   boot ROM statically reads it for POST-level memory sizing, but the whole
   containing routine scored zero hits in the same live single-step
   reachability check; unstubbed (`0xFF`) either way, not confirmed blocking.
-- RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.
+- ~~RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.~~
+  **CHASED (M7 Task 1): `RSBASE = IOMMU + $0D201 = $FCD201`** (source-mover:46);
+  full Z8530 register map, driver init/transmit discipline, the ROM POST
+  `$FCD241`-mirror probe, and the parameter-memory persistence answer are now in
+  §11 "SCC / Serial B". The `$FCD241` ROM probe is a bus-error-guarded presence
+  test that the `0xFF` stub satisfies by ACKing the cycle (§11.5).
 - `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
   site found (bracketing a RAM-sizing/checksum routine, result discarded),
   purpose not identified. See §2 "Vertical Retrace" above.
@@ -2126,3 +2131,232 @@ Decided for the Task-2 Widget HLE (reasoning inline):
   correct model; flush granularity is per-block to bound data loss on an
   abrupt exit. (A future optimization may batch flushes, but per-block is the
   safe default.)
+
+## 11. SCC / Serial B (RS-232) — the Z8530 contract (M7 Task 1)
+
+The Lisa's two RS-232 ports (A and B) are a single Zilog **Z8530 SCC** (dual
+channel). The built-in SCC is interrupt **Level 6** (§5 "Interrupt Levels":
+`rsints = $600`; RSINT handler mover:827-849, INITRAP:136-137). This section is
+the driver contract Task 2 codes the real device against. Constants are
+SOURCE-DERIVED from `/Users/jdawson/Development/Lisa_Source/LISA_OS/` unless a
+line is tagged **OBSERVED** (M7 Task 1 live trace: Rev H ROM + OS31-installed
+Widget boot to desktop, release build; see docs/rom-trace-notes.md "Checkpoint N
+prep").
+
+### 11.1 RSBASE and the register-address map — SOURCE-DERIVED + OBSERVED
+
+- `IOMMU = $FC0000` (source-PASCALDEFS.TEXT.unix.txt:47, source-SERNUM.TEXT.unix.txt:15).
+- **`RSBASE = IOMMU + $0D201 = $FCD201`** (source-mover.text.unix.txt:46), with
+  `PORTB = 0`, `CTRL = 0` (source-mover.text.unix.txt:47-48). This strikes the
+  Known-Gaps "RSBASE not chased" record below.
+- The four SCC registers are at **odd** byte addresses, stride 2 — the built-in
+  port-control addresses the OS computes are `iospacemmu*$20000 + $0D203` for
+  channel A control and `portacontrol − 2` for channel B control
+  (source-rs232.text.unix.txt:516-523; `iospacemmu*$20000 = IOMMU`,
+  i.e. `iospacemmu = $7E`). The data register is control **+4** (`DATA .EQU 4`,
+  source-rsASM.TEXT.unix.txt:24):
+
+  | Address     | Register             | Access                          |
+  |-------------|----------------------|---------------------------------|
+  | `$FCD201`   | channel **B** control | write reg#/value; read = RRn    |
+  | `$FCD203`   | channel **A** control | "                               |
+  | `$FCD205`   | channel **B** data    | Tx byte out / Rx byte in        |
+  | `$FCD207`   | channel **A** data    | "                               |
+
+  Address bit 1 selects channel (A = bit1 set, i.e. +2), bit 2 selects
+  data (+4); higher address bits are **not decoded** — see the `$FCD241` ROM
+  mirror in §11.5. **Serial B (the printer port) control = `$FCD201`,
+  data = `$FCD205`.**
+- Expansion-card serial ports (not the built-in) use the same scheme at slot
+  bases `iospacemmu*$20000 + {$2003,$6003,$A003}` (control A) / `{$2001,$6001,$A001}`
+  (control B) for slots 0/1/2 (source-rs232.text.unix.txt:503-513,
+  SOURCE-SERCARD.TEXT.unix.txt:131-133). SOURCE-SERCARD is only the per-slot
+  interrupt **dispatcher** (reads WR2/RR2 for the vector); the built-in RS-232
+  byte engine is `source-rs232.text` (Pascal) + `source-rsASM` (assembly).
+
+### 11.2 Register-access discipline — SOURCE-DERIVED
+
+- **Write a WR register** — `WR_SCC(regno, val)` (source-rsASM.TEXT.unix.txt:528-566):
+  `INTSOFF` (mask RS ints) → write `regno` byte to the control address →
+  a NOP-equivalent delay (a memory access) → write `val` byte to the same
+  control address → `INTSON`. Register-pointer-then-value, both to the one
+  control port.
+- **Read an RR register**: write the register number to control, then read the
+  control address (e.g. RR1 error status, source-rsASM.TEXT.unix.txt:160-166).
+  A bare read of control (no preceding select) returns **RR0** (the default
+  pointer), which is how RSOUT and RESTORE sample status
+  (source-rsASM.TEXT.unix.txt:429, 626).
+- **Data**: `MOVE.B char,DATA(A0)` writes the Tx byte to control+4
+  (source-rsASM.TEXT.unix.txt:489); `MOVE.B DATA(A0),Dn` reads the Rx byte
+  (source-rsASM.TEXT.unix.txt:167).
+
+### 11.3 Channel-B init sequence (`dinit`) — SOURCE-DERIVED
+
+Order the OS driver programs when a Serial-B device is opened
+(source-rs232.text.unix.txt:538-580, then RESTORE at :642; baud via the internal
+`dcontrol` dcode 5 at :558-566 / :740-751):
+
+1. Dummy read of control (resets the register pointer to RR0/WR0) (:544).
+2. `WR9 = $4A` — reset channel B (:545). (Channel A uses `$8A`; a full-chip
+   reset is `WR9 = $C0`, which is what the ROM POST issues — §11.5.)
+3. `WR4 = $44` — async, ×16 clock, 1 stop bit, parity off (:548).
+4. `WR11 = $D0` — clock source (channel B = oscillator), then a ~1000-iter wait
+   for the oscillator to start (:554-555). (Channel A = `$50`, baud-rate
+   generator, :551.)
+5. **Baud** (dcode 5, :740-751): `WR14 = $00` (BRG off) → `WR12 = TC_lo` →
+   `WR13 = TC_hi` → `WR14 = openwr14` (channel B `= 1`, i.e. BRG on from the
+   oscillator). The time constant is `TC = (temp DIV baud) − 2` with
+   **`temp = 115200` for channel B** (125000 for channel A). Default at init is
+   **1200 baud** (:564) → `TC = 94 = $005E`.
+6. `WR10 = $00` — NRZ encoding (:568).
+7. `WR3 = $C1` — Rx 8 bits/char, Rx enable (:570).
+8. `WR5` — Tx enable + DTR (channel-B byte from :542/:572; a later `dcontrol`
+   parity call sets `$A8` for B, "port B always has RTS off", :679).
+9. `WR15 = $A0` — enable external/status interrupts on **Break** and **CTS**
+   change (channel B; channel A = `$90`, Break + Sync) (:577).
+10. `controlreg := $10` — reset ext/status latch (:580).
+11. `RESTORE` writes `WR1 = $17` — enable Rx / Tx / status interrupts on the
+    channel (:642, source-rsASM.TEXT.unix.txt:600-647).
+
+### 11.4 Transmit-a-byte + "printer connected and ready" — SOURCE-DERIVED
+
+`RSOUT`/`BYTEO` sends one byte (source-rsASM.TEXT.unix.txt:426-525):
+
+1. Read **RR0** (bare control read) → status (:429).
+2. `BTST #2` — **RR0 bit 2 = Tx Buffer Empty**. If clear, return (can't send
+   yet) (:430-431).
+3. If hardware handshake (`xmt_hs = hw_hs`): require `(RR0 & xmtrr0) == xmtrr0`
+   **and** `(~RR0 & xmtzrr0) == xmtzrr0` (:448-457). For **channel B**
+   `xmtrr0 = 0`, `xmtzrr0 = $20` (source-rs232.text.unix.txt:540, :720) — i.e.
+   **RR0 bit 5 (CTS) must read 0** for transmit to proceed (the OS comment calls
+   it "DSR'"; on the DB-25 the modem-control input the port gates on).
+4. Write the byte to the **data** register `$FCD205` (:489); set `AWAIT_TX = $04`
+   (:491).
+5. Completion arrives as a **Level-6 Tx-empty interrupt** (RSINT, mover:827-849
+   → rsASM DRIVER `XMIT`): `WR0 = $29` (reset Tx-int-pending + point WR1) →
+   `WR1 = 0` → `WR0 = $38` (reset IUS) (source-rsASM.TEXT.unix.txt:98-103).
+
+So the driver's notion of **"connected and ready to accept a byte"** is:
+**RR0 bit 2 (Tx buffer empty) set**, and — under hardware handshake — **RR0 bit 5
+(CTS) asserted**. It learns of CTS/DCD/Break transitions via the Level-6
+external/status (modem-change) interrupt enabled by `WR15 = $A0`; the handler
+re-reads RR0 for modem status (rsASM.TEXT.unix.txt:295-320). RR0 bit assignments
+the driver relies on: bit0 = Rx char available, bit2 = Tx buffer empty,
+bit3 = DCD, bit5 = CTS. Input errors are read from **RR1** (mask `$70` =
+framing/overrun/parity, source-rsASM.TEXT.unix.txt:160-166). Software XON/XOFF
+(`$11`/`$13`) is an alternate handshake selected by `dcontrol` dcode 3
+(source-rs232.text.unix.txt:727-731); the printer's exact handshake (DSR-hardware
+vs XON/XOFF vs CR/LF-delay) is a Preferences/`dcontrol` choice (dcodes 2/3/4,
+:714-738), not fixed in the driver.
+
+The higher-level printer path (`LIBS/LIBPR`) is a QuickDraw grafPort
+(`LibPr-ciprint.text:190-191 OpenPort`); its byte output reaches Serial B through
+the OS device manager → the RS-232 CD device for the built-in SCC (slot 10,
+below), i.e. this same driver — not a second register path.
+
+### 11.5 ROM POST SCC probe, and why the `0xFF` stub passes — OBSERVED
+
+- The Rev H boot ROM touches the SCC exactly once during POST, at **`$FE10D0`**,
+  via the **mirror `$FCD241`** (`= $FCD201 | $40`; bits 0-2 identical to
+  channel-B control, bit 6 undecoded → same register). OBSERVED live at
+  cyc ≈ 692674: `R $FCD241=$FF`, then the table-driven write sequence
+  **`$02,$00,$09,$C0,$05,$82`** (`move.b (A2)+,(A0)`), then `R $FCD241=$FF`.
+  Decoded: `WR2=$00` (int vector), `WR9=$C0` (**force hardware reset**, both
+  channels), `WR5=$82` (DTR + RTS asserted). It is **write-mostly**; the two RR0
+  reads are **not value-compared**.
+- The probe is **bus-error-guarded**: the ROM installs a bus-error handler at
+  `$FE100C` before the access; the *only* failure path is a **bus timeout**
+  (device absent), which loads boot error `$37`/`$38` and sets a soft-fail bit in
+  D7, then continues POST (docs/rom-trace-notes.md:289-299, 722-732 —
+  `cmpa.l #$fcd241,A0` at `$FE10EE`). POST is **non-fatal** on failure and never
+  compares register values.
+- **Why `0xFF` passes:** "present" means "the address ACKs the cycle without a
+  bus error." Our dispatcher answers `$FCD241` (like all of `$FCD2xx`) with the
+  generic unmapped-I/O default `0xFF` (IODispatcher.swift:316-332 — there is **no
+  dedicated SCC case**; the M1b "$D241 candidate SCC / 0xFF stub passes" note is
+  hereby confirmed, not merely candidate). A normal `$FF` read is a completed bus
+  cycle, so no bus error fires, no `$37/$38`, no fail bit — the SCC reads as
+  present and POST proceeds. **What the real device must return to keep POST
+  passing: nothing specific — merely ACK the bus cycles.** (Value semantics
+  matter only to the OS driver and to Task 2's transmit path, not to POST.)
+- **OBSERVED boot-to-desktop:** the OS then runs the §11.3 `dinit` against
+  **channel A** (`$FCD203`) at cyc ≈ 53.1M — full WR sequence
+  `WR9=$8A, WR4=$44, WR11=$50, WR14=$00, WR12=$0B/WR13=$00` (TC 11 ⇒ ≈9600 baud,
+  channel-A console default), `WR14=$03, WR10=$00, WR3=$C1, WR5=$EA, WR15=$00,
+  WR1=$00` — exactly the register discipline of §11.2-11.3. **Channel B
+  (`$FCD201`) is never initialized on the no-Preferences boot path** (no
+  Serial-B device is configured — see §11.6). 29 SCC accesses total to the
+  desktop; all absorbed by the `0xFF` stub with no fault, no halt. The stub is
+  sufficient for boot; a real Z8530 is only needed to actually *move bytes*
+  (Task 2).
+
+### 11.6 Parameter memory (PM) — where it lives, and persistence — SOURCE-DERIVED + OBSERVED
+
+**Where PM physically lives (SOURCE-DERIVED).** The 64 bytes of parameter memory
+live in the **disk-controller (6504 / Sony-IOB) shared static RAM**, *not* in a
+battery-backed NVRAM:
+
+- `PMEMAD = TWIGBAS + $180 = IOMMU + $0C000 + $180 = $FCC180`
+  (source-mover.text.unix.txt:42, :17).
+- `W_PARAM_MEM` writes the 64 bytes with `MOVEP.L D0,1(A2)` stepping A2 by 8 —
+  i.e. to the **odd** byte lanes `$FCC181, $FCC183, … $FCC1FF`
+  (source-mover.text.unix.txt:617-633), the classic 6504-shared-RAM byte layout.
+  It only writes when the disk is idle (source-twiggy.text.unix.txt:226-264,
+  gated on the `$FCD801` diag bit).
+- PM layout (source-PMEM.TEXT.unix.txt:29-49): version/timestamp, screen/beep/
+  mouse prefs, `pm_cdCount` (byte 9), **`pm_DevConfig` (bytes 10-59)** — the
+  device-connection table the Preferences serial-B printer entry would occupy —
+  and a checksum (bytes 62-63). The built-in SCC is device **slot 10, chan 0**
+  (source-PMEM.TEXT.unix.txt:267-276); built-in devices are *never* written into
+  the configurable region (:445), so a Serial-B **printer** entry is a
+  configurable `pm_DevConfig` record keyed to slot 10.
+
+**Persistence on real hardware is the disk snapshot, not NVRAM (SOURCE-DERIVED).**
+`Write_PMem` does **two** things: `Paramem_Write` (→ the volatile `$FCC181`
+shared RAM) **and** `PMSnapshot` (→ a copy on the boot volume)
+(source-PMEM.TEXT.unix.txt:156-157). At boot, `INIT_CDS` calls `READ_PMEM`
+(SOURCE-CD.TEXT.unix.txt:1758) and `pmem_state` reconciles the RAM copy against
+the disk snapshot (`PMg_SSg / PMb_SSg / …`, source-PMEM.TEXT.unix.txt:207-214).
+The shared RAM survives a warm reset but is lost on power-off; **true
+cross-power-cycle persistence is the boot-volume snapshot.**
+
+**Our machine today (OBSERVED).**
+- `$FCC180` falls inside the FloppyController's `$FCC000-$FCC7FF` shared-RAM
+  window, so PM writes **are** backed (IODispatcher.swift:315/365 → `floppy.window`).
+  Verified: writing `$A0…` to `$FCC181,$183,…` reads back; at power-on the region
+  reads `$00` (window zero-init, FloppyController.swift:269).
+- **`reset()` wipes PM.** `Machine.reset()` calls `bus.floppy.reset()`
+  (Machine.swift:163), which **zeroes the whole window**
+  (FloppyController.swift:495-496). Verified: `$A0…` → all `$00` after `reset()`.
+  A soft power-**off** (`powerState = .off` via the COPS power-off handler,
+  Machine.swift:105-107) does **not** call `reset()`, so PM survives *in memory*
+  while powered off — but the next power-**on** is a `reset()`, so **PM does NOT
+  survive a full off→on cycle** on our machine.
+- On the live boot, `INIT_CDS` read PM **196 times, all `$00`** (empty/zeroed),
+  and made **no** PM writes — so the OS built only the built-in devices and
+  never a Serial-B printer CD. This is exactly why channel B is never inited
+  (§11.5): no PM config ⇒ no Serial-B device ⇒ no `dinit`.
+
+**Would a Preferences Serial-B printer config survive? — VERDICT.**
+- Saving it triggers `Write_PMem` → `Paramem_Write` (lands in `floppy.window`,
+  volatile) **+** `PMSnapshot` (a **disk** write). Our disk writes are
+  **write-through-persistent** to the backing file (WidgetImage.swift:20-24, :176),
+  so the snapshot path *already works in principle*. If the same Widget image is
+  reused across boots, `READ_PMEM`/`INIT_CDS` would reload the config and rebuild
+  the Serial-B CD — with `pmem_state` taking the `PMb_SSg` (RAM-bad, snapshot-good)
+  fallback, which is faithful to a real Lisa after power loss.
+- **Two gaps for M7 in practice:** (1) our boot harness runs from a **fresh /tmp
+  copy** each time, so no snapshot survives between runs by construction; (2) the
+  config also needs Task 2's real SCC (so the port opens) and the printer CD to
+  be creatable.
+- **Cost estimate to make PM persist:**
+  - *Cheapest / most faithful (≈0 new code):* reuse one Widget image across boots
+    and let the existing `PMSnapshot`/`READ_PMEM` disk path do the work — a
+    harness/policy choice, already functional via write-through.
+  - *Model battery-like RAM survival (small, ~20-40 lines):* carve the 64 PM bytes
+    (`$180-$1FF`, odd lanes) out of `FloppyController.reset()`'s blanket zero, and
+    optionally load/save that 64-byte slice to a host file at power-on/off so it
+    survives an emulator restart without a disk round-trip.
+  - *Full fidelity (medium):* also model the `pmem_state` checksum/snapshot
+    reconciliation so RAM-vs-disk divergence behaves exactly as `SOURCE-PMEM`
+    describes. Not needed for a working printer config; only for edge-case parity.

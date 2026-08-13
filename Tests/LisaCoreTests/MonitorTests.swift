@@ -46,6 +46,8 @@ extension MusashiSuites {
             #expect(Monitor.parse("insert /tmp/LisaWrite.dc42") == .insertFloppy("/tmp/LisaWrite.dc42"))
             #expect(Monitor.parse("insert") == nil, "insert requires a path")
             #expect(Monitor.parse("eject") == .ejectFloppy)
+            // M7 Task 4: printer flush/status.
+            #expect(Monitor.parse("printer") == .printer)
             // M6 Task 1: soft-power button.
             #expect(Monitor.parse("power") == .power)
             #expect(Monitor.parse("q") == .quit)

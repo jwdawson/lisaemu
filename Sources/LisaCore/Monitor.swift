@@ -63,6 +63,12 @@ public struct Monitor {
         /// `eject` (M6 Task 3) -- eject the current floppy (`floppy.eject()`),
         /// the same call the app's `ejectFloppy` mailbox makes.
         case ejectFloppy
+        /// `printer` (M7 Task 4) -- flush any inked page + open print job to
+        /// the `--printer-dir` PNG sink and report the pipeline's byte/job
+        /// counters. A no-op-but-status if `--printer-dir` wasn't given. The
+        /// pipeline itself lives in lisadbg (LisaShell), not `Monitor`; this
+        /// case is just the parsed signal, like every other command here.
+        case printer
         case quit, help
     }
 
@@ -142,6 +148,7 @@ public struct Monitor {
             guard parts.count >= 2 else { return nil }
             return .insertFloppy(parts[1...].joined(separator: " "))
         case "eject": return .ejectFloppy
+        case "printer": return .printer
         case "q": return .quit
         case "?": return .help
         default:  return nil

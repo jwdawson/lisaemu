@@ -2,6 +2,7 @@ import CoreGraphics
 import Foundation
 import ImageIO
 import LisaCore
+import LisaShell
 import UniformTypeIdentifiers
 
 func fail(_ message: String) -> Never {
@@ -176,6 +177,84 @@ func writeScreenshotPNG(_ framebuffer: [UInt8], to path: String) throws {
     CGImageDestinationAddImage(dest, cgImage, nil)
     guard CGImageDestinationFinalize(dest) else {
         throw ScreenshotError.finalizeFailed
+    }
+}
+
+/// Renders one `PrinterPage` (1 bit/pixel, MSB-first, `rowBytes` per row,
+/// **set bit = ink = black**, docs/hardware-notes.md §12.4) to a grayscale PNG
+/// at `path`. Same polarity handling as `writeScreenshotPNG`: invert the bits
+/// up front and rely on CGImage's *default* 1bpp DeviceGray decode (component
+/// 0 → black), because `CGImageDestinationFinalize` does not honor a custom
+/// `decode` array when encoding PNG (see `writeScreenshotPNG`'s doc comment for
+/// the negative-image regression that established this). Unlike the fixed
+/// 720×364 screen, a page's dimensions come from the `PrinterPage` (e.g.
+/// 1280×1584 for Portrait Hi-Res).
+func writePrinterPagePNG(_ page: PrinterPage, to path: String) throws {
+    let inverted = page.bits.map { ~$0 }
+    guard let provider = CGDataProvider(data: Data(inverted) as CFData) else {
+        throw ScreenshotError.imageCreationFailed
+    }
+    guard let cgImage = CGImage(
+        width: page.width,
+        height: page.height,
+        bitsPerComponent: 1,
+        bitsPerPixel: 1,
+        bytesPerRow: page.rowBytes,
+        space: CGColorSpaceCreateDeviceGray(),
+        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+        provider: provider,
+        decode: nil,
+        shouldInterpolate: false,
+        intent: .defaultIntent
+    ) else {
+        throw ScreenshotError.imageCreationFailed
+    }
+    guard let dest = CGImageDestinationCreateWithURL(
+        URL(fileURLWithPath: path) as CFURL, UTType.png.identifier as CFString, 1, nil
+    ) else {
+        throw ScreenshotError.destinationCreationFailed
+    }
+    CGImageDestinationAddImage(dest, cgImage, nil)
+    guard CGImageDestinationFinalize(dest) else {
+        throw ScreenshotError.finalizeFailed
+    }
+}
+
+/// The `--printer-dir` PNG sink: receives each closed print job (from the
+/// `PrinterPipeline`'s spooler) and writes its pages as
+/// `job-<n>-page-<m>.png` under `dir`, tracking cumulative counters for the
+/// `printer` status command. `@unchecked Sendable` because
+/// `PrintJobSpooler.onJob` is `@Sendable`; in lisadbg the whole pipeline is
+/// driven from the single interactive thread, so the counters are never
+/// touched concurrently (the box exists only to satisfy the closure-capture
+/// contract, matching `FrameCoalescer`'s rationale in AppModel).
+final class PrinterSink: @unchecked Sendable {
+    let dir: String
+    private(set) var jobsWritten = 0
+    private(set) var pagesWritten = 0
+    private(set) var lastPaths: [String] = []
+
+    init(dir: String) {
+        self.dir = dir
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+    }
+
+    func write(_ job: [PrinterPage]) {
+        let jobIndex = jobsWritten + 1
+        var paths: [String] = []
+        for (i, page) in job.enumerated() {
+            let path = "\(dir)/job-\(jobIndex)-page-\(i + 1).png"
+            do {
+                try writePrinterPagePNG(page, to: path)
+                pagesWritten += 1
+                paths.append(path)
+            } catch {
+                FileHandle.standardError.write("lisadbg: printer PNG write failed for \(path): \(error)\n".data(using: .utf8) ?? Data())
+            }
+        }
+        jobsWritten += 1
+        lastPaths = paths
+        print("      printer: wrote job \(jobIndex) — \(job.count) page(s) -> \(paths.joined(separator: ", "))")
     }
 }
 
@@ -446,8 +525,20 @@ if let widgetFlagIndex = args.firstIndex(of: "--widget") {
     args.removeSubrange(widgetFlagIndex...(widgetFlagIndex + 1))
 }
 
+// `--printer-dir <path>` (M7 Task 4): attach the ImageWriter print pipeline to
+// Serial B and write each closed print job's pages as PNGs into <path>.
+// Position-independent, same as `--disk`/`--widget`.
+var printerDir: String?
+if let printerFlagIndex = args.firstIndex(of: "--printer-dir") {
+    guard printerFlagIndex + 1 < args.count else {
+        fail("--printer-dir requires a path argument")
+    }
+    printerDir = args[printerFlagIndex + 1]
+    args.removeSubrange(printerFlagIndex...(printerFlagIndex + 1))
+}
+
 guard args.count >= 2 else {
-    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>] [--widget <path.widget>]")
+    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>] [--widget <path.widget>] [--printer-dir <path>]")
 }
 
 let machine = Machine()
@@ -506,6 +597,23 @@ if let widgetPath {
     }
 }
 
+// M7 Task 4: the printer pipeline. When `--printer-dir` is given, attach the
+// ImageWriter interpreter + spooler to Serial B (bus.scc.channelB.printerPort)
+// and route closed jobs to a PNG sink. The pipeline is ticked once per command
+// (host wall-clock time) so an idle job auto-closes; the `printer` command
+// force-flushes for a deterministic capture at end of a scripted print.
+var printerPipeline: PrinterPipeline?
+var printerSink: PrinterSink?
+if let printerDir {
+    let pipeline = PrinterPipeline()
+    let sink = PrinterSink(dir: printerDir)
+    pipeline.onJob = { [sink] job in sink.write(job) }
+    machine.bus.scc.channelB.printerPort = pipeline.printerPort
+    printerPipeline = pipeline
+    printerSink = sink
+    print("lisadbg — printer pipeline attached to Serial B; jobs -> PNGs in \(printerDir)")
+}
+
 // Linkmap symbol overlay (M4 Task 2) -- `LISAEMU_LINKMAP_DIR` or the
 // default `~/Development/Lisa_Source/LISA_OS/Linkmaps 3.0/`
 // (`LinkmapSymbols.defaultDirectory`). Never bundled/committed: this is a
@@ -526,6 +634,10 @@ do {
 
 print(monitor.registerDump())
 while let line = readLine(strippingNewline: true) {
+    // M7 Task 4: advance the printer's idle clock before each command with
+    // host wall-clock time, so a job that went quiet during a preceding
+    // run/click closes on its own; `printer` also force-flushes below.
+    printerPipeline?.tick(now: ProcessInfo.processInfo.systemUptime)
     switch Monitor.parse(line) {
     case .regs:
         print(monitor.registerDump())
@@ -662,10 +774,23 @@ while let line = readLine(strippingNewline: true) {
         // the OS discovers the stale presence on its next disk access.
         machine.bus.floppy.eject()
         print("      ejected floppy")
+    case .printer:
+        guard let pipeline = printerPipeline, let sink = printerSink else {
+            print("      printer: no pipeline attached — start lisadbg with --printer-dir <path>")
+            break
+        }
+        // Force-close any inked page + open job to the PNG sink (deterministic
+        // end-of-print capture), then report the pipeline counters.
+        pipeline.flush()
+        let bytes = machine.bus.scc.channelB.transmittedCount
+        print("      printer: Serial-B bytes=\(bytes) jobsWritten=\(sink.jobsWritten) pagesWritten=\(sink.pagesWritten) dir=\(sink.dir)")
+        if !sink.lastPaths.isEmpty {
+            print("      printer: last job PNGs -> \(sink.lastPaths.joined(separator: ", "))")
+        }
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

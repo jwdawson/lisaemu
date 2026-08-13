@@ -6,14 +6,18 @@ Computer History Museum in 2023.
 
 **Current status:** the real Rev H boot ROM completes its power-on self-test and boots
 the Lisa Office System 3.1 the whole way to a **working machine you can use** — the full
-daily loop runs end to end. The Office System installs from its floppies onto a blank
-Widget hard-disk image, boots clean off that hard disk to the **Office System desktop**,
-and there responds to a **live mouse, keyboard, and clock**: real Filer work (open the
-disk, tear off and keyboard-rename a folder), a LisaWrite tool installed from its diskette
-and **typed into**, and a **soft-power shutdown** through the OS's own path (which leaves
-the next boot free of the dirty-volume dialog). The clock is the emulated COPS real-time
-clock, faithful to the Lisa's 4-bit year field — it rolls every 16 years, so a 2026 host
-clock is displayed by the OS as 1994.
+daily loop runs end to end, and **the Lisa prints**. The Office System installs from its
+floppies onto a blank Widget hard-disk image, boots clean off that hard disk to the
+**Office System desktop**, and there responds to a **live mouse, keyboard, and clock**:
+real Filer work (open the disk, tear off and keyboard-rename a folder), a LisaWrite tool
+installed from its diskette and **typed into**, and a **soft-power shutdown** through the
+OS's own path (which leaves the next boot free of the dirty-volume dialog). The clock is
+the emulated COPS real-time clock, faithful to the Lisa's 4-bit year field — it rolls
+every 16 years, so a 2026 host clock is displayed by the OS as 1994. Configure an
+ImageWriter on **Serial B** in Preferences (the config **persists across a power cycle**),
+print from LisaWrite, and the OS's own ImageWriter driver streams a raster out a
+register-level **Z8530 SCC** that the emulator turns back into pages — captured as PNGs by
+`lisadbg` or handed to the standard **macOS print panel** (Save as PDF included).
 
 ## Milestones
 
@@ -28,9 +32,10 @@ clock is displayed by the OS as 1994.
 | M4 — OS alive | Live interrupts, OS scheduler, floppy write-through, real-68000 fault frames; **boots to the Office System installer** |
 | M5 — Widget HD | Widget/ProFile hard-disk HLE; the Office System installs onto a blank Widget image and **boots off the hard disk to the desktop**, mouse live |
 | M6 — Real machine | The full daily loop: RTC (real clock), OS-driven soft-power shutdown, Filer work + LisaWrite typed into — **mouse, keyboard, and clock all live** |
-| M7 — next | Timed reboot-alarm wake; per-app symbol relocation; deeper app coverage (LisaCalc/Draw, printing) |
+| M7 — The Printer | Register-level Z8530 SCC on Serial B; the OS's own ImageWriter driver **prints from LisaWrite** to `lisadbg` PNGs and the macOS print panel; printer config persists across a power cycle |
+| M8 — next | Receive-side serial (LisaTerminal / LisaBug console, on the M7 SCC); pixel-true 144-vpi interlace; daisy wheel / Canon devices; the warm-reset/Widget-boot error-42 fix |
 
-Each milestone has a demo document under [`docs/`](docs/) (`m1b-demo.md` … `m6-demo.md`)
+Each milestone has a demo document under [`docs/`](docs/) (`m1b-demo.md` … `m7-demo.md`)
 with reproduction steps, and the project keeps two citation-backed engineering records:
 [`docs/hardware-notes.md`](docs/hardware-notes.md) (every register, address, and constant,
 with sources) and [`docs/rom-trace-notes.md`](docs/rom-trace-notes.md) (the boot-trace
@@ -94,7 +99,7 @@ local path only and never bundled.
 ## Testing
 
 ```sh
-swift test                      # 252 tests; suites needing real ROMs/disks/linkmaps skip
+swift test                      # 277 LisaCore + 91 LisaShell; suites needing real ROMs/disks/linkmaps skip
 
 # Full matrix with real assets:
 LISAEMU_ROM_DIR=~/Development/LisaROMs \

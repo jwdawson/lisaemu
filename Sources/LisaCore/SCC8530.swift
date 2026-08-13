@@ -47,10 +47,12 @@
 /// The latch (`txInterruptPending`) sets on *every* data write and is cleared
 /// by the ISR's `WR0=$29`; the ISR re-arms it by writing the next byte and
 /// `RESTORE`-ing `WR1=$17`. Task 2's earlier "not wired to the CPU IRQ" note
-/// was correct for the boot path (channel B is never inited at boot, so Level 6
-/// never asserts and the FNV checkpoints are byte-identical) but is superseded
-/// for the printing path: without this wiring a live print emits exactly one
-/// byte and stalls (observed). Ext/status and Rx interrupts are not modeled.
+/// was **wrong in reasoning, harmless in effect at boot**: its rationale ("the
+/// driver drains its buffer synchronously and never waits on a Level-6
+/// interrupt") is refuted by rsASM:96-152 (only byte 1 is polled; bytes 2..N
+/// ride the `XMIT` ISR) -- it was boot-harmless only because channel B is never
+/// armed at boot. Without this wiring a live print emits exactly one byte and
+/// stalls (observed). Ext/status and Rx interrupts are not modeled.
 ///
 /// ## Unknown accesses (bounded, inert)
 ///
@@ -167,8 +169,10 @@ public final class SCCChannel {
     // WR6/WR7 (sync chars) are never touched by the built-in RS-232 driver, so
     // they are the "outside the modeled subset" bucket the unknown log catches.
     private static let modeledWriteRegisters: Set<Int> = [0, 1, 2, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15]
-    // Read registers the driver samples (§11.4): RR0 status, RR1 errors.
-    private static let modeledReadRegisters: Set<Int> = [0, 1]
+    // Read registers the driver samples: RR0 status, RR1 errors (§11.4), and
+    // RR2 the modified interrupt vector the Level-6 RSINT handler dispatches on
+    // (§11.4 step 5, source-mover.text.unix.txt:828-833).
+    private static let modeledReadRegisters: Set<Int> = [0, 1, 2]
 
     public init(id: ID) {
         self.id = id
@@ -240,6 +244,12 @@ public final class SCCChannel {
             // bits 7-6 are transient. Without this, `softReset`'s blanket clear
             // would drop MIE and the Level-6 Tx-empty interrupt would never
             // assert, stalling the printer after a single byte.
+            //
+            // MODEL NOTE: WR9 (hence MIE) is a **chip-wide** register on a real
+            // Z8530, but we store it per-channel (like the $C0 cross-channel
+            // reset scope, Task 2 concern 3). Harmless here: only channel B ever
+            // arms interrupts on the print path, so per-channel MIE is
+            // indistinguishable from chip-wide for every state this model reaches.
             wr[9] = value & 0x3F
         }
     }
@@ -272,6 +282,7 @@ public final class SCCChannel {
         switch register {
         case 0: return rr0()
         case 1: return rr1()
+        case 2: return rr2()
         default:
             logUnknown(register: register, value: 0, isWrite: false)
             return 0
@@ -292,6 +303,35 @@ public final class SCCChannel {
     /// the driver's `$70` mask reads clean.
     private func rr1() -> UInt8 {
         return 0x00
+    }
+
+    /// RR2 -- the interrupt-vector register, and the register the OS's Level-6
+    /// RSINT handler dispatches on. RSINT selects RR2 on **channel B**, reads
+    /// it, masks **`$0E`** (bits 3-1), and decodes: bit 3 = which channel
+    /// (0 = B, 1 = A), bits 2-1 = interrupt type (0 = Tx buffer empty, 1 =
+    /// ext/status, 2 = Rx available, 3 = special Rx). It calls the matching
+    /// driver with that as `INTPAR`; `INTPAR == 0` enters `XMIT`
+    /// (source-mover.text.unix.txt:824-848, source-rsASM.TEXT.unix.txt:96-133).
+    ///
+    /// On channel A, RR2 reads the base vector (`WR2`) **unmodified**; on
+    /// channel B it reads `WR2` **modified** by the highest-priority pending
+    /// interrupt's status (V3-V1 in bits 3-1, status-**low** since the driver's
+    /// dinit leaves `WR9` bit 4 clear). Our only asserted interrupt source is
+    /// the **channel-B Tx-buffer-empty** interrupt (status code V3V2V1 = 000 --
+    /// the only reachable state, since Level 6 only ever asserts for it), so
+    /// channel B's modified vector forces bits 3-1 to `000`; RSINT then decodes
+    /// "port B, output interrupt" and enters `XMIT`.
+    ///
+    /// **Modeled explicitly** rather than served by the unknown-register
+    /// fallback (which returned 0 -- coincidentally the same `$0E`-masked value,
+    /// but undocumented, log-spamming on every interrupt, and silently fragile
+    /// to any fallback change). Ext/status and Rx status codes are not modeled
+    /// because those interrupts are never asserted (see `irqAsserted`).
+    private func rr2() -> UInt8 {
+        guard id == .b else { return wr[2] }
+        // Status-low, channel-B Tx-buffer-empty (V3V2V1 = 000): clear bits 3-1
+        // of the base vector; the other vector bits pass through.
+        return wr[2] & ~UInt8(0x0E)
     }
 
     // MARK: - Data port (§11.4)

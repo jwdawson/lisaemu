@@ -67,8 +67,8 @@ print panel** renders the pages (each sized from its DPI: Portrait Hi-Res =
 2. **Warm reset + Widget boot fails (known gap, out of M7 scope).** A warm
    `Machine.reset()` followed by a Widget boot hits **boot error 42** at the
    menu, whereas a fresh power cycle boots cleanly. So the printer config→reboot
-   flow uses a fresh boot (a new process in `lisadbg`; a fresh controller in the
-   integration test), matching real "power cycle" behavior. The warm-reset/
+   flow uses a fresh boot (a new process in `lisadbg`; two sequential raw
+   `Machine`s in the integration test), matching real "power cycle" behavior. The warm-reset/
    Widget-boot interaction is a separate issue (the app's Machine ▸ Reset of a
    *Widget-booted* OS), noted for a later milestone.
 

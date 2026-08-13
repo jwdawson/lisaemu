@@ -219,6 +219,50 @@ private func writeReg(_ ch: SCCChannel, _ reg: Int, _ value: UInt8) {
     #expect(!ch.irqAsserted, "with the latch cleared and no new byte, /INT stays low at end of transfer")
 }
 
+// MARK: - M7 Task 4 fix round 1: RR2 modified interrupt vector (the register
+// the OS Level-6 RSINT handler dispatches on, source-mover:828-833). Modeled
+// explicitly so dispatch is documented, can't silently break, and RR2 reads
+// don't saturate the unknown-access log (one entry per print byte otherwise).
+
+@Test func rr2OnChannelBDecodesAsTxEmptyAndDoesNotSpamTheUnknownLog() {
+    let ch = SCCChannel(id: .b)
+    ch.printerPort = CapturePrinterPort()
+    writeReg(ch, 9, 0x4A)                  // MIE
+    writeReg(ch, 1, 0x17)                  // Tx int enabled
+    ch.writeData(0x55)                     // a pending ch-B Tx-empty interrupt
+    #expect(ch.irqAsserted, "precondition: a channel-B Tx-empty interrupt is pending")
+
+    // RSINT: select RR2, read, mask $0E. For ch-B Tx-empty (V3V2V1=000) the
+    // masked value is 0 -> "port B, output interrupt" -> XMIT.
+    ch.writeControl(0x02)                  // point at RR2
+    let rr2 = ch.readControl()
+    #expect(rr2 & 0x0E == 0x00, "RR2 masked $0E must decode as channel-B Tx-empty (INTPAR 0 -> XMIT)")
+
+    // The whole point of modeling it: RR2 reads are NOT logged as unknown.
+    #expect(ch.unknownAccesses.allSatisfy { $0.register != 2 })
+    #expect(ch.unknownAccesses.isEmpty, "no unknown-access spam from RR2 reads")
+}
+
+@Test func rr2ModifiesOnlyTheStatusBitsOfTheBaseVector() {
+    // The base interrupt vector (WR2) passes through except bits 3-1, which the
+    // channel-B modified read forces to the Tx-empty status code (000).
+    let ch = SCCChannel(id: .b)
+    writeReg(ch, 2, 0xFF)                  // base vector all-ones
+    ch.writeControl(0x02)
+    let rr2 = ch.readControl()
+    #expect(rr2 == 0xF1, "bits 3-1 forced to 000 (ch-B Tx-empty); other vector bits preserved")
+    #expect(rr2 & 0x0E == 0x00)
+}
+
+@Test func rr2OnChannelAReadsTheUnmodifiedBaseVector() {
+    // Channel A returns the base vector unmodified (only channel B carries the
+    // status modification on the real Z8530).
+    let ch = SCCChannel(id: .a)
+    writeReg(ch, 2, 0xFF)
+    ch.writeControl(0x02)
+    #expect(ch.readControl() == 0xFF, "channel A RR2 is the unmodified WR2 base vector")
+}
+
 @Test func sccIRQAssertedIsTheORofBothChannels() {
     let scc = SCC8530()
     #expect(!scc.irqAsserted, "idle: neither channel asserts")

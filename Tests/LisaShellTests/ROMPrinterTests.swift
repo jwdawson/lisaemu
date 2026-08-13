@@ -16,40 +16,39 @@ import LisaCore
 /// fix that made a live print emit its full raster instead of one byte) →
 /// `ImageWriterInterpreter` → `PrintJobSpooler`.
 ///
-/// ## Harness shape (why raw `Machine`s, not `EmulationController`)
+/// ## Harness shape (why raw `Machine`s, and what still doesn't work in-process)
 /// The reboot is done as **two sequential raw `Machine`s on the test thread**
-/// (the `ROMWidgetBootTests` pattern), not one controller with a warm
-/// `reset()` and not two controllers:
-/// - a warm `Machine.reset()` + Widget boot hits **boot error 42** (a separate
-///   warm-reset/Widget-boot issue, noted in the M7 report), and
-/// - two `EmulationController`s (two emulation *threads*) in one process make
-///   the second boot's print **stall at a 2 KB buffer boundary** (a Musashi
-///   cross-thread harness artifact — a single controller, or a fresh process,
-///   prints the full stream; verified).
+/// (the `ROMWidgetBootTests` pattern), not one controller with a warm `reset()`
+/// (which + Widget boot hits **boot error 42** — a separate warm-reset/
+/// Widget-boot issue, noted in the M7 report) and not two `EmulationController`s
+/// (two emulation threads).
 ///
-/// Both are in-process test-harness limitations, not product bugs: real usage
-/// is one process per launch (the app, or `lisadbg`), which prints fully — the
-/// headless artifact `m7-print-01.png` is the same print captured that way.
-/// Two raw Machines on ONE thread sidestep both: Musashi's owner thread is the
-/// test thread for each, and the Widget file (write-through) carries the PM
-/// snapshot between them, exactly like a real power cycle.
+/// **A second in-process Machine's print still stalls at a 2 KB buffer boundary**
+/// — raw Machines do NOT sidestep this; it happens on one thread too. The
+/// **observable** is confirmed: a single process (the app, or `lisadbg`, or a
+/// single-Machine test) prints the full ~9229-byte stream; any *second* Machine
+/// in the same process stalls at exactly 2048 bytes. The **cause is a
+/// hypothesis** (residual Musashi global state after the first Machine's
+/// lifecycle), not yet root-caused. This is a test-harness limitation, not a
+/// product bug: real usage is one process per launch — `m7-print-01.png` is the
+/// same OS print captured full that way.
 ///
 /// ## What this asserts (robust, deterministic), and what it defers
 /// The hard assertion is that the print drives a **substantial ImageWriter byte
-/// stream on Serial B** (`transmittedCount > 1000`). That is the load-bearing,
-/// deterministic proof of the whole new M7 chain end to end through the live OS:
+/// stream on Serial B** (`transmittedCount > 1000`; deterministically 2048).
+/// That is the load-bearing, deterministic proof of the whole new M7 chain end
+/// to end through the live OS:
 /// - **config persistence across the reboot** — without it the Print dialog
 ///   reports *"printer not connected"* and **0** bytes flow; and
 /// - **the Level-6 Tx-empty interrupt transport** — without it the driver sends
 ///   exactly **1** byte and stalls (the pre-fix bug).
 ///
-/// The in-process second Machine stalls at a 2 KB buffer boundary (the Musashi
-/// harness artifact above — a single-process run reaches the full ~9229 bytes),
-/// so this test does **not** pin the full-page raster. That is covered robustly
-/// elsewhere: `PrinterPipelineTests` (the interpreter/spooler/flush path) and
-/// the headless `lisadbg` artifact `m7-print-01.png` (the same OS print,
-/// captured full in a single process). A `PrinterPipeline` is still attached
-/// and flushed here so any inked page that DID land is delivered.
+/// Because the second in-process Machine stalls at 2 KB (the prefix, before the
+/// graphics ink), this test does **not** pin the full-page raster. That is
+/// covered robustly elsewhere: `PrinterPipelineTests` (the interpreter/spooler/
+/// flush path) and the headless `lisadbg` artifact `m7-print-01.png` (the same
+/// OS print, captured full in a single process). A `PrinterPipeline` is still
+/// attached and flushed here so any inked page that DID land is delivered.
 ///
 /// Gated on `LISAEMU_ROM_DIR` + `LISAEMU_WIDGET_DIR` holding
 /// `OS31-installed.widget` (which has LisaWrite installed).

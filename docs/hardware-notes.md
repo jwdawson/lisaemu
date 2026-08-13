@@ -879,10 +879,17 @@ Source: libhw-DRIVERS (various), OS/source-mover.text.unix.txt, OS/source-INITRA
     `XMIT` ISR (§11.4 step 5) sends the first byte polled, then drives every
     subsequent byte off the Level-6 Tx-empty interrupt — without it a live
     print emits exactly ONE byte and stalls (observed). Task 2's "SCC not wired
-    to the CPU IRQ" note is superseded here: it was correct for the boot path
-    (channel B is never inited at boot, so no Level-6 ever asserts — the FNV
-    checkpoints confirm boot is byte-identical), but the *printing* path does
-    require it. Autovectored (`$78`), like every other Lisa interrupt.
+    to the CPU IRQ" note is superseded here — and to the project's honesty bar,
+    it was **wrong in reasoning, harmless in effect at boot**: its stated
+    rationale ("the polled fast path never blocks, so the driver drains its
+    buffer synchronously and never waits on a Level-6 interrupt") is **refuted**
+    by rsASM:96-152 — the driver polls only byte 1 (`RSOUT`/`BYTEO`); bytes
+    2..N ride the `XMIT` ISR (`WR0=$29` :98, `WR1=0` :100-101, `WR0=$38` :103,
+    `JSR RSOUT` :129-133, exit re-arms `WR1=$17` via `#$0617`→`RESTORE`
+    :150-152). It happened to be boot-harmless *only* because channel B is never
+    armed at boot (no `dinit`, so Level 6 never asserts — the FNV checkpoints
+    confirm boot is byte-identical). Autovectored (`$78`), like every other Lisa
+    interrupt.
 
 - **Level 7:** NMI (INIT_NMI_TRAPV, INITRAP:43,73)
   - Debugger break-in via low-core $7C — LDASM:68-106
@@ -2267,6 +2274,25 @@ with it, the same print emitted 9229 bytes and produced a full page raster
 (m7-print-01.png). Ext/status (CTS/DCD/Break) and Rx interrupts are **not**
 modeled/asserted — nothing in the transmit-only printer path changes a modem
 line or feeds the receiver.
+
+**RR2 dispatch (SOURCE-DERIVED, load-bearing).** The Level-6 handler `RSINT`
+does **not** know a priori which port/interrupt fired — it reads it from the
+SCC. `RSINT` selects **RR2 on channel B**, reads it, masks **`$0E`** (bits
+3-1), `LSR #1`, and splits: bit 3 → port (0 = B, 4 = A), bits 2-1 → interrupt
+type (0 = Tx buffer empty, 1 = ext/status, 2 = Rx available, 3 = special Rx);
+`INTPAR == 0` dispatches into `XMIT` (source-mover.text.unix.txt:824-848). RR2
+is the Z8530 **modified interrupt vector**: on channel A it reads the base
+vector `WR2` unmodified; on channel B it reads `WR2` with the highest-priority
+pending interrupt's status in bits 3-1 (status-**low**, since the driver's
+`dinit` leaves `WR9` bit 4 clear). Our SCC asserts Level 6 only for the
+channel-B Tx-empty interrupt (status code `000`), so channel-B RR2 forces bits
+3-1 to `000` and RSINT correctly decodes "port B, output interrupt." **Our
+model programs RR2 explicitly** (`SCCChannel.rr2()`) rather than letting it fall
+to the unknown-register default (which returned 0 — the same `$0E`-masked
+value, so dispatch "worked," but undocumented, fragile to any fallback change,
+and logging an unknown access on *every* interrupt, ~thousands of drops per
+print). Ext/status and Rx status codes aren't modeled because those interrupts
+never fire.
 
 So the driver's notion of **"connected and ready to accept a byte"** is:
 **RR0 bit 2 (Tx buffer empty) set**, and — under hardware handshake — **RR0 bit 5

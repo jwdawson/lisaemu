@@ -2375,3 +2375,170 @@ cross-power-cycle persistence is the boot-volume snapshot.**
   - *Full fidelity (medium):* also model the `pmem_state` checksum/snapshot
     reconciliation so RAM-vs-disk divergence behaves exactly as `SOURCE-PMEM`
     describes. Not needed for a working printer config; only for edge-case parity.
+
+
+## 12. ImageWriter escape contract (as ciprint emits it) — M7 Task 3
+
+This is the *wire contract* the Lisa OS's C.Itoh/ImageWriter driver actually
+puts on Serial-B, derived end-to-end from the driver source, **not** from a
+printer manual. `LibPr/CiDev` (`LibPr-cidev.text.unix.txt`) is the byte-level
+device layer — every escape sequence the printer ever sees is emitted by a
+`CiOut` in that unit — and `LibPr/CiProcs` + `LibPr/CiGlobals` supply the
+resolution/geometry choices above it. Citations are `file:line` into
+`~/Development/Lisa_Source/LISA_OS/LIBS/LIBPR/`. Where a public
+ImageWriter/C.Itoh 8510 reference disagrees, **the driver source wins** and the
+divergence is noted.
+
+### 12.1 Control bytes and the command alphabet
+Non-command control bytes (CiDev:103):
+`LF = 10`, `SO = 14`, `SI = 15`, `CAN = 24`, `ESC = 27`.
+
+Every command below is `ESC` followed by one command byte (and, where noted,
+ASCII decimal-digit operands or raw data), **except `SO`/`SI` which carry no
+`ESC`** (CiDev:114, `CiSetWide` CiDev:641-645). Command-byte table verbatim from
+CiDev:106-126:
+
+| Sequence | Meaning | Operands | Emitter (CiDev) |
+|---|---|---|---|
+| `ESC 'T' d d` | set line-feed pitch (line height) | 2 ASCII digits, 144ths of an inch, max 99 (`cLFMax`) | `CiSetLineHt` :618-625 |
+| `ESC 'G' d d d d` | **standard** bit-image graphics | 4 ASCII digits = column count `N`, then `N` data bytes | `CiPrGraf` :508-530 |
+| `ESC 'g' d d d` | **fast** bit-image graphics | 3 ASCII digits = `N/8`, then `N` data bytes (`N` = digits×8) | `CiPrGraf` :508-530 |
+| `ESC 'F' d d d d` | horizontal tab / absolute column | 4 ASCII digits = dot column from left | `CiPrTab` :532-538 |
+| `ESC 'f'` / `ESC 'r'` | line-feed direction forward / reverse | — | `CiSetLFFwd` :610-616 |
+| `ESC '<'` / `ESC '>'` | bidirectional / unidirectional print | — | `CiSetBiDir` :560-565 |
+| `ESC 'o'` / `ESC 'O'` | paper-empty stop / override | — | `CiSetPEStop` :627-632 |
+| `ESC '!'` / `ESC '"'` | emphasized (1/160" smear) on / off | — | `CiSetEmph` :598-603 |
+| `SO` / `SI` (no ESC) | elongated (horizontal bit-double) on / off | — | `CiSetWide` :641-645 |
+| `ESC 'X'` / `ESC 'Y'` | underline on / off | — | `CiSetUL` :634-639 |
+| `ESC 'n' N E q Q p P` | set horizontal density (bpi) — see 12.2 | — | `CiSetBpi` :567-581 |
+| `ESC 'Z' b1 b2` | open DIP switches (country) | 2 raw mask bytes | `CiSetCntry` :583-596 |
+| `ESC 'D' b1 b2` | close DIP switches (country) | 2 raw mask bytes | `CiSetCntry` :583-596 |
+| `ESC 'c'` | reset printer to power-on state | — | `CiDevClose` :253-255 |
+| `LF` (bare) | advance paper by current line height | — | `CiBindV` :184 |
+| `CAN` | abort a partial graphics line | — | `CiDevOpen` :272 |
+
+`cmRun = 'V'` (CiDev:109) is **declared but never emitted** by this driver
+(grep-confirmed: the only `'V'` reference is the constant declaration). Public
+references list `ESC 'V'` as a repeated-graphics command; the Lisa path does not
+use it, so the interpreter treats `ESC V` as unknown (bounded-log, no-op).
+
+There is **no `FF` (0x0C)** anywhere in the C.Itoh path (grep-confirmed; only the
+unrelated DaisyWheel driver defines `FF`). **Page ejection is done entirely by
+line feeds**, not a form-feed byte — see 12.4.
+
+### 12.2 Horizontal density (bpi) codes
+`CiSetBpi` (CiDev:567-581) maps the internal `TTybpi` enum to one command byte
+each (CiDev:117-118):
+
+| Code | bpi | Code | bpi |
+|---|---|---|---|
+| `ESC 'n'` | 72 | `ESC 'q'` | 120 |
+| `ESC 'N'` | 80 | `ESC 'Q'` | 136 |
+| `ESC 'E'` | 96 | `ESC 'p'` | 144 |
+| | | `ESC 'P'` | 160 |
+
+Max columns per scan at a given bpi = `8 × bpi` (`CiMaxBits`/`CiHRes`
+CiDev:355-377), i.e. an **8-inch** printable width at every density
+(72→576, 96→768, 144→1152, 160→1280 dots; these are the `cNNNBits` constants,
+CiGlobals:60-61). `CiDevOpen` initialises the printer to **96 bpi** (`tybpi96`,
+CiDev:277); the real print path then re-commands the density **per band** inside
+`CiPrBand` (`CiSetBpi(tybpi)` CiDev:435).
+
+### 12.3 Which density the OS actually uses
+`CiProcs.CiOpen` picks the band `tybpi`/`tyspi` once per job (CiProcs:531-546),
+and `CiMetrics` derives the page geometry from it (CiProcs:402-509). All four
+raster modes (paper page length is **always 11 in / 144ths**, independent of
+orientation — CiProcs:548-549):
+
+| Mode | H bpi | V spi | printable width | code emitted |
+|---|---|---|---|---|
+| Portrait Hi-Res | **160** | **144** | 1280 dots (`c160Bits`) | `ESC 'P'` |
+| Portrait Lo-Res | 96 | 72 | 768 dots (`c96Bits`) | `ESC 'E'` |
+| Landscape Hi-Res | 144 | 144 | 1152 dots (`c144Bits`) | `ESC 'p'` |
+| Landscape Lo-Res | 96 | 144 | 768 dots (`c96Bits`) | `ESC 'E'` |
+
+(CiProcs:408-421, :439-452, :531-546. `prPgFract = 120`, PrStdInfo:81, is the
+PgSize unit — US Letter = 1020×1320 of those; e.g. Portrait Hi-Res paper width
+= `1020×160/120 = 1360` dots, **clamped to the 1280-dot platen** `rPrintable`,
+CiProcs:429-433.)
+
+The WYSIWYG office path prints **purely as graphics** (`ESC G`/`ESC g` bands);
+QuickDraw text is rasterised into the band bitmap upstream (`PrStdText` bottleneck,
+CiPrint:197) and reaches CiDev already as dots. `CiPrText` (CiDev:540-558) emits
+**raw text bytes** *only* in **draft mode** (`CiPrMode.Draft`, CiProcs:306), where
+the driver leans on the printer's own ROM font (plus per-country DIP-switch
+swaps, `CiEuropeanOut` CiDev:310-348). Our interpreter therefore models graphics
+as the primary path; text bytes are handled defensively via a synthetic dot font
+(see 12.6).
+
+### 12.4 Graphics band format (`ESC G` / `ESC g`)
+`CiPrGraf` (CiDev:508-530):
+- **Standard** (`ESC 'G'`): operand = **4 ASCII decimal digits** = `cBits` =
+  the number of dot **columns** `N` (`cDigits = 4`, `cNumber = cBits`), then
+  `CiBlockOut(p, cBits)` sends exactly `N` **data bytes** — one byte per column.
+- **Fast** (`ESC 'g'`): operand = **3 ASCII decimal digits** = `cBits DIV 8`
+  (`cDigits = 3`, `cNumber = cBits DIV 8`), then `N = digits×8` data bytes.
+  `CiPrBand` rounds `cBits` up to a multiple of 8 before calling
+  (CiDev:440-441). Fast graphics is selected whenever the port is the built-in
+  Serial A/B (`fFastGraf := (port=PortA) OR (port=PortB)`, CiProcs:519) — i.e.
+  **the real Lisa serial printer uses `ESC g`**; `ESC G` is the parallel/slow path.
+
+Each data byte is one **column of 8 vertical dots** (the band is 8 scanlines
+tall; "Bit" runs along the scan = horizontal, "Scan" = vertical, CiDev:16-19).
+**Bit-within-byte order (top vs bottom pin) is NOT visible in the Pascal** — the
+byte columns are produced by the external assembly `PrVBand`/`PrHBand`
+(CiDev:154-155), so it is a documented **modeling decision** in the interpreter
+(we take bit 7 = top dot). `CiPrBand` white-space-trims each band left and right
+and emits a leading `ESC 'F'` tab for the trimmed left margin (CiDev:419-448),
+so real streams interleave `ESC F` + short `ESC g` runs rather than one
+full-width band.
+
+### 12.5 Vertical positioning, line feeds, and page breaks
+There is **no absolute vertical command**; all vertical motion is relative LFs
+metered by the line-height pitch (`CiBindV` is "the only place emitting LFs",
+CiDev:164-197):
+- Vertical position is tracked in **144ths of an inch**. To move down `Δ`:
+  set direction (`ESC f`), and if `Δ > 99` emit `ESC 'T' 99` + `LF` repeatedly,
+  then `ESC 'T' (Δ mod 99)` + `LF` (CiDev:176-184).
+- Reverse motion sets `ESC r`, moves up, then **"burps"** a small forward LF
+  (`cBurp144ths = 24`, CiDev:123, :191-195) to take up gear lash.
+- Graphics bands advance vertically via `CiDeltaV` after each band: at 144 spi
+  the two interlaced half-bands advance **1** then **15** (=16/144" per 16
+  interlaced dots ⇒ 144 dpi), at 72 spi a band advances **16** (=16/144" per 8
+  dots ⇒ 72 dpi) (CiDev:468-476, :492-502).
+
+**Page eject** (`CiNewPage`, CiDev:379-395): `CiGotoV(cPg144ths + gap)` then
+`CiBindV` LFs the paper to the next page top; `CiBindV` wraps the position
+`cAct144ths := cCur144ths MOD cPg144ths` (CiDev:187). So **crossing the page
+length in the LF accumulator IS the form feed** — there is no distinct eject
+byte. `cPg144ths` defaults to `144×11 = 1584` (CiDev:276) and is reset from the
+real `PgSize.Height` in `CiOpen` (CiProcs:549). The gap `cCiGap144ths = 80`
+(≈0.55", CiGlobals:64) is the roller-to-printhead offset.
+
+### 12.6 Interpreter modeling decisions (ours, documented)
+The `ImageWriterInterpreter` implements 12.1-12.5 faithfully; the following are
+choices where the source is silent or where we deliberately simplify. None
+affect the byte-level command parsing:
+1. **Fixed page geometry from a `Config`** (default = Portrait Hi-Res:
+   1280×1584 dots at 160×144 dpi). The commanded density (12.2) is tracked and
+   used for the emitted page's `dpi.h`, and disagreement with the canvas is
+   bounded-logged; the canvas grid itself is fixed per page. Lo-Res preset =
+   768×792 at 96×72. (Real jobs command one density before any ink, CiOpen:531,
+   so no mid-page resize is needed.)
+2. **Bit 7 = top dot** within each graphics column byte (see 12.4 — not
+   recoverable from the Pascal source).
+3. **Vertical grid = the config's V dpi**, driven by the 144ths accumulator
+   (`row = pos144 × dpiV ÷ 144`). Interlace half-band advances (1/15) land on
+   adjacent rows rather than physically interleaved passes — a raster-fidelity
+   simplification, not a parsing one.
+4. **Page emission triggers**: (a) the LF accumulator forward-crossing the page
+   length (the real form-feed mechanism, 12.5); (b) `flush()` for an
+   end-of-stream partial page; (c) `ESC c` reset flushes any dirty page. A bare
+   `FF` (0x0C), which this driver never emits, is honored defensively as an
+   explicit eject.
+5. **Text bytes** (draft-mode raw ASCII, 12.3) render through a small **synthetic
+   5×7 dot font that is ours** (committed fixture — Lisa fonts are never
+   extracted), advancing the horizontal cursor per glyph.
+6. **Unknown / unmodeled codes** (including `ESC V`, malformed digit runs,
+   stray control bytes) are **bounded-logged and no-op'd, never fatal**
+   (house pattern: a capped log array + a dropped counter, per `Bus.mmuPortLog`).

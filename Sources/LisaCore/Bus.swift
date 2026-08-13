@@ -596,6 +596,13 @@ public final class Bus {
     /// queue) to drop any in-flight handshake; the attached image, if any,
     /// survives (mirrors `floppy`).
     public var widget: WidgetDrive { io.widget }
+    /// Register-level Z8530 SCC (M7 Task 2), owned by `IODispatcher` and serving
+    /// the built-in RS-232 `$FCD2xx` window -- see `SCC8530`'s type doc comment.
+    /// Channel B is the printer port: attach the transmit sink via
+    /// `bus.scc.channelB.printerPort`. `Machine.reset()` calls `scc.reset()`
+    /// (register state back to power-on; the attached sink survives), mirroring
+    /// `floppy`/`widget`.
+    public var scc: SCC8530 { io.scc }
     /// Diagnostic: accesses to the OS ProFile/Widget driver's VIA1 region
     /// (`$FCD801`/`$FCDC01`/`$FCDC05`, §10.1) -- the M5 Task 1 Q1 live-probe
     /// seam. 0 until the OS driver first drives the Widget (Task 3).

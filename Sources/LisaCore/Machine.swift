@@ -162,6 +162,7 @@ public final class Machine {
         bus.videoTiming.reset()
         bus.floppy.reset()
         bus.widget.reset()
+        bus.scc.reset()   // M7 Task 2: SCC register state back to power-on
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {

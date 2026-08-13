@@ -82,6 +82,16 @@ final class IODispatcher {
     /// §10.9). Its completion interrupt is VIA1 IFR bit 1 (level 1, §10.2).
     let widget: WidgetDrive
 
+    /// Register-level Z8530 SCC (M7 Task 2) -- the built-in RS-232 A/B ports at
+    /// `RSBASE = $FCD201`, replacing the generic `0xFF` stub the `$FCD2xx`
+    /// window answered through M6. Channel B is the printer port (its
+    /// `printerPort` sink is the M7 transmit seam). See `SCC8530`'s type doc
+    /// comment and docs/hardware-notes.md §11. No injected dependencies: it is
+    /// a pure register file with no scheduled events or interrupts (the polled
+    /// Tx-empty fast path never blocks, so no Level-6 wiring -- §11.4 / the
+    /// Task-2 report).
+    let scc = SCC8530()
+
     private var contextBit1 = false
     private var contextBit2 = false
 
@@ -176,6 +186,11 @@ final class IODispatcher {
         let value: UInt8
         if let (via, index) = Self.viaRegisterIndex(offset) {
             value = viaInstance(via).read(index)
+        } else if Self.isSCCOffset(offset) {
+            // Real (side-effecting) SCC control/data read: control reads return
+            // RR[pointer] and reset the pointer (§11.2). Distinct from the
+            // `currentValue` peek path below.
+            value = scc.read(address: offset)
         } else {
             value = currentValue(offset)
             applyLatch(offset)
@@ -197,6 +212,8 @@ final class IODispatcher {
             if via == 1, Self.isWidgetPortBOffset(offset, index: index) {
                 widget.portBWrite(value)
             }
+        } else if Self.isSCCOffset(offset) {
+            scc.write(address: offset, value)   // §11.1-11.4
         } else if !applyLatch(offset) {
             applyNonLatchWrite(offset, value)
         }
@@ -313,6 +330,11 @@ final class IODispatcher {
         // FloppyController's 2KB shared-RAM window (docs/hardware-notes.md
         // §9), Task 4. Checked after the two explicit board-ID cases above.
         case 0xC000...0xC7FF: return floppy.read(Int(offset - 0xC000))
+        // Z8530 SCC window (§11.1), M7 Task 2 -- the whole `$D200-$D2FF`
+        // offset range (RSBASE `$D201` + the undecoded `$D241` POST mirror and
+        // every alias) routes to the SCC, replacing the old `0xFF` stub. Peek
+        // path only: side-effect-free RR[pointer] read (no pointer reset).
+        case 0xD200...0xD2FF: return scc.peek(address: offset)
         default:
             if let (via, index) = Self.viaRegisterIndex(offset) {
                 return viaInstance(via).peek(index)
@@ -385,6 +407,15 @@ final class IODispatcher {
 
     private func viaInstance(_ via: Int) -> VIA6522 {
         via == 1 ? via1 : via2
+    }
+
+    /// Whether `offset` falls in the built-in SCC's `$FCD2xx` window (§11.1).
+    /// Higher address bits are undecoded, so the entire `$D200-$D2FF` range --
+    /// including the ROM POST's `$D241` channel-B-control mirror (§11.5) --
+    /// belongs to the Z8530. The channel/register decode within is
+    /// `SCC8530`'s job (address bits 1 and 2).
+    private static func isSCCOffset(_ offset: UInt32) -> Bool {
+        offset >= 0xD200 && offset <= 0xD2FF
     }
 
     /// ROM-observed bases (docs/hardware-notes.md §3): VIA1 = `$D901`,

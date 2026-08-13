@@ -101,7 +101,7 @@ struct ImageWriterInterpreterTests {
         #expect(pages.count == 1)
         #expect(pages[0].width == 768)
         #expect(pages[0].height == 792)   // 11in * 72 spi
-        #expect(pages[0].dpi == (h: 96, v: 72))
+        #expect(pages[0].dpi == PrinterPage.DPI(h: 96, v: 72))
     }
 
     // MARK: - Graphics: exact dot placement + bit order
@@ -188,6 +188,30 @@ struct ImageWriterInterpreterTests {
             }
             #expect(pages[0].dpi.h == dpi, "ESC \(Character(UnicodeScalar(code))) → \(dpi) bpi")
         }
+    }
+
+    @Test
+    func densityMatchingCanvasIsNotLoggedButMismatchIs() {
+        // Matching the canvas dpiH (default 160 = ESC P): no diagnostic.
+        let matched = ImageWriterInterpreter()
+        matched.feed(Self.esc); matched.feed(UInt8(ascii: "P"))
+        #expect(matched.unknownLog.isEmpty)
+
+        // Commanding a density that disagrees with the fixed canvas produces a
+        // silently mis-scaled raster (§12.6.1), so it must be bounded-logged.
+        let mismatched = ImageWriterInterpreter()   // canvas dpiH = 160
+        mismatched.feed(Self.esc); mismatched.feed(UInt8(ascii: "E"))  // 96 ≠ 160
+        #expect(mismatched.unknownLog.count == 1)
+        #expect(mismatched.unknownLog[0].byte == UInt8(ascii: "E"))
+    }
+
+    @Test
+    func densityMismatchLoggingIsBounded() {
+        let interp = ImageWriterInterpreter()   // canvas dpiH = 160
+        // 400 mismatched density commands (ESC E = 96) → capped at logLimit.
+        for _ in 0..<400 { interp.feed(Self.esc); interp.feed(UInt8(ascii: "E")) }
+        #expect(interp.unknownLog.count == 256)
+        #expect(interp.unknownLogDropped == 400 - 256)
     }
 
     // MARK: - Line feeds / vertical placement
@@ -400,8 +424,8 @@ struct ImageWriterInterpreterTests {
         }
         let hi = page(.imageWriterPortraitHiRes, UInt8(ascii: "P"))   // 160×144
         let lo = page(.imageWriterPortraitLoRes, UInt8(ascii: "E"))   // 96×72
-        #expect(hi.dpi == (h: 160, v: 144))
-        #expect(lo.dpi == (h: 96, v: 72))
+        #expect(hi.dpi == PrinterPage.DPI(h: 160, v: 144))
+        #expect(lo.dpi == PrinterPage.DPI(h: 96, v: 72))
         #expect(Self.fnv(hi.bits) != Self.fnv(lo.bits))   // distinct geometry ⇒ distinct raster
         #expect(Self.fnv(hi.bits) == 0xd58a_571e_f5ed_0189)
         #expect(Self.fnv(lo.bits) == 0x543e_21ca_4839_3989)

@@ -12,13 +12,22 @@ import Foundation
 /// horizontal dots-per-inch commanded by the stream (see
 /// docs/hardware-notes.md §12.2), `v` the vertical grid (§12.5). Geometry
 /// and polarity rationale: §12.4, §12.6.
-public struct PrinterPage: Sendable {
+public struct PrinterPage: Sendable, Equatable, Hashable {
     public let width: Int
     public let height: Int
     public let bits: [UInt8]
-    public let dpi: (h: Int, v: Int)
+    public let dpi: DPI
 
-    public init(width: Int, height: Int, bits: [UInt8], dpi: (h: Int, v: Int)) {
+    /// Device resolution in dots per inch. A 2-field struct (not a bare
+    /// `(h:Int,v:Int)` tuple) so `PrinterPage` can synthesize
+    /// `Equatable`/`Hashable` for downstream (Task 4) consumers.
+    public struct DPI: Sendable, Equatable, Hashable {
+        public let h: Int
+        public let v: Int
+        public init(h: Int, v: Int) { self.h = h; self.v = v }
+    }
+
+    public init(width: Int, height: Int, bits: [UInt8], dpi: DPI) {
         self.width = width
         self.height = height
         self.bits = bits
@@ -209,19 +218,30 @@ public final class ImageWriterInterpreter {
         case UInt8(ascii: "Y"): underline = false; state = .ground
         case UInt8(ascii: "c"): resetPrinter();    state = .ground
         // Density (bpi) codes — §12.2.
-        case UInt8(ascii: "n"): bpi = 72;  state = .ground
-        case UInt8(ascii: "N"): bpi = 80;  state = .ground
-        case UInt8(ascii: "E"): bpi = 96;  state = .ground
-        case UInt8(ascii: "q"): bpi = 120; state = .ground
-        case UInt8(ascii: "Q"): bpi = 136; state = .ground
-        case UInt8(ascii: "p"): bpi = 144; state = .ground
-        case UInt8(ascii: "P"): bpi = 160; state = .ground
+        case UInt8(ascii: "n"): setDensity(72,  code: byte)
+        case UInt8(ascii: "N"): setDensity(80,  code: byte)
+        case UInt8(ascii: "E"): setDensity(96,  code: byte)
+        case UInt8(ascii: "q"): setDensity(120, code: byte)
+        case UInt8(ascii: "Q"): setDensity(136, code: byte)
+        case UInt8(ascii: "p"): setDensity(144, code: byte)
+        case UInt8(ascii: "P"): setDensity(160, code: byte)
         default:
             // ESC 'V' (declared-but-unused, §12.1) and any other unknown
             // escape land here.
             note(byte)
             state = .ground
         }
+    }
+
+    /// Apply a commanded horizontal density (§12.2). The canvas geometry is
+    /// fixed per page (§12.6 decision 1); a density that disagrees with the
+    /// canvas `config.dpiH` means the raster will be mis-scaled, so it is
+    /// bounded-logged (the `code` byte) as a diagnostic rather than silently
+    /// mis-rendered. A matching density is applied without noise.
+    private func setDensity(_ newBpi: Int, code: UInt8) {
+        bpi = newBpi
+        if newBpi != config.dpiH { note(code) }
+        state = .ground
     }
 
     // MARK: - Digit collection
@@ -347,7 +367,7 @@ public final class ImageWriterInterpreter {
         onPage(PrinterPage(width: config.widthDots,
                            height: config.heightDots,
                            bits: canvas,
-                           dpi: (h: bpi, v: config.dpiV)))
+                           dpi: PrinterPage.DPI(h: bpi, v: config.dpiV)))
         canvas = [UInt8](repeating: 0, count: rowBytes * config.heightDots)
         pageDirty = false
         cursorX = 0

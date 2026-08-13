@@ -22,9 +22,14 @@ import Foundation
 /// so a slow/reentrant consumer can't stall a concurrent `onJob =`.
 public final class PrintJobSpooler {
     private let lock = NSLock()
-    private var _onJob: (([PrinterPage]) -> Void)?
+    private var _onJob: (@Sendable ([PrinterPage]) -> Void)?
     /// Called once per closed job with that job's pages, in feed order.
-    public var onJob: (([PrinterPage]) -> Void)? {
+    ///
+    /// Typed `@Sendable` for the same reason `FramePublisher.onFrame` is: it is
+    /// assigned from any thread (the app at startup) but invoked on the
+    /// emulation thread inside `closeJob()`, so it must be legal to call
+    /// cross-thread.
+    public var onJob: (@Sendable ([PrinterPage]) -> Void)? {
         get { lock.lock(); defer { lock.unlock() }; return _onJob }
         set { lock.lock(); defer { lock.unlock() }; _onJob = newValue }
     }

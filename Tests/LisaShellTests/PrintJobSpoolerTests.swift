@@ -10,7 +10,7 @@ struct PrintJobSpoolerTests {
     /// A trivial distinct page (geometry doesn't matter for grouping).
     static func page(_ w: Int = 8) -> PrinterPage {
         PrinterPage(width: w, height: 1, bits: [UInt8](repeating: 0, count: (w + 7) / 8),
-                    dpi: (h: 160, v: 144))
+                    dpi: PrinterPage.DPI(h: 160, v: 144))
     }
 
     static func makeSpooler(idle: TimeInterval = 2.0)

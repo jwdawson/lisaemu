@@ -294,4 +294,24 @@ public final class Machine {
         }
         return executed
     }
+
+    // MARK: - Scripted-input gestures (M7 Task 4)
+
+    /// The double-click **gesture**, timed so the running OS reliably reads it
+    /// as one: two mouse-button down/up pairs with both button-downs inside
+    /// ~400k CPU cycles. Two independently scripted clicks put the downs
+    /// ~600k+ cycles apart — marginal against the OS's double-click threshold
+    /// and observably flaky (M7 Task 4). The **single** implementation of the
+    /// timing; steering the cursor to the target first is the caller's job
+    /// (`lisadbg`'s `dclick` and `ROMPrinterTests` each steer with their own
+    /// harness idiom, then call this).
+    ///
+    /// `0x06` is the COPS mouse-button keycode (same code `lisadbg`'s single
+    /// `click` posts).
+    public func postDoubleClick() {
+        for _ in 0..<2 {
+            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + 100_000)
+            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + 100_000)
+        }
+    }
 }

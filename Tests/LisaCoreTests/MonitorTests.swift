@@ -30,6 +30,10 @@ extension MusashiSuites {
             #expect(Monitor.parse("click 615 210") == .click(615, 210))
             #expect(Monitor.parse("click 615") == nil, "click requires both x and y")
             #expect(Monitor.parse("click") == nil, "click requires coordinates")
+            // M7 Task 4: tight double-click (same operand shape as click).
+            #expect(Monitor.parse("dclick 45 335") == .dclick(45, 335))
+            #expect(Monitor.parse("dclick 45") == nil, "dclick requires both x and y")
+            #expect(Monitor.parse("dclick") == nil, "dclick requires coordinates")
             #expect(Monitor.parse("type Hello World") == .type("Hello World"))
             #expect(Monitor.parse("type") == nil, "type requires text")
             // M6 Task 3: mouse press/release/drag primitives (menus, drags).

@@ -356,6 +356,16 @@ func click(_ m: Machine) {
     m.run(until: m.cycles + 300_000)
 }
 
+/// A tight double-click: steer to `(tx,ty)` then post the double-click
+/// gesture (opens icons/folders). The gesture timing lives in ONE place —
+/// `Machine.postDoubleClick()` (both button-downs within ~400k cycles; two
+/// separate `clickAt` calls put the downs ~600k+ apart, marginal vs the OS
+/// double-click threshold and flaky) — shared with `ROMPrinterTests`.
+func doubleClickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+    steerCursor(m, to: tx, ty)
+    m.postDoubleClick()
+}
+
 // MARK: - `click <x> <y>` / `type <text>` (M5 Task 3)
 //
 // bootdisk's ROM-cursor steering ($496/$498) goes dead once the OS is running
@@ -756,6 +766,10 @@ while let line = readLine(strippingNewline: true) {
         clickAt(machine, x, y)
         let (cx, cy) = osCursor(machine)
         print("      clicked at cursor (\(cx),\(cy)) [target (\(x),\(y))]")
+    case .dclick(let x, let y):
+        doubleClickAt(machine, x, y)
+        let (cx, cy) = osCursor(machine)
+        print("      double-clicked at cursor (\(cx),\(cy)) [target (\(x),\(y))]")
     case .type(let text):
         typeText(machine, text)
         print("      typed \(text.count) character(s)")
@@ -814,7 +828,7 @@ while let line = readLine(strippingNewline: true) {
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

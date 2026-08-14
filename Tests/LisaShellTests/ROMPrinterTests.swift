@@ -90,16 +90,13 @@ extension LisaShellMusashiSuites {
             m.bus.cops.postKey(code: 0x06, down: false); m.run(until: m.cycles + 300_000)
         }
         private func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) { steer(m, tx, ty); click(m) }
-        /// A double-click: steer ONCE, then two down/up pairs tightly coupled
-        /// (both button-downs within ~400k cycles) so the OS reliably reads a
-        /// double-click. Two separate `clickAt` calls put the downs ~600k+ cycles
-        /// apart — marginal against the OS double-click threshold and flaky.
+        /// A double-click: steer ONCE (the test's own cursor idiom), then post
+        /// the shared gesture — `Machine.postDoubleClick()` is the single
+        /// implementation of the tight down/up timing, shared with `lisadbg`'s
+        /// `dclick` (M7 Task 4 wrap-up reconcile).
         private func doubleClickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
             steer(m, tx, ty)
-            for _ in 0..<2 {
-                m.bus.cops.postKey(code: 0x06, down: true);  m.run(until: m.cycles + 100_000)
-                m.bus.cops.postKey(code: 0x06, down: false); m.run(until: m.cycles + 100_000)
-            }
+            m.postDoubleClick()
         }
         private func moveMenu(_ m: Machine, _ tx: Int, _ ty: Int) {
             for _ in 0..<24 {

@@ -292,9 +292,15 @@ public final class ImageWriterInterpreter {
         state = remaining <= 1 ? .ground : .graphics(remaining: remaining - 1)
     }
 
-    /// Paint one 8-dot column at the current cursor. Bit 7 = top pin
-    /// (modeling decision, §12.4). Elongated (`wide`) doubles the column
-    /// horizontally (§12.1, CiSetWide). Advances the cursor; clips to page.
+    /// Paint one 8-dot column at the current cursor. **Bit 0 = top pin**
+    /// (LSB-top, the C.Itoh 8510 graphics-byte convention — §12.4/§12.6
+    /// decision 2, CORRECTED in M7 Task 4 fix round 3: proven against a
+    /// captured live LisaWrite stream, which renders as a single clean text
+    /// line only under LSB-top; the earlier MSB-top guess vertically mirrored
+    /// every 8-pin pass inside its band, scrambling the interlace into the
+    /// user-visible "two stacked garbled copies"). Elongated (`wide`) doubles
+    /// the column horizontally (§12.1, CiSetWide). Advances the cursor; clips
+    /// to page.
     ///
     /// **Two-pass interlace geometry (§12.5, CiDeltaV CiDev:468-476).** The
     /// print head is a **72-dpi 8-pin column**: pin `p` sits `2/144"` below the
@@ -305,18 +311,15 @@ public final class ImageWriterInterpreter {
     /// a solid 144-dpi stroke. At 72 spi a single band's pins land on adjacent
     /// 72-vpi rows. Mapping the 144ths position through `config.dpiV` yields both
     /// exactly. The earlier `y144 + p` mapping (pins 1/144 apart) made the two
-    /// half-bands *overlap* instead of interleave — a within-band "comb". (NB:
-    /// this corrects the interlace geometry only; a separately-observed
-    /// whole-line 2× duplication is upstream in the emitted stream, not here —
-    /// docs/hardware-notes.md §12.6 decision 3 SCOPE note.)
+    /// half-bands *overlap* instead of interleave — a within-band "comb".
     private func writeColumn(_ columnByte: UInt8) {
         let reps = wide ? 2 : 1
         for _ in 0..<reps {
             let x = cursorX
             if x >= 0, x < config.widthDots, columnByte != 0 {
                 for pin in 0..<8 {
-                    // bit 7 (0x80) = top pin (p = 0); pins are 2/144" apart.
-                    if columnByte & (0x80 >> UInt8(pin)) != 0 {
+                    // bit 0 (0x01) = top pin (p = 0); pins are 2/144" apart.
+                    if columnByte & (1 << UInt8(pin)) != 0 {
                         let row = (y144 + 2 * pin) * config.dpiV / 144
                         setInk(x: x, y: row)
                     }

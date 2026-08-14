@@ -107,28 +107,40 @@ struct ImageWriterInterpreterTests {
     // MARK: - Graphics: exact dot placement + bit order
 
     @Test
-    func standardGraphicsColumnBitOrderTopIsBit7() {
-        // A single column 0x81 = bit7 (pin 0, top) + bit0 (pin 7, bottom). The
-        // head is a 72-dpi 8-pin column, so on the 144-vpi canvas the pins sit
-        // 2 rows apart (§12.5): pin 0 → row 0, pin 7 → row 14. (The intervening
-        // odd rows are where the SECOND interlace half-band's pins land.)
+    func standardGraphicsColumnBitOrderTopIsBit0() {
+        // SUPERSEDED name/assertions (M7 Task 4 fix round 3): this test was
+        // `standardGraphicsColumnBitOrderTopIsBit7` and pinned the MSB-top
+        // guess. The captured live LisaWrite stream proved the C.Itoh
+        // graphics byte is **LSB-top** (bit 0 = top pin): the capture renders
+        // as one clean text line only under LSB-top, and as the user-visible
+        // doubled/garbled print under MSB-top (§12.6 decision 2, corrected).
+        //
+        // 0x01 = bit0 only → pin 0 (top). Head is a 72-dpi 8-pin column, so on
+        // the 144-vpi canvas the pins sit 2 rows apart (§12.5): pin 0 → row 0,
+        // pin 7 → row 14. 0x01 must ink ONLY row 0 — under the old MSB-top
+        // mapping it landed at row 14 (the vertical mirror that scrambled the
+        // interlace).
         let pages = Self.run { interp in
-            interp.feed(Self.stdBand([0x81]))
+            interp.feed(Self.stdBand([0x01]))
+            interp.feed(Self.tab(4))
+            interp.feed(Self.stdBand([0x80]))   // bit7 → BOTTOM pin, row 14
             interp.flush()
         }
         let p = pages[0]
-        #expect(Self.inked(p, 0, 0))        // bit7 = top pin, row 0
+        #expect(Self.inked(p, 0, 0))        // bit0 = top pin, row 0
         #expect(!Self.inked(p, 0, 1))       // 2/144 pitch — no dot on the interlace row
-        #expect(!Self.inked(p, 0, 7))       // (was the bug's location under the 1/144 mapping)
-        #expect(Self.inked(p, 0, 14))       // bit0 = bottom pin, 7 × 2 = row 14
+        #expect(!Self.inked(p, 0, 14))      // NOT mirrored to the bottom pin
+        #expect(Self.inked(p, 4, 14))       // bit7 = bottom pin, 7 × 2 = row 14
+        #expect(!Self.inked(p, 4, 0))
         #expect(Self.inkCount(p) == 2)
     }
 
     @Test
     func columnsAdvanceHorizontally() {
         // Three columns → three adjacent inked dots on the top row.
+        // (0x01 = top pin under the corrected LSB-top bit order, §12.6.2.)
         let pages = Self.run { interp in
-            interp.feed(Self.stdBand([0x80, 0x80, 0x80]))
+            interp.feed(Self.stdBand([0x01, 0x01, 0x01]))
             interp.flush()
         }
         let p = pages[0]
@@ -153,7 +165,7 @@ struct ImageWriterInterpreterTests {
     func tabSetsAbsoluteColumn() {
         let pages = Self.run { interp in
             interp.feed(Self.tab(100))
-            interp.feed(Self.stdBand([0x80]))
+            interp.feed(Self.stdBand([0x01]))
             interp.flush()
         }
         #expect(Self.inked(pages[0], 100, 0))
@@ -164,7 +176,7 @@ struct ImageWriterInterpreterTests {
     func elongatedDoublesColumnsHorizontally() {
         let pages = Self.run { interp in
             interp.feed(14)                       // SO = wide on
-            interp.feed(Self.stdBand([0x80]))     // one column → two dots
+            interp.feed(Self.stdBand([0x01]))     // one column → two dots
             interp.feed(15)                       // SI = wide off
             interp.flush()
         }
@@ -200,6 +212,46 @@ struct ImageWriterInterpreterTests {
         }
         #expect(!Self.inked(p, 0, 16), "the stroke ends at row 15 (16/144 = one band pair)")
         #expect(Self.inkCount(p) == 16)
+    }
+
+    @Test
+    func capturedStreamSkeletonPlacesAscenderAtTopNotMirroredToBottom() {
+        // M7 Task 4 fix round 3 — the regression distilled from the live
+        // LisaWrite capture (`m7-print-raw-stream.bin`), which decodes as:
+        //   ESC P · SI · ESC < · ESC f · ESC T 64 · LF · ESC F ttt · ESC g pass-1
+        //   ESC P · SI · ESC < · ESC f · ESC T 01 · LF · ESC F ttt · ESC g pass-2
+        //   … (ESC T 15 / ESC T 01 alternating for later band pairs) …
+        // The COMMAND SKELETON here is byte-for-byte that shape; the ink is a
+        // synthetic 8-column "ascender" stroke (0x0F = pins 0–3, the TOP half
+        // of the head) in both interlace passes — no Apple raster content.
+        //
+        // Under the corrected LSB-top bit order the two passes interleave into
+        // a solid half-band at rows 64–71 and rows 72–79 stay blank. Under the
+        // old MSB-top bug 0x0F meant pins 4–7, mirroring the stroke into rows
+        // 72–79 — the per-band vertical flip that presented as the doubled,
+        // garbled print (the round-2 "upstream duplication" misdiagnosis).
+        let skeleton: [UInt8] =
+            [Self.esc, UInt8(ascii: "P"), 15,
+             Self.esc, UInt8(ascii: "<"), Self.esc, UInt8(ascii: "f")]
+            + Self.setLineHeight(64) + [Self.lf] + Self.tab(184)
+            + Self.fastBand([UInt8](repeating: 0x0F, count: 8))
+            + [Self.esc, UInt8(ascii: "P"), 15,
+               Self.esc, UInt8(ascii: "<"), Self.esc, UInt8(ascii: "f")]
+            + Self.setLineHeight(1) + [Self.lf] + Self.tab(184)
+            + Self.fastBand([UInt8](repeating: 0x0F, count: 8))
+        let pages = Self.run { interp in
+            interp.feed(skeleton)
+            interp.flush()
+        }
+        #expect(pages.count == 1)
+        let p = pages[0]
+        for y in 64...71 {
+            #expect(Self.inked(p, 184, y), "ascender must be solid at row \(y)")
+        }
+        for y in 72...79 {
+            #expect(!Self.inked(p, 184, y), "row \(y) must be blank — MSB-top mirrored the stroke here")
+        }
+        #expect(Self.inkCount(p) == 8 * 8)   // 8 columns × (4 pins × 2 passes)
     }
 
     // MARK: - Density modes (each bpi ciprint uses, §12.2/§12.3)
@@ -254,10 +306,10 @@ struct ImageWriterInterpreterTests {
         // driver always tabs before a band (CiDev:444), so we tab back to 0.
         let pages = Self.run { interp in
             interp.feed(Self.setLineHeight(72))   // 72/144 in = 72 rows at 144 dpi
-            interp.feed(Self.stdBand([0x80]))     // row 0
+            interp.feed(Self.stdBand([0x01]))     // row 0
             interp.feed(Self.lf)                  // advance 72
             interp.feed(Self.tab(0))
-            interp.feed(Self.stdBand([0x80]))     // row 72
+            interp.feed(Self.stdBand([0x01]))     // row 72
             interp.flush()
         }
         let p = pages[0]
@@ -272,11 +324,11 @@ struct ImageWriterInterpreterTests {
             interp.feed(Self.setLineHeight(50))
             interp.feed(Self.lf)                              // down to 50
             interp.feed(Self.lf)                              // down to 100
-            interp.feed(Self.stdBand([0x80]))                // row 100
+            interp.feed(Self.stdBand([0x01]))                // row 100
             interp.feed(Self.esc); interp.feed(UInt8(ascii: "r"))  // reverse
             interp.feed(Self.lf)                              // up to 50
             interp.feed(Self.tab(0))                          // LF is not CR (§12.5)
-            interp.feed(Self.stdBand([0x80]))                // row 50
+            interp.feed(Self.stdBand([0x01]))                // row 50
             interp.flush()
         }
         let p = pages[0]
@@ -292,9 +344,9 @@ struct ImageWriterInterpreterTests {
         // pageLength144 = 1584. Line height 99 → 17 LFs = 1683 > 1584 crosses.
         let pages = Self.run { interp in
             interp.feed(Self.setLineHeight(99))
-            interp.feed(Self.stdBand([0x80]))       // ink page 1
+            interp.feed(Self.stdBand([0x01]))       // ink page 1
             for _ in 0..<17 { interp.feed(Self.lf) } // cross the page length
-            interp.feed(Self.stdBand([0x80]))       // ink page 2 (wrapped)
+            interp.feed(Self.stdBand([0x01]))       // ink page 2 (wrapped)
             interp.flush()
         }
         #expect(pages.count == 2)
@@ -444,7 +496,11 @@ struct ImageWriterInterpreterTests {
         // 1/144 pin mapping; the corrected two-pass interlace geometry (§12.5 —
         // pins 2/144 apart) legitimately moves every hi-res multi-pin raster, so
         // the pin was re-locked from a known-good run of the fixed mapping.
-        #expect(Self.fnv(pages[0].bits) == 0x3cf1_f467_7fef_02f7)
+        // SUPERSEDED again (M7 Task 4 fix round 3): was 0x3cf1_f467_7fef_02f7
+        // under the MSB-top bit-order guess; the captured-stream-proven LSB-top
+        // order (§12.6 decision 2) legitimately moves every asymmetric-byte
+        // raster. Re-locked from a known-good run of the corrected bit order.
+        #expect(Self.fnv(pages[0].bits) == 0x3d14_c42e_21bf_02f7)
     }
 
     @Test
@@ -468,7 +524,12 @@ struct ImageWriterInterpreterTests {
         // two-pass interlace (§12.5); re-locked from the fixed mapping. The LO
         // (72-vpi, single-pass, NOT interleaved) pin is UNCHANGED — proof the fix
         // only affects the 144-vpi interleaved path.
-        #expect(Self.fnv(hi.bits) == 0xe6ff_27c5_9c36_d389)
-        #expect(Self.fnv(lo.bits) == 0x543e_21ca_4839_3989)
+        // SUPERSEDED again (M7 Task 4 fix round 3): were 0xe6ff_27c5_9c36_d389 /
+        // 0x543e_21ca_4839_3989 under the MSB-top bit-order guess. The corrected
+        // LSB-top order (§12.6 decision 2 — proven by the captured LisaWrite
+        // stream) flips every column's pin assignment, so BOTH pins move this
+        // time (the bit order affects every density, unlike the interlace fix).
+        #expect(Self.fnv(hi.bits) == 0x5286_f877_9b89_1989)
+        #expect(Self.fnv(lo.bits) == 0x3e6d_0b5b_cc96_5989)
     }
 }

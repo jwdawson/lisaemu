@@ -2575,8 +2575,9 @@ Each data byte is one **column of 8 vertical dots** (the band is 8 scanlines
 tall; "Bit" runs along the scan = horizontal, "Scan" = vertical, CiDev:16-19).
 **Bit-within-byte order (top vs bottom pin) is NOT visible in the Pascal** — the
 byte columns are produced by the external assembly `PrVBand`/`PrHBand`
-(CiDev:154-155), so it is a documented **modeling decision** in the interpreter
-(we take bit 7 = top dot). `CiPrBand` white-space-trims each band left and right
+(CiDev:154-155), so it was a documented **modeling decision** in the interpreter
+~~(we take bit 7 = top dot)~~ **[CORRECTED — M7 Task 4 fix round 3: bit 0 =
+top dot (LSB-top), settled empirically — see §12.6 decision 2.]** `CiPrBand` white-space-trims each band left and right
 and emits a leading `ESC 'F'` tab for the trimmed left margin (CiDev:419-448),
 so real streams interleave `ESC F` + short `ESC g` runs rather than one
 full-width band.
@@ -2613,8 +2614,25 @@ affect the byte-level command parsing:
    bounded-logged; the canvas grid itself is fixed per page. Lo-Res preset =
    768×792 at 96×72. (Real jobs command one density before any ink, CiOpen:531,
    so no mid-page resize is needed.)
-2. **Bit 7 = top dot** within each graphics column byte (see 12.4 — not
-   recoverable from the Pascal source).
+2. ~~**Bit 7 = top dot** within each graphics column byte (see 12.4 — not
+   recoverable from the Pascal source).~~ **[CORRECTED — M7 Task 4 fix
+   round 3.]** **Bit 0 = top dot** (LSB-top, the C.Itoh 8510 graphics-byte
+   convention). Not recoverable from the Pascal (12.4), but settled
+   **empirically** against the captured live LisaWrite stream
+   (`m7-print-raw-stream.bin`): hand-decoding shows a normal 144-spi
+   interlace (band pairs at 144ths 64/65, 80/81, 96/97, 112/113 —
+   `ESC T 01`/`ESC T 15` advances exactly per 12.5), and re-rendering the
+   pass bytes under both bit orders shows LSB-top yields a **single clean
+   text line** ("This is a test of the lisa write application", inked rows
+   72–116) while the old MSB-top guess vertically mirrors each 8-pin pass
+   inside its 16/144 band window, scrambling the interlace into **two
+   stacked garbled copies** — exactly the doubling observed in
+   `m7-print-01.png`/`m7-print-02-interlace-corrected.png`. Pinned by
+   `standardGraphicsColumnBitOrderTopIsBit0` and
+   `capturedStreamSkeletonPlacesAscenderAtTopNotMirroredToBottom` (a
+   synthetic-ink reconstruction of the capture's exact command skeleton);
+   render evidence: `m7-print-03-full-page.png` /
+   `m7-print-03-single-text-crop.png`.
 3. **Vertical grid = the config's V dpi**, driven by the 144ths accumulator.
    ~~Interlace half-band advances (1/15) land on adjacent rows rather than
    physically interleaved passes — a raster-fidelity simplification, not a
@@ -2633,7 +2651,7 @@ affect the byte-level command parsing:
    `interlacedHalfBandsProduceASolidVerticalStroke` (16 contiguous inked rows)
    and the moved hi-res golden FNVs.
 
-   > **SCOPE (honest).** This corrects the *within-band* interlace geometry
+   > ~~**SCOPE (honest).** This corrects the *within-band* interlace geometry
    > only. The **whole-line vertical doubling** a user reported on a live
    > LisaWrite print (the text appearing as two stacked copies, ~2× the screen
    > height) is **NOT** this geometry and is not fixed by it: raw-stream capture
@@ -2643,7 +2661,16 @@ affect the byte-level command parsing:
    > (~3% aligned overlap) yet each read as the full line — i.e. the emitted
    > raster is ~2× the screen height. That duplication is **upstream** of the
    > `ImageWriterInterpreter` (the QuickDraw print-spool/banding path), which
-   > renders the wire bytes faithfully. Flagged for a separate investigation.
+   > renders the wire bytes faithfully. Flagged for a separate investigation.~~
+   >
+   > **[REFUTED — M7 Task 4 fix round 3.]** The "upstream duplication" was a
+   > misreading of a stream rendered with the **wrong bit order** (decision 2):
+   > MSB-top mirrors every 8-pin pass vertically inside its band, so the one
+   > emitted text line *looked like* two different 32-scanline copies. The wire
+   > content is a single, correctly-interlaced line (~45 print rows, not 2×
+   > screen height — "64 scanlines" was the band-pair envelope 64–127, most of
+   > it blank); under LSB-top the captured stream renders as one solid line.
+   > Nothing is wrong upstream; no OS/QuickDraw involvement.
 4. **Page emission triggers**: (a) the LF accumulator forward-crossing the page
    length (the real form-feed mechanism, 12.5); (b) `flush()` for an
    end-of-stream partial page; (c) `ESC c` reset flushes any dirty page. A bare

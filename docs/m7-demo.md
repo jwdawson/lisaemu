@@ -130,6 +130,28 @@ New `lisadbg` commands this milestone: **`--printer-dir <path>`** (closed jobs �
 per-page 1bpp→grayscale PNGs), **`printer`** (flush the open job + report
 counters), **`reset`** (warm reset).
 
+### Troubleshooting — *"(Not presently connected!)"* / phantom expansion cards
+
+If the print monitor reports the printer *"(Not presently connected!)"* even
+though Preferences shows an ImageWriter on Serial B, the config almost certainly
+carries **phantom expansion cards** from earlier experiments (the live-QA case:
+a *2 Port Card* in slot 2 with a device still attached — the original "port 2"
+printer try — plus a *Priam Card* in slot 3). The OS's device-build resolves
+printing to the phantom card's printer, which of course is never "connected".
+This is **authentic OS behavior**, not an emulator bug: Preferences keeps card
+and device records independently, and a stale card entry wins.
+
+**Fix, in Preferences:** disconnect the *devices* attached to the phantom cards
+first, **then** remove the cards themselves, leaving a Serial-B-only config —
+then power cycle (same image) and print again.
+
+One host-side gotcha from live QA: a **stale app build** prints garbled pages
+(banded, fading dot rows — the pre-fix interlace/bit-order signature). If a
+print looks corrupted, rebuild `LisaApp` first before suspecting the emulator;
+the emulation thread also dumps every closed job's raw wire bytes + page rasters
+to `~/Library/Application Support/LisaEmu/PrintDebug/` (see `PrintDebugDump`)
+for offline comparison.
+
 ## Part 4 — the macOS print panel (LisaApp)
 
 In the app, a closed job arrives on `AppModel.onPrintJob` → main thread → the
@@ -198,12 +220,15 @@ Each piece is fully cited in `hardware-notes.md` §11–§12 / `rom-trace-notes.
 
 M7 makes the Lisa print end to end and stops at **breadth, not a wall**:
 
-- **Interlace vertical doubling.** The printed page is correct and legible but
-  shows a vertical doubling — the ImageWriter's two-pass 144-vpi interlace lands
-  adjacent half-bands on adjacent rows under the interpreter's simplified vertical
-  mapping (Task 3 decision 3). True interleaved-pass geometry is driven by
-  external `PrVBand`/`PrHBand` asm (not the Pascal source); a pixel-true 144-vpi
-  follow-up.
+- ~~**Interlace vertical doubling.** The printed page is correct and legible but
+  shows a vertical doubling…~~ **SUPERSEDED (fix rounds 2–3):** the doubling had
+  *two* stacked root causes, both fixed — the pin pitch is **2/144″**
+  (`CiPrBMVert` two-pass interleave, §12.5) and the graphics bit order is
+  **LSB-top** (bit 0 = top pin, §12.4 — the MSB-top guess vertically mirrored
+  every band, scrambling the interleave into stacked comb copies). The real
+  captured wire stream now renders as a **single solid text line**
+  (`m7-print-03-full-page.png` / `m7-print-03-single-text-crop.png`), and an
+  anti-comb golden pins it.
 - **Warm reset + Widget boot → boot error 42.** A warm `Machine.reset()` followed
   by a Widget boot hits boot error 42 at the menu (a fresh power cycle boots
   cleanly). This is a **pre-existing** warm-reset/Widget-boot interaction, not the
@@ -235,8 +260,8 @@ M7 makes the Lisa print end to end and stops at **breadth, not a wall**:
 
 - **Receive-side serial** — LisaTerminal / LisaBug serial console, built on the
   SCC receive path (the transmit-side SCC is done and is their foundation).
-- **Pixel-true 144-vpi interlace** — model the interleaved two-pass band geometry
-  (external `PrVBand`/`PrHBand`) so the printed page has no vertical doubling.
+- ~~**Pixel-true 144-vpi interlace**~~ **DONE in fix rounds 2–3** (2/144″ pin
+  pitch + LSB-top bit order; see "The honest frontier").
 - **Daisy wheel / Canon** — a second and third printer device through the
   `PrinterPort` seam (text-only daisy wheel; Canon inkjet).
 - **The warm-reset/Widget-boot error 42** — root-cause the pre-existing
@@ -341,5 +366,5 @@ rule as M2–M6's artifacts):
 **The north star is met:** the emulated Lisa **prints** — configured through its
 own Preferences, persisting the config across a power cycle, and streaming a real
 ImageWriter raster out Serial B to a PNG or the macOS print panel — with the
-honest caveats above (interlace vertical doubling; receive-side serial and the
-other printer devices are future).
+honest caveats above (receive-side serial and the other printer devices are
+future).

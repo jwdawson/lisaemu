@@ -57,6 +57,17 @@ import LisaCore
 /// (Preferences/Wastebasket/Clipboard/Internal Hard Disk) and no LisaWrite doc.
 /// Restore an image whose desktop carries the LisaWrite document to run this.
 ///
+/// **DEFERRED (M7 close, 2026-08-15): full self-provisioning.** The canonical
+/// image is now the user's *living* disk (LisaWrite document put away, not on
+/// the desktop), so this test should ultimately open the document itself via
+/// the Filer route (open the disk window, double-click the put-away document)
+/// instead of relying on desktop state. The `dclick`/`postDoubleClick`
+/// primitive for that landed (desktop icons open reliably; items *inside*
+/// windows still resist the gesture — unresolved), but the menu-route flow was
+/// not completed under the milestone's token budget. Until then the test keeps
+/// the desktop-document prerequisite above — roster item, alongside the
+/// pristine-image rebuild (scripted reinstall) it pairs with.
+///
 /// Gated on `LISAEMU_ROM_DIR` + `LISAEMU_WIDGET_DIR` holding
 /// `OS31-installed.widget` (which has LisaWrite installed).
 private let pRomDir = ProcessInfo.processInfo.environment["LISAEMU_ROM_DIR"]

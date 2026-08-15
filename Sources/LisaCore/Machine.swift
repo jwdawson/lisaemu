@@ -398,10 +398,25 @@ public final class Machine {
     ///
     /// `0x06` is the COPS mouse-button keycode (same code `lisadbg`'s single
     /// `click` posts).
-    public func postDoubleClick() {
+    ///
+    /// **`phaseCycles` (M8).** Each button phase (down-held, then up-held)
+    /// lasts this long; the two button-DOWNS therefore land `2 *
+    /// phaseCycles` apart. The default `100_000` (~20ms at 5MHz) is the M7
+    /// value tuned against the Lisa OS and is left untouched -- the Lisa's
+    /// driver consumes queued COPS *events*, so short phases are fine.
+    ///
+    /// A **Macintosh guest (MacWorks Plus) needs longer phases**: it samples
+    /// the button LEVEL at VBL (~16.7ms), so a 20ms phase gets barely one
+    /// sample and a phase is easily missed entirely -- observed live at the
+    /// MacWorks Finder, where this gesture only ever selected an icon while
+    /// two ordinary `click`s (60ms phases) opened it. There is ample room:
+    /// the Mac's own `DoubleTime` ($2F0) reads `$20` = 32 ticks = 533ms, far
+    /// wider than either spacing, so the fix is slower phases rather than
+    /// tighter ones. `lisadbg` passes 300_000 under `guest mac`.
+    public func postDoubleClick(phaseCycles: UInt64 = 100_000) {
         for _ in 0..<2 {
-            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + 100_000)
-            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + 100_000)
+            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + phaseCycles)
+            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + phaseCycles)
         }
     }
 }

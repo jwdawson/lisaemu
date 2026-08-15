@@ -81,9 +81,12 @@ Never hand-edit `Sources/CMusashi`. All changes are patches applied by
 
 - `lisadbg --rom <dir> [--widget/--disk <img>] [--printer-dir <d>]
   [--printer-raw <f>]`; prompt commands include `g`, `gu <addr>` (run until
-  PC = breakpoint), `iot clear`/`iot limit <n>` (the ioTrace cap is a TOTAL,
-  not a window — it fills during POST, so clear it before a slice whose I/O
-  you need to see), `sc`/`sca`, `click`, `dclick`,
+  PC = breakpoint), `gw <addr>` (run until a byte changes), `iot clear`/`iot
+  limit <n>` (the ioTrace cap is a TOTAL, not a window — it fills during
+  POST, so clear it before a slice whose I/O you need to see), `guest
+  mac|lisa` (which guest's cursor the click/drag steering reads back —
+  MacWorks keeps its mouse in Mac low memory, not the Lisa OS's cells),
+  `sc`/`sca`, `click`, `dclick`,
   `press/release/moveto/drag`, `type`, `insert/eject`, `printer`, `reset`,
   `power`.
 - Every closed print job auto-dumps raw wire bytes + page rasters +

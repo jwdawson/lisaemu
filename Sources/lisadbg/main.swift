@@ -397,7 +397,9 @@ func click(_ m: Machine) {
 /// double-click threshold and flaky) — shared with `ROMPrinterTests`.
 func doubleClickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
     steerCursor(m, to: tx, ty)
-    m.postDoubleClick()
+    // A Macintosh guest samples the button level at VBL, so it needs phases
+    // long enough to be sampled -- see `Machine.postDoubleClick`.
+    m.postDoubleClick(phaseCycles: guestCursorMode == .mac ? 300_000 : 100_000)
 }
 
 // MARK: - `click <x> <y>` / `type <text>` (M5 Task 3)
@@ -407,40 +409,77 @@ func doubleClickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
 // M5 Task 3's install trace). `click` feedback-steers whichever cursor is live,
 // so it drives both the ROM boot menu and the OS/installer UI.
 
+/// Which guest's cursor `osCursor` should read (M8, MacWorks Plus). A
+/// Macintosh guest keeps its mouse in Mac low memory, not in the Lisa OS's
+/// cells, so the steering loop is reading a dead address under MacWorks and
+/// runs away to a screen edge. `guest mac` switches it.
+enum GuestCursorMode { case lisa, mac }
+var guestCursorMode: GuestCursorMode = .lisa
+
 /// The live cursor (x,y): the OS cursor (`MousX`/`MousY`, physical $3CF0) when
 /// it reads plausibly on-screen, else the ROM boot-menu cursor ($496/$498).
+/// Under `guest mac`, the Macintosh `Mouse` global ($830) instead -- a Mac
+/// `Point`, so **v (y) first, then h (x)**, verified live at the MacWorks
+/// Finder ($828 MTemp / $82C RawMouse / $830 Mouse all tracking together,
+/// reading (15,15) with the cursor parked at the top-left).
 func osCursor(_ m: Machine) -> (Int, Int) {
+    if guestCursorMode == .mac {
+        return (Int(m.bus.read16(0x832)), Int(m.bus.read16(0x830)))
+    }
     let ox = Int(m.bus.physicalRead16(0x3CF0)), oy = Int(m.bus.physicalRead16(0x3CF2))
     if ox <= 720 && oy <= 364 && (ox > 0 || oy > 0) { return (ox, oy) }
     return (Int(m.bus.read16(0x496)), Int(m.bus.read16(0x498)))
 }
 
-/// Feedback-steer the cursor to `(tx,ty)` then press+release the button. The
-/// half-step on X damps the OS mouse driver's 3/2 coarse scaling (LIBHW-MOUSE).
-func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
-    for _ in 0..<80 {
-        let (cx, cy) = osCursor(m)
-        let dx = tx - cx, dy = ty - cy
-        if abs(dx) <= 1 && abs(dy) <= 1 { break }
-        m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
-                             dy: Int8(max(-100, min(100, dy))))
-        m.run(until: m.cycles + 200_000)
-    }
-    click(m)
+/// Per-axis delta sign the guest's mouse driver responds to, MEASURED rather
+/// than assumed (M8). The Lisa OS's driver and MacWorks' need not share a
+/// convention -- and they do not: blind steering under MacWorks drove the
+/// cursor to (0,363) while asking for (300,200). Rather than hard-code a
+/// second set of constants per guest, probe once: nudge, observe, keep the
+/// sign that moved the cursor the way we asked.
+///
+/// Returns (1,1) unchanged for the Lisa guest, so every existing pin
+/// (`bootdisk`'s menu clicks, M5/M6/M7's OS gestures) steers byte-identically.
+/// Cached across steers: the signs are a property of the guest's mouse
+/// driver, not of the moment. Probing on every steer would also perturb the
+/// cursor and burn 400k cycles between the two clicks of a `dclick`, which
+/// is exactly the spacing a double-click depends on. Reset by `guest`.
+var cachedCursorSigns: (Int, Int)?
+
+func measureCursorSigns(_ m: Machine) -> (Int, Int) {
+    guard guestCursorMode == .mac else { return (1, 1) }
+    if let cached = cachedCursorSigns { return cached }
+    let (x0, y0) = osCursor(m)
+    m.bus.cops.postMouse(dx: 8, dy: 8)
+    m.run(until: m.cycles + 400_000)
+    let (x1, y1) = osCursor(m)
+    // No observed motion (cursor pinned at an edge, or the probe landed
+    // between driver polls) leaves that axis at +1 -- the convergence loop
+    // simply corrects on the next iteration if it guessed wrong.
+    let signs = (x1 < x0 ? -1 : 1, y1 < y0 ? -1 : 1)
+    cachedCursorSigns = signs
+    return signs
 }
 
-/// Feedback-steer the cursor to `(tx,ty)` using the same convergence loop as
-/// `clickAt`, but WITHOUT clicking -- shared by `press`/`drag` so the button
-/// transitions land at the intended pixel.
+/// The shared convergence loop behind `click`/`moveto`/`press`/`drag`: post
+/// damped COPS deltas until the live cursor reaches `(tx,ty)`. The half-step
+/// on X damps the OS mouse driver's 3/2 coarse scaling (LIBHW-MOUSE).
 func steerCursor(_ m: Machine, to tx: Int, _ ty: Int) {
+    let (sx, sy) = measureCursorSigns(m)
     for _ in 0..<80 {
         let (cx, cy) = osCursor(m)
         let dx = tx - cx, dy = ty - cy
         if abs(dx) <= 1 && abs(dy) <= 1 { break }
-        m.bus.cops.postMouse(dx: Int8(max(-100, min(100, dx / 2))),
-                             dy: Int8(max(-100, min(100, dy))))
+        m.bus.cops.postMouse(dx: Int8(max(-100, min(100, sx * dx / 2))),
+                             dy: Int8(max(-100, min(100, sy * dy))))
         m.run(until: m.cycles + 200_000)
     }
+}
+
+/// Feedback-steer the cursor to `(tx,ty)` then press+release the button.
+func clickAt(_ m: Machine, _ tx: Int, _ ty: Int) {
+    steerCursor(m, to: tx, ty)
+    click(m)
 }
 
 /// Steer to `(tx,ty)` then press the mouse button DOWN and leave it held
@@ -759,6 +798,12 @@ while let line = readLine(strippingNewline: true) {
             : String(format: "still $%02X", Int(before))
         reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU,
                     prefix: "      gw $\(String(format: "%06X", Int(addr))) stop=\(reason) (\(change)) after \(n) cycle budget")
+    case .guestCursor(let mac):
+        guestCursorMode = mac ? .mac : .lisa
+        cachedCursorSigns = nil   // re-probe against the new guest's driver
+        print(mac
+            ? "      cursor source = Macintosh low-mem Mouse ($830, Point v/h); delta signs measured per steer"
+            : "      cursor source = Lisa OS MousX/MousY (physical $3CF0), falling back to the boot ROM's $496/$498")
     case .ioTraceClear:
         machine.bus.clearIOTrace()
         print("      ioTrace cleared (limit=\(machine.bus.ioTraceLimit)) -- the next g/gu slice starts from empty")
@@ -872,7 +917,7 @@ while let line = readLine(strippingNewline: true) {
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | gw <hexaddr> [cycles] | iot clear | iot limit <n> | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | gw <hexaddr> [cycles] | iot clear | iot limit <n> | guest mac|lisa | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

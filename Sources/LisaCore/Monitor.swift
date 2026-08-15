@@ -21,6 +21,11 @@ public struct Monitor {
         case ioTraceClear
         /// `iot limit <n>` (M8 tooling) -- resize that cap for a session.
         case ioTraceLimit(Int)
+        /// `guest mac` / `guest lisa` (M8) -- which guest's cursor the
+        /// click/moveto/press/drag steering should read back. A Macintosh
+        /// guest (MacWorks Plus) keeps its mouse in Mac low memory, not in
+        /// the Lisa OS's cells, so the loop steers blind under the default.
+        case guestCursor(mac: Bool)
         case screenshot(String), asciiPreview
         /// The scripted menu-boot harness (M4 Task 2): cycle/instruction
         /// budget defaults to `bootdisk`'s own generous constant when no
@@ -144,6 +149,13 @@ public struct Monitor {
                    return .goUntil(a, int(2, default: goUntilDefaultBudget))
         case "gw": guard let a = hex(1) else { return nil }
                    return .goWatch(a, int(2, default: goUntilDefaultBudget))
+        case "guest":
+            guard parts.count >= 2 else { return nil }
+            switch parts[1] {
+            case "mac": return .guestCursor(mac: true)
+            case "lisa": return .guestCursor(mac: false)
+            default: return nil
+            }
         case "iot":
             guard parts.count >= 2 else { return nil }
             switch parts[1] {

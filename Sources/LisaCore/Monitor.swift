@@ -24,6 +24,11 @@ public struct Monitor {
         /// this drives the OS's own cursor once the OS is running -- see
         /// lisadbg's `osCursor`/`clickAt`.
         case click(Int, Int)
+        /// `dclick <x> <y>` (M7 Task 4) -- a tight double-click: two down/up
+        /// pairs within a few hundred k cycles so the OS reliably reads a
+        /// double-click (opening icons/folders). Two separate `click`s put the
+        /// button-downs too far apart to register.
+        case dclick(Int, Int)
         /// `type <text>` (M5 Task 3) -- injects `text` as COPS keyboard
         /// make/break events (with Shift for uppercase / shifted symbols).
         case type(String)
@@ -63,6 +68,17 @@ public struct Monitor {
         /// `eject` (M6 Task 3) -- eject the current floppy (`floppy.eject()`),
         /// the same call the app's `ejectFloppy` mailbox makes.
         case ejectFloppy
+        /// `printer` (M7 Task 4) -- flush any inked page + open print job to
+        /// the `--printer-dir` PNG sink and report the pipeline's byte/job
+        /// counters. A no-op-but-status if `--printer-dir` wasn't given. The
+        /// pipeline itself lives in lisadbg (LisaShell), not `Monitor`; this
+        /// case is just the parsed signal, like every other command here.
+        case printer
+        /// `reset` (M7 Task 4) -- warm-reset the Machine (`machine.reset()`),
+        /// the same path `EmulationController.reset()` takes: CPU back to the
+        /// ROM entry, attached media (floppy/Widget/printer port) survives.
+        /// Used to reproduce the config→reboot→print flow in one process.
+        case reset
         case quit, help
     }
 
@@ -120,6 +136,10 @@ public struct Monitor {
             guard parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]),
                   x >= 0, y >= 0 else { return nil }
             return .click(x, y)
+        case "dclick":
+            guard parts.count >= 3, let x = Int(parts[1]), let y = Int(parts[2]),
+                  x >= 0, y >= 0 else { return nil }
+            return .dclick(x, y)
         case "type":
             guard parts.count >= 2 else { return nil }
             return .type(parts[1...].joined(separator: " "))
@@ -142,6 +162,8 @@ public struct Monitor {
             guard parts.count >= 2 else { return nil }
             return .insertFloppy(parts[1...].joined(separator: " "))
         case "eject": return .ejectFloppy
+        case "printer": return .printer
+        case "reset": return .reset
         case "q": return .quit
         case "?": return .help
         default:  return nil

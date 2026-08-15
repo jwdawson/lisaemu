@@ -28,6 +28,7 @@ struct LisaEmuApp: App {
                     appDelegate.model = model // see AppDelegate's doc comment
                     model.insertDiskIfRequested()
                     model.runAutoScreenshotIfRequested()
+                    model.runPrintTestIfRequested()
                 }
         }
         .windowResizability(.contentSize)
@@ -94,6 +95,12 @@ struct LisaEmuApp: App {
                 .disabled(model.poweredOff)
 
                 Divider()
+
+                // M7 Task 4: printer status indicator, default connected. A
+                // checked Toggle so the menu shows the current state; unchecking
+                // makes the app drop incoming print jobs (acts as an unplugged
+                // printer). The OS-side Serial-B config is separate (§11.6).
+                Toggle("Printer Connected (Serial B)", isOn: Bindable(model).printerConnected)
 
                 Toggle("Throttle", isOn: Bindable(model).throttled)
                     .keyboardShortcut("t", modifiers: [.command])

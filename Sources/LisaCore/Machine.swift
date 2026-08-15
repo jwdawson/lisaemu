@@ -162,6 +162,7 @@ public final class Machine {
         bus.videoTiming.reset()
         bus.floppy.reset()
         bus.widget.reset()
+        bus.scc.reset()   // M7 Task 2: SCC register state back to power-on
     }
 
     public func schedule(at cycle: UInt64, _ action: @escaping (Machine) -> Void) {
@@ -262,7 +263,12 @@ public final class Machine {
         }
         let level1 = (bus.via1.irqAsserted || vsyncPending || floppyPending) ? 1 : 0
         let level2 = bus.via2.irqAsserted ? 2 : 0
-        cpu.setIRQ(level: max(level1, level2))
+        // M7 Task 4: the SCC serial controller is CPU Level 6 (docs/hardware-
+        // notes.md §5, §11.4). Its only asserted source in the printer model
+        // is the channel-B Tx-empty interrupt that drives the OS's XMIT ISR --
+        // without it the printer driver sends one byte and waits forever.
+        let level6 = bus.scc.irqAsserted ? 6 : 0
+        cpu.setIRQ(level: max(level1, level2, level6))
     }
 
     /// Executes a single CPU instruction, advancing `cycles` by the amount
@@ -287,5 +293,25 @@ public final class Machine {
             halted = true
         }
         return executed
+    }
+
+    // MARK: - Scripted-input gestures (M7 Task 4)
+
+    /// The double-click **gesture**, timed so the running OS reliably reads it
+    /// as one: two mouse-button down/up pairs with both button-downs inside
+    /// ~400k CPU cycles. Two independently scripted clicks put the downs
+    /// ~600k+ cycles apart — marginal against the OS's double-click threshold
+    /// and observably flaky (M7 Task 4). The **single** implementation of the
+    /// timing; steering the cursor to the target first is the caller's job
+    /// (`lisadbg`'s `dclick` and `ROMPrinterTests` each steer with their own
+    /// harness idiom, then call this).
+    ///
+    /// `0x06` is the COPS mouse-button keycode (same code `lisadbg`'s single
+    /// `click` posts).
+    public func postDoubleClick() {
+        for _ in 0..<2 {
+            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + 100_000)
+            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + 100_000)
+        }
     }
 }

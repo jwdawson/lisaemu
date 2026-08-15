@@ -142,6 +142,18 @@ private final class Shared {
         set { lock.lock(); defer { lock.unlock() }; _onDiskError = newValue }
     }
 
+    /// M7 Task 4: closed print jobs, republished from the emulation thread
+    /// (where the `PrinterPipeline`'s spooler closes them) to the app. Same
+    /// lock-protected get/set + `@Sendable` shape as `onStatus`/`onDiskError`
+    /// above, for the identical cross-thread-reassignment reason (assigned by
+    /// the app at startup, read+invoked on the emulation thread inside the
+    /// spooler's `onJob`).
+    private var _onPrintJob: (@Sendable ([PrinterPage]) -> Void)?
+    var onPrintJob: (@Sendable ([PrinterPage]) -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return _onPrintJob }
+        set { lock.lock(); defer { lock.unlock() }; _onPrintJob = newValue }
+    }
+
     /// Set only from the emulation thread's startup failure path (before
     /// `startupGate.signal()`), read only from `EmulationController.init`
     /// after `startupGate.wait()` returns -- the semaphore itself is the
@@ -223,6 +235,20 @@ public final class EmulationController {
     public var onDiskError: (@Sendable (String) -> Void)? {
         get { shared.onDiskError }
         set { shared.onDiskError = newValue }
+    }
+
+    /// M7 Task 4: fires ON THE EMULATION THREAD (same contract as
+    /// `onStatus`/`onFrame` — the app hops threads itself) once per **closed
+    /// print job**, with that job's pages in feed order. A job is the run of
+    /// pages the OS's ImageWriter driver emitted on Serial B with no more than
+    /// the spooler's idle window (2 s host-time) between them; there is no
+    /// form-feed byte, so "the printer went quiet" is the only end-of-job
+    /// signal (docs/hardware-notes.md §12.5). `LisaApp` presents each job in
+    /// an `NSPrintOperation`; `lisadbg --printer-dir` writes each page to a
+    /// PNG. Never fires for a still-open job.
+    public var onPrintJob: (@Sendable ([PrinterPage]) -> Void)? {
+        get { shared.onPrintJob }
+        set { shared.onPrintJob = newValue }
     }
 
     /// Mailbox-set (see `Mailbox.throttledSnapshot`'s doc comment): the
@@ -427,6 +453,27 @@ public final class EmulationController {
             shutdownGate.signal()
             return
         }
+
+        // M7 Task 4: the printer pipeline lives on THIS thread (it owns the
+        // SCC). Attach its `PrinterPort` to channel B, republish each closed
+        // job through `shared.onPrintJob` (read fresh under its lock, so a
+        // late app assignment still wins), and tick it once per loop iteration
+        // below with host wall-clock time. The SCC keeps the port across
+        // `machine.reset()` (SCC8530.reset), so this survives a warm reset.
+        let printer = PrinterPipeline()
+        machine.bus.scc.channelB.printerPort = printer.printerPort
+        // M7 print-debug: tee the raw wire stream and dump per-job artifacts
+        // (raw bytes, page rasters, diagnostics) at every job close -- see
+        // `PrintDebugDump`. The interpreter is captured `weak` so the spooler's
+        // `onJob` doesn't complete an interpreter <-> spooler retain cycle
+        // (interpreter.onPage already holds the spooler strongly).
+        let printDebug = PrintDebugDump()
+        printer.rawByteSink = { printDebug.append($0) }
+        printer.onJob = { [weak interpreter = printer.interpreter] job in
+            printDebug.dump(job: job, interpreter: interpreter)
+            shared.onPrintJob?(job)
+        }
+
         startupGate.signal()
 
         var running = false
@@ -531,10 +578,19 @@ public final class EmulationController {
                 case .powerButton:
                     machine.bus.cops.pressPowerButton()
                 case .shutdown:
+                    // Flush any inked-but-unclosed page + open job so a print
+                    // in flight at quit isn't silently lost.
+                    printer.flush()
                     shutdownGate.signal()
                     return
                 }
             }
+
+            // M7 Task 4: advance the printer's idle clock every iteration with
+            // host wall-clock time (the idle window is a real-time gap, not an
+            // emulated-cycle one — §12.5). Runs in every state: even while
+            // paused/halted, a job that just went quiet must still close.
+            printer.tick(now: ProcessInfo.processInfo.systemUptime)
 
             guard running, !machine.halted, machine.powerState == .on else {
                 // Avoid a hot spin while paused/halted/powered-off; mailbox is
@@ -650,3 +706,82 @@ public final class EmulationController {
     }
 }
 
+
+/// M7 print-debug: captures the raw Serial-B wire stream (via
+/// `PrinterPipeline.rawByteSink`) and, at every job close, dumps that job's
+/// artifacts for offline corruption analysis:
+///
+///   - `job-N-raw.bin`   -- the exact bytes the OS transmitted since the
+///                          previous job closed (the ImageWriter wire stream),
+///   - `job-N-page-M.pgm` -- each rendered page raster as binary PGM (P5,
+///                          ink = black; Foundation-only, no ImageIO),
+///   - `job-N-info.txt`  -- byte/page counts plus the interpreter's bounded
+///                          unknown-byte log (unmodeled escapes surface here).
+///
+/// Always on: the files are small, written only when a print job actually
+/// closes, and land in `LISAEMU_PRINT_DEBUG_DIR` (default
+/// `~/Library/Application Support/LisaEmu/PrintDebug`). Emulation-thread-only,
+/// like the pipeline that feeds it.
+private final class PrintDebugDump {
+    private var raw: [UInt8] = []
+    private var jobIndex = 0
+    private let directory: URL
+
+    init() {
+        if let env = ProcessInfo.processInfo.environment["LISAEMU_PRINT_DEBUG_DIR"] {
+            directory = URL(fileURLWithPath: env, isDirectory: true)
+        } else {
+            directory = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask)[0]
+                .appendingPathComponent("LisaEmu/PrintDebug", isDirectory: true)
+        }
+    }
+
+    func append(_ byte: UInt8) { raw.append(byte) }
+
+    func dump(job: [PrinterPage], interpreter: ImageWriterInterpreter?) {
+        jobIndex += 1
+        let bytes = raw
+        raw.removeAll(keepingCapacity: true)
+        let prefix = "job-\(jobIndex)"
+        do {
+            try FileManager.default.createDirectory(at: directory,
+                                                    withIntermediateDirectories: true)
+            try Data(bytes).write(to: directory.appendingPathComponent("\(prefix)-raw.bin"))
+            for (n, page) in job.enumerated() {
+                try pgmData(for: page)
+                    .write(to: directory.appendingPathComponent("\(prefix)-page-\(n).pgm"))
+            }
+            var info = "raw bytes: \(bytes.count)\npages: \(job.count)\n"
+            for (n, page) in job.enumerated() {
+                info += "page \(n): \(page.width)x\(page.height) @ \(page.dpi.h)x\(page.dpi.v) dpi\n"
+            }
+            if let interpreter {
+                info += "unknown bytes logged: \(interpreter.unknownLog.count)"
+                    + " (+\(interpreter.unknownLogDropped) dropped)\n"
+                for entry in interpreter.unknownLog {
+                    info += String(format: "  byte 0x%02X at y144=%d\n", entry.byte, entry.y144)
+                }
+            }
+            try info.write(to: directory.appendingPathComponent("\(prefix)-info.txt"),
+                           atomically: true, encoding: .utf8)
+            print("[print-debug] wrote \(prefix)-* to \(directory.path)")
+        } catch {
+            print("[print-debug] dump failed: \(error)")
+        }
+    }
+
+    /// One page raster as binary PGM (P5), ink = black.
+    private func pgmData(for page: PrinterPage) -> Data {
+        var out = Data("P5\n\(page.width) \(page.height)\n255\n".utf8)
+        out.reserveCapacity(out.count + page.width * page.height)
+        for y in 0..<page.height {
+            let rowStart = y * page.rowBytes
+            for x in 0..<page.width {
+                let bit = page.bits[rowStart + (x >> 3)] & (0x80 >> UInt8(x & 7))
+                out.append(bit != 0 ? 0 : 255)
+            }
+        }
+        return out
+    }
+}

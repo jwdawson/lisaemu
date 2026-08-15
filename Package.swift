@@ -36,7 +36,11 @@ let package = Package(
         ),
         .executableTarget(
             name: "lisadbg",
-            dependencies: ["LisaCore"],
+            // LisaShell for the M7 printer pipeline (ImageWriterInterpreter +
+            // PrintJobSpooler + PrinterPipeline) behind `--printer-dir`; still
+            // Foundation-only, so the debugger stays framework-light apart from
+            // its existing ImageIO/CoreGraphics PNG use.
+            dependencies: ["LisaCore", "LisaShell"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),
         // Foundation-only shell layer (M1c): owns the emulation thread and

@@ -88,6 +88,16 @@ final class AppModel {
         }
     }
 
+    /// M7 Task 4: the Machine-menu "Printer Connected (Serial B)" indicator,
+    /// **default connected**. The emulator always attaches the printer pipeline
+    /// to Serial B (see `EmulationController`), so this is primarily a status
+    /// indicator; when the user unchecks it, the app suppresses the print panel
+    /// (treating the printer as unplugged) rather than reaching into the
+    /// emulation thread to detach the port. A real ImageWriter print still
+    /// requires the OS-side Preferences → Connect Devices config (§11.6); this
+    /// toggle is the app's own "should I surface print jobs" switch.
+    var printerConnected: Bool = true
+
     private var controller: EmulationController?
 
     /// Long-lived, reused across `apply(_:)` calls (perf-fix round, "CGImage
@@ -192,6 +202,25 @@ final class AppModel {
                 self?.diskError = message
             }
         }
+        // M7 Task 4: a closed print job fires on the emulation thread (see
+        // `EmulationController.onPrintJob`); hop to main, then present it in the
+        // standard macOS print panel. `[PrinterPage]` is Sendable, so the hop
+        // is clean; `presentPrintJob` respects the `printerConnected` toggle.
+        controller.onPrintJob = { [weak self] pages in
+            DispatchQueue.main.async {
+                self?.presentPrintJob(pages)
+            }
+        }
+    }
+
+    /// Presents a closed print job (`[PrinterPage]`) in the standard macOS
+    /// print panel — unless the "Printer Connected (Serial B)" indicator is
+    /// off, in which case the job is dropped (the app is acting as an unplugged
+    /// printer). Main-actor: `NSPrintOperation` is main-thread only, and
+    /// `wire(_:)` already hopped here.
+    private func presentPrintJob(_ pages: [PrinterPage]) {
+        guard printerConnected else { return }
+        PrintPresenter.present(pages)
     }
 
     private func apply(_ frame: Frame) {
@@ -265,6 +294,50 @@ final class AppModel {
         let args = CommandLine.arguments
         guard let flagIndex = args.firstIndex(of: "--insert-disk"), args.count > flagIndex + 1 else { return }
         insertFloppy(url: URL(fileURLWithPath: args[flagIndex + 1]))
+    }
+
+    /// Supports `--print-test`: a debug-only launch argument that, shortly
+    /// after launch, feeds a synthetic ImageWriter page through the SAME
+    /// `PrintPresenter` path a real print job uses — so the standard macOS
+    /// print panel can be brought up (and screenshotted / "Save as PDF"
+    /// sanity-checked) without driving a full multi-minute OS boot + print in
+    /// the GUI. The page is rendered entirely from our own `SyntheticDotFont`
+    /// via `ImageWriterInterpreter` (no Apple content). Inert unless the
+    /// argument is present. Mirrors `runAutoScreenshotIfRequested`'s shape.
+    func runPrintTestIfRequested() {
+        let args = CommandLine.arguments
+        // `--print-test-pdf <path>`: headless variant — writes the exact PDF
+        // the panel would render (via `PrintDocument.makePDFData`) and quits.
+        // Usable without a window server (unlike the interactive panel), so it
+        // produces a viewable render artifact in CI / an agent context.
+        if let flag = args.firstIndex(of: "--print-test-pdf"), args.count > flag + 1 {
+            let path = args[flag + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                let pages = [AppModel.syntheticPrintTestPage()]
+                if let data = PrintDocument.makePDFData(pages: pages) {
+                    try? data.write(to: URL(fileURLWithPath: path))
+                }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+        guard args.contains("--print-test") else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            self.presentPrintJob([AppModel.syntheticPrintTestPage()])
+        }
+    }
+
+    /// A synthetic ImageWriter page (our own `SyntheticDotFont` — no Apple
+    /// content) for the `--print-test`/`--print-test-pdf` proofs.
+    private static func syntheticPrintTestPage() -> PrinterPage {
+        let interpreter = ImageWriterInterpreter()
+        var page: PrinterPage?
+        interpreter.onPage = { page = $0 }
+        interpreter.feed(Array("LISAEMU M7 PRINT PANEL TEST".utf8))
+        interpreter.flush()
+        return page ?? PrinterPage(width: 8, height: 8, bits: [UInt8](repeating: 0, count: 8),
+                                    dpi: PrinterPage.DPI(h: 160, v: 144))
     }
 
     // MARK: - Machine menu actions

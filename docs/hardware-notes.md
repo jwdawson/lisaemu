@@ -873,6 +873,23 @@ Source: libhw-DRIVERS (various), OS/source-mover.text.unix.txt, OS/source-INITRA
 - **Level 5:** Expansion slot 0
 
 - **Level 6:** RS-232 SCC (mover:822-849, INITRAP:136-137)
+  - **M7 Task 4 (WIRED):** the SCC now asserts CPU Level 6 when a channel has a
+    pending, enabled Tx-empty interrupt (`SCC8530.irqAsserted`, OR'd into
+    `Machine.tickVIAsAndUpdateIRQ`). This is REQUIRED for printing: the OS's
+    `XMIT` ISR (§11.4 step 5) sends the first byte polled, then drives every
+    subsequent byte off the Level-6 Tx-empty interrupt — without it a live
+    print emits exactly ONE byte and stalls (observed). Task 2's "SCC not wired
+    to the CPU IRQ" note is superseded here — and to the project's honesty bar,
+    it was **wrong in reasoning, harmless in effect at boot**: its stated
+    rationale ("the polled fast path never blocks, so the driver drains its
+    buffer synchronously and never waits on a Level-6 interrupt") is **refuted**
+    by rsASM:96-152 — the driver polls only byte 1 (`RSOUT`/`BYTEO`); bytes
+    2..N ride the `XMIT` ISR (`WR0=$29` :98, `WR1=0` :100-101, `WR0=$38` :103,
+    `JSR RSOUT` :129-133, exit re-arms `WR1=$17` via `#$0617`→`RESTORE`
+    :150-152). It happened to be boot-harmless *only* because channel B is never
+    armed at boot (no `dinit`, so Level 6 never asserts — the FNV checkpoints
+    confirm boot is byte-identical). Autovectored (`$78`), like every other Lisa
+    interrupt.
 
 - **Level 7:** NMI (INIT_NMI_TRAPV, INITRAP:43,73)
   - Debugger break-in via low-core $7C — LDASM:68-106
@@ -1652,7 +1669,12 @@ zone/track/sector/side:
   boot ROM statically reads it for POST-level memory sizing, but the whole
   containing routine scored zero hits in the same live single-step
   reachability check; unstubbed (`0xFF`) either way, not confirmed blocking.
-- RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.
+- ~~RS-232 SCC base (RSBASE) not chased. Consult SOURCE-SERCARD/SOURCE-DEVCONTROL.~~
+  **CHASED (M7 Task 1): `RSBASE = IOMMU + $0D201 = $FCD201`** (source-mover:46);
+  full Z8530 register map, driver init/transmit discipline, the ROM POST
+  `$FCD241`-mirror probe, and the parameter-memory persistence answer are now in
+  §11 "SCC / Serial B". The `$FCD241` ROM probe is a bus-error-guarded presence
+  test that the `0xFF` stub satisfies by ACKing the cycle (§11.5).
 - `$E01C`/`$E01E` (video-register-adjacent bare strobes, M1b Task 5) — usage
   site found (bracketing a RAM-sizing/checksum routine, result discarded),
   purpose not identified. See §2 "Vertical Retrace" above.
@@ -2126,3 +2148,537 @@ Decided for the Task-2 Widget HLE (reasoning inline):
   correct model; flush granularity is per-block to bound data loss on an
   abrupt exit. (A future optimization may batch flushes, but per-block is the
   safe default.)
+
+## 11. SCC / Serial B (RS-232) — the Z8530 contract (M7 Task 1)
+
+The Lisa's two RS-232 ports (A and B) are a single Zilog **Z8530 SCC** (dual
+channel). The built-in SCC is interrupt **Level 6** (§5 "Interrupt Levels":
+`rsints = $600`; RSINT handler mover:827-849, INITRAP:136-137). This section is
+the driver contract Task 2 codes the real device against. Constants are
+SOURCE-DERIVED from `/Users/jdawson/Development/Lisa_Source/LISA_OS/` unless a
+line is tagged **OBSERVED** (M7 Task 1 live trace: Rev H ROM + OS31-installed
+Widget boot to desktop, release build; see docs/rom-trace-notes.md "Checkpoint N
+prep").
+
+### 11.1 RSBASE and the register-address map — SOURCE-DERIVED + OBSERVED
+
+- `IOMMU = $FC0000` (source-PASCALDEFS.TEXT.unix.txt:47, source-SERNUM.TEXT.unix.txt:15).
+- **`RSBASE = IOMMU + $0D201 = $FCD201`** (source-mover.text.unix.txt:46), with
+  `PORTB = 0`, `CTRL = 0` (source-mover.text.unix.txt:47-48). This strikes the
+  Known-Gaps "RSBASE not chased" record below.
+- The four SCC registers are at **odd** byte addresses, stride 2 — the built-in
+  port-control addresses the OS computes are `iospacemmu*$20000 + $0D203` for
+  channel A control and `portacontrol − 2` for channel B control
+  (source-rs232.text.unix.txt:516-523; `iospacemmu*$20000 = IOMMU`,
+  i.e. `iospacemmu = $7E`). The data register is control **+4** (`DATA .EQU 4`,
+  source-rsASM.TEXT.unix.txt:24):
+
+  | Address     | Register             | Access                          |
+  |-------------|----------------------|---------------------------------|
+  | `$FCD201`   | channel **B** control | write reg#/value; read = RRn    |
+  | `$FCD203`   | channel **A** control | "                               |
+  | `$FCD205`   | channel **B** data    | Tx byte out / Rx byte in        |
+  | `$FCD207`   | channel **A** data    | "                               |
+
+  Address bit 1 selects channel (A = bit1 set, i.e. +2), bit 2 selects
+  data (+4); higher address bits are **not decoded** — see the `$FCD241` ROM
+  mirror in §11.5. **Serial B (the printer port) control = `$FCD201`,
+  data = `$FCD205`.**
+- Expansion-card serial ports (not the built-in) use the same scheme at slot
+  bases `iospacemmu*$20000 + {$2003,$6003,$A003}` (control A) / `{$2001,$6001,$A001}`
+  (control B) for slots 0/1/2 (source-rs232.text.unix.txt:503-513,
+  SOURCE-SERCARD.TEXT.unix.txt:131-133). SOURCE-SERCARD is only the per-slot
+  interrupt **dispatcher** (reads WR2/RR2 for the vector); the built-in RS-232
+  byte engine is `source-rs232.text` (Pascal) + `source-rsASM` (assembly).
+
+### 11.2 Register-access discipline — SOURCE-DERIVED
+
+- **Write a WR register** — `WR_SCC(regno, val)` (source-rsASM.TEXT.unix.txt:528-566):
+  `INTSOFF` (mask RS ints) → write `regno` byte to the control address →
+  a NOP-equivalent delay (a memory access) → write `val` byte to the same
+  control address → `INTSON`. Register-pointer-then-value, both to the one
+  control port.
+- **Read an RR register**: write the register number to control, then read the
+  control address (e.g. RR1 error status, source-rsASM.TEXT.unix.txt:160-166).
+  A bare read of control (no preceding select) returns **RR0** (the default
+  pointer), which is how RSOUT and RESTORE sample status
+  (source-rsASM.TEXT.unix.txt:429, 626).
+- **Data**: `MOVE.B char,DATA(A0)` writes the Tx byte to control+4
+  (source-rsASM.TEXT.unix.txt:489); `MOVE.B DATA(A0),Dn` reads the Rx byte
+  (source-rsASM.TEXT.unix.txt:167).
+
+### 11.3 Channel-B init sequence (`dinit`) — SOURCE-DERIVED
+
+Order the OS driver programs when a Serial-B device is opened
+(source-rs232.text.unix.txt:538-580, then RESTORE at :642; baud via the internal
+`dcontrol` dcode 5 at :558-566 / :740-751):
+
+1. Dummy read of control (resets the register pointer to RR0/WR0) (:544).
+2. `WR9 = $4A` — reset channel B (:545). (Channel A uses `$8A`; a full-chip
+   reset is `WR9 = $C0`, which is what the ROM POST issues — §11.5.)
+3. `WR4 = $44` — async, ×16 clock, 1 stop bit, parity off (:548).
+4. `WR11 = $D0` — clock source (channel B = oscillator), then a ~1000-iter wait
+   for the oscillator to start (:554-555). (Channel A = `$50`, baud-rate
+   generator, :551.)
+5. **Baud** (dcode 5, :740-751): `WR14 = $00` (BRG off) → `WR12 = TC_lo` →
+   `WR13 = TC_hi` → `WR14 = openwr14` (channel B `= 1`, i.e. BRG on from the
+   oscillator). The time constant is `TC = (temp DIV baud) − 2` with
+   **`temp = 115200` for channel B** (125000 for channel A). Default at init is
+   **1200 baud** (:564) → `TC = 94 = $005E`.
+6. `WR10 = $00` — NRZ encoding (:568).
+7. `WR3 = $C1` — Rx 8 bits/char, Rx enable (:570).
+8. `WR5` — Tx enable + DTR (channel-B byte from :542/:572; a later `dcontrol`
+   parity call sets `$A8` for B, "port B always has RTS off", :679).
+9. `WR15 = $A0` — enable external/status interrupts on **Break** and **CTS**
+   change (channel B; channel A = `$90`, Break + Sync) (:577).
+10. `controlreg := $10` — reset ext/status latch (:580).
+11. `RESTORE` writes `WR1 = $17` — enable Rx / Tx / status interrupts on the
+    channel (:642, source-rsASM.TEXT.unix.txt:600-647).
+
+### 11.4 Transmit-a-byte + "printer connected and ready" — SOURCE-DERIVED
+
+`RSOUT`/`BYTEO` sends one byte (source-rsASM.TEXT.unix.txt:426-525):
+
+1. Read **RR0** (bare control read) → status (:429).
+2. `BTST #2` — **RR0 bit 2 = Tx Buffer Empty**. If clear, return (can't send
+   yet) (:430-431).
+3. If hardware handshake (`xmt_hs = hw_hs`): require `(RR0 & xmtrr0) == xmtrr0`
+   **and** `(~RR0 & xmtzrr0) == xmtzrr0` (:448-457). For **channel B**
+   `xmtrr0 = 0`, `xmtzrr0 = $20` (source-rs232.text.unix.txt:540, :720) — i.e.
+   **RR0 bit 5 (CTS) must read 0** for transmit to proceed (the OS comment calls
+   it "DSR'"; on the DB-25 the modem-control input the port gates on).
+4. Write the byte to the **data** register `$FCD205` (:489); set `AWAIT_TX = $04`
+   (:491).
+5. Completion arrives as a **Level-6 Tx-empty interrupt** (RSINT, mover:827-849
+   → rsASM DRIVER `XMIT`): `WR0 = $29` (reset Tx-int-pending + point WR1) →
+   `WR1 = 0` → `WR0 = $38` (reset IUS) (source-rsASM.TEXT.unix.txt:98-103).
+
+**M7 Task 4 — our interrupt model (SOURCE-DERIVED from the `XMIT` ISR, and
+LIVE-VERIFIED).** The ISR (source-rsASM.TEXT.unix.txt:96-133) is the load-bearing
+detail: only the **first** byte is sent by the polled `RSOUT` above; every
+byte after that is sent from inside the Level-6 ISR, which does `WR0=$29`
+(clear the Tx-empty latch), `WR1=0` (disable), `WR0=$38`, then `RSOUT` the
+**next** byte *while Tx-int is disabled*, and finally `RESTORE` writes
+`WR1=$17` to re-enable — at which point the still-set Tx-empty latch re-asserts
+`/INT` for the following byte. So our SCC models the Tx-empty as a **level
+latch, not an edge**: `SCC8530.writeData` sets `txInterruptPending` on *every*
+data write (the host sink empties the buffer instantly), and
+`SCCChannel.irqAsserted = txInterruptPending && WR1 bit1 && WR9 bit3 (MIE)`
+gates the CPU assertion. `WR9=$4A` (the ch-B reset that dinit issues, §11.3
+step 2) carries MIE (bit3) + NV (bit1); our channel reset preserves those mode
+bits (`wr[9] = value & $3F`) since the driver never re-writes WR9. The final
+ISR clears the latch (`WR0=$29`) and sends no further byte, so `/INT` drops and
+there is **no interrupt storm** at end-of-transfer. **Live proof:** without
+this wiring a LisaWrite print emitted exactly 1 byte on Serial B and stalled;
+with it, the same print emitted 9229 bytes and produced a full page raster
+(m7-print-01.png). Ext/status (CTS/DCD/Break) and Rx interrupts are **not**
+modeled/asserted — nothing in the transmit-only printer path changes a modem
+line or feeds the receiver.
+
+**RR2 dispatch (SOURCE-DERIVED, load-bearing).** The Level-6 handler `RSINT`
+does **not** know a priori which port/interrupt fired — it reads it from the
+SCC. `RSINT` selects **RR2 on channel B**, reads it, masks **`$0E`** (bits
+3-1), `LSR #1`, and splits: bit 3 → port (0 = B, 4 = A), bits 2-1 → interrupt
+type (0 = Tx buffer empty, 1 = ext/status, 2 = Rx available, 3 = special Rx);
+`INTPAR == 0` dispatches into `XMIT` (source-mover.text.unix.txt:824-848). RR2
+is the Z8530 **modified interrupt vector**: on channel A it reads the base
+vector `WR2` unmodified; on channel B it reads `WR2` with the highest-priority
+pending interrupt's status in bits 3-1 (status-**low**, since the driver's
+`dinit` leaves `WR9` bit 4 clear). Our SCC asserts Level 6 only for the
+channel-B Tx-empty interrupt (status code `000`), so channel-B RR2 forces bits
+3-1 to `000` and RSINT correctly decodes "port B, output interrupt." **Our
+model programs RR2 explicitly** (`SCCChannel.rr2()`) rather than letting it fall
+to the unknown-register default (which returned 0 — the same `$0E`-masked
+value, so dispatch "worked," but undocumented, fragile to any fallback change,
+and logging an unknown access on *every* interrupt, ~thousands of drops per
+print). Ext/status and Rx status codes aren't modeled because those interrupts
+never fire.
+
+So the driver's notion of **"connected and ready to accept a byte"** is:
+**RR0 bit 2 (Tx buffer empty) set**, and — under hardware handshake — **RR0 bit 5
+(CTS) asserted**. It learns of CTS/DCD/Break transitions via the Level-6
+external/status (modem-change) interrupt enabled by `WR15 = $A0`; the handler
+re-reads RR0 for modem status (rsASM.TEXT.unix.txt:295-320). RR0 bit assignments
+the driver relies on: bit0 = Rx char available, bit2 = Tx buffer empty,
+bit3 = DCD, bit5 = CTS. Input errors are read from **RR1** (mask `$70` =
+framing/overrun/parity, source-rsASM.TEXT.unix.txt:160-166). Software XON/XOFF
+(`$11`/`$13`) is an alternate handshake selected by `dcontrol` dcode 3
+(source-rs232.text.unix.txt:727-731); the printer's exact handshake (DSR-hardware
+vs XON/XOFF vs CR/LF-delay) is a Preferences/`dcontrol` choice (dcodes 2/3/4,
+:714-738), not fixed in the driver.
+
+The higher-level printer path (`LIBS/LIBPR`) is a QuickDraw grafPort
+(`LibPr-ciprint.text:190-191 OpenPort`); its byte output reaches Serial B through
+the OS device manager → the RS-232 CD device for the built-in SCC (slot 10,
+below), i.e. this same driver — not a second register path.
+
+### 11.5 ROM POST SCC probe, and why the `0xFF` stub passes — OBSERVED
+
+- The Rev H boot ROM touches the SCC exactly once during POST, at **`$FE10D0`**,
+  via the **mirror `$FCD241`** (`= $FCD201 | $40`; bits 0-2 identical to
+  channel-B control, bit 6 undecoded → same register). OBSERVED live at
+  cyc ≈ 692674: `R $FCD241=$FF`, then the table-driven write sequence
+  **`$02,$00,$09,$C0,$05,$82`** (`move.b (A2)+,(A0)`), then `R $FCD241=$FF`.
+  Decoded: `WR2=$00` (int vector), `WR9=$C0` (**force hardware reset**, both
+  channels), `WR5=$82` (DTR + RTS asserted). It is **write-mostly**; the two RR0
+  reads are **not value-compared**.
+- The probe is **bus-error-guarded**: the ROM installs a bus-error handler at
+  `$FE100C` before the access; the *only* failure path is a **bus timeout**
+  (device absent), which loads boot error `$37`/`$38` and sets a soft-fail bit in
+  D7, then continues POST (docs/rom-trace-notes.md:289-299, 722-732 —
+  `cmpa.l #$fcd241,A0` at `$FE10EE`). POST is **non-fatal** on failure and never
+  compares register values.
+- **Why `0xFF` passes:** "present" means "the address ACKs the cycle without a
+  bus error." Our dispatcher answers `$FCD241` (like all of `$FCD2xx`) with the
+  generic unmapped-I/O default `0xFF` (IODispatcher.swift:316-332 — there is **no
+  dedicated SCC case**; the M1b "$D241 candidate SCC / 0xFF stub passes" note is
+  hereby confirmed, not merely candidate). A normal `$FF` read is a completed bus
+  cycle, so no bus error fires, no `$37/$38`, no fail bit — the SCC reads as
+  present and POST proceeds. **What the real device must return to keep POST
+  passing: nothing specific — merely ACK the bus cycles.** (Value semantics
+  matter only to the OS driver and to Task 2's transmit path, not to POST.)
+- **OBSERVED boot-to-desktop:** the OS then runs the §11.3 `dinit` against
+  **channel A** (`$FCD203`) at cyc ≈ 53.1M — full WR sequence
+  `WR9=$8A, WR4=$44, WR11=$50, WR14=$00, WR12=$0B/WR13=$00` (TC 11 ⇒ ≈9600 baud,
+  channel-A console default), `WR14=$03, WR10=$00, WR3=$C1, WR5=$EA, WR15=$00,
+  WR1=$00` — exactly the register discipline of §11.2-11.3. **Channel B
+  (`$FCD201`) is never initialized on the no-Preferences boot path** (no
+  Serial-B device is configured — see §11.6). 29 SCC accesses total to the
+  desktop; all absorbed by the `0xFF` stub with no fault, no halt. The stub is
+  sufficient for boot; a real Z8530 is only needed to actually *move bytes*
+  (Task 2).
+
+### 11.6 Parameter memory (PM) — where it lives, and persistence — SOURCE-DERIVED + OBSERVED
+
+**Where PM physically lives (SOURCE-DERIVED).** The 64 bytes of parameter memory
+live in the **disk-controller (6504 / Sony-IOB) shared static RAM**, *not* in a
+battery-backed NVRAM:
+
+- `PMEMAD = TWIGBAS + $180 = IOMMU + $0C000 + $180 = $FCC180`
+  (source-mover.text.unix.txt:42, :17).
+- `W_PARAM_MEM` writes the 64 bytes with `MOVEP.L D0,1(A2)` stepping A2 by 8 —
+  i.e. to the **odd** byte lanes `$FCC181, $FCC183, … $FCC1FF`
+  (source-mover.text.unix.txt:617-633), the classic 6504-shared-RAM byte layout.
+  It only writes when the disk is idle (source-twiggy.text.unix.txt:226-264,
+  gated on the `$FCD801` diag bit).
+- PM layout (source-PMEM.TEXT.unix.txt:29-49): version/timestamp, screen/beep/
+  mouse prefs, `pm_cdCount` (byte 9), **`pm_DevConfig` (bytes 10-59)** — the
+  device-connection table the Preferences serial-B printer entry would occupy —
+  and a checksum (bytes 62-63). The built-in SCC **card** is CD position
+  **(slot 10, chan 0, dev 0)** — the single auto-generated entry `GetNxtConfig`
+  emits for it (source-PMEM.TEXT.unix.txt:267-276) — and `PutNxtConfig`
+  **refuses to store any config record at exactly `(slot=10, chan=0)`**
+  (source-PMEM.TEXT.unix.txt:445, the `(pos.slot=10) and (pos.chan=0)` guard),
+  because that coordinate is the built-in port itself, rebuilt from scratch every
+  boot. So a configurable Serial-B **printer** record is **not** keyed on
+  `(10, 0)`. What *is* source-certain about how Serial B is distinguished: the SCC
+  driver splits the two channels by **`iochannel`** — `iochannel = 0` → channel
+  **B**, non-zero → channel **A** (SOURCE-SERCARD.TEXT.unix.txt:151) — and CD sets
+  `iochannel := chan` from the device's position channel (SOURCE-CD.TEXT.unix.txt:741,
+  `chan_offset = $800` per channel at :521-527). The exact `(slot, chan, dev)`
+  triple the Preferences "Device Connections" tool assigns a Serial-B printer —
+  and precisely how it clears the `(10,0)` guard (a non-zero `chan`/`dev` on the
+  SCC card, or a distinct pseudo-slot) — is **not** unambiguously derivable from
+  SERCARD/CD/PMEM alone (it lives in the Preferences tool's CD-building logic, not
+  in these units). **Flagged as a Task-4 live-verification point**: capture the
+  actual `pm_DevConfig` bytes a live "printer on Serial B" save produces and read
+  back the stored position, rather than asserting a channel number here.
+
+**Persistence on real hardware is the disk snapshot, not NVRAM (SOURCE-DERIVED).**
+`Write_PMem` does **two** things: `Paramem_Write` (→ the volatile `$FCC181`
+shared RAM) **and** `PMSnapshot` (→ a copy on the boot volume)
+(source-PMEM.TEXT.unix.txt:156-157). At boot, `INIT_CDS` calls `READ_PMEM`
+(SOURCE-CD.TEXT.unix.txt:1758) and `pmem_state` reconciles the RAM copy against
+the disk snapshot (`PMg_SSg / PMb_SSg / …`, source-PMEM.TEXT.unix.txt:207-214).
+The shared RAM survives a warm reset but is lost on power-off; **true
+cross-power-cycle persistence is the boot-volume snapshot.**
+
+**Our machine today (OBSERVED).**
+- `$FCC180` falls inside the FloppyController's `$FCC000-$FCC7FF` shared-RAM
+  window, so PM writes **are** backed (IODispatcher.swift:315/365 → `floppy.window`).
+  Verified: writing `$A0…` to `$FCC181,$183,…` reads back; at power-on the region
+  reads `$00` (window zero-init, FloppyController.swift:269).
+- **`reset()` wipes PM.** `Machine.reset()` calls `bus.floppy.reset()`
+  (Machine.swift:163), which **zeroes the whole window**
+  (FloppyController.swift:495-496). Verified: `$A0…` → all `$00` after `reset()`.
+  A soft power-**off** (`powerState = .off` via the COPS power-off handler,
+  Machine.swift:105-107) does **not** call `reset()`, so PM survives *in memory*
+  while powered off — but the next power-**on** is a `reset()`, so **PM does NOT
+  survive a full off→on cycle** on our machine.
+- On the live boot, `INIT_CDS` read PM **196 times, all `$00`** (empty/zeroed),
+  and made **no** PM writes — so the OS built only the built-in devices and
+  never a Serial-B printer CD. This is exactly why channel B is never inited
+  (§11.5): no PM config ⇒ no Serial-B device ⇒ no `dinit`.
+
+**Would a Preferences Serial-B printer config survive? — VERDICT.**
+- Saving it triggers `Write_PMem` → `Paramem_Write` (lands in `floppy.window`,
+  volatile) **+** `PMSnapshot` (a **disk** write). Our disk writes are
+  **write-through-persistent** to the backing file (WidgetImage.swift:20-24, :176),
+  so the snapshot path *already works in principle*. If the same Widget image is
+  reused across boots, `READ_PMEM`/`INIT_CDS` would reload the config and rebuild
+  the Serial-B CD — with `pmem_state` taking the `PMb_SSg` (RAM-bad, snapshot-good)
+  fallback, which is faithful to a real Lisa after power loss.
+- **Two gaps for M7 in practice:** (1) our boot harness runs from a **fresh /tmp
+  copy** each time, so no snapshot survives between runs by construction; (2) the
+  config also needs Task 2's real SCC (so the port opens) and the printer CD to
+  be creatable.
+- **Cost estimate to make PM persist:**
+  - *Cheapest / most faithful (≈0 new code):* reuse one Widget image across boots
+    and let the existing `PMSnapshot`/`READ_PMEM` disk path do the work — a
+    harness/policy choice, already functional via write-through.
+  - *Model battery-like RAM survival (small, ~20-40 lines):* carve the 64 PM bytes
+    (`$180-$1FF`, odd lanes) out of `FloppyController.reset()`'s blanket zero, and
+    optionally load/save that 64-byte slice to a host file at power-on/off so it
+    survives an emulator restart without a disk round-trip.
+  - *Full fidelity (medium):* also model the `pmem_state` checksum/snapshot
+    reconciliation so RAM-vs-disk divergence behaves exactly as `SOURCE-PMEM`
+    describes. Not needed for a working printer config; only for edge-case parity.
+
+**M7 Task 4 — LIVE-VERIFIED (closes the Task-4 verification point above).**
+Driving the real Preferences → **Connect Devices** flow live: the device list
+for a serial connector is `Nothing / Serial Cable / Modem A / Imagewriter · ‖
+DMP / Daisy Wheel Printer`; selecting **Serial B Connector → Imagewriter / ‖
+DMP** attaches the dot-matrix printer, and **Set Aside** (which calls
+`Write_PMem`) persists it. **Persistence works via the disk snapshot with ZERO
+new emulator code:** a *fresh boot of the same Widget image* (a full power
+cycle — new process, fresh `Machine.reset()` that zeroes shared-RAM PM) still
+shows "Serial B Connector — Imagewriter / ‖ DMP", because `INIT_CDS`/`READ_PMEM`
+reload the config from the `PMSnapshot` written to the write-through Widget and
+`pmem_state` takes the RAM-bad/snapshot-good (`PMb_SSg`) path. This is the
+"reuse image across boots" outcome (≈0 code) predicted above, now confirmed.
+**Verdict on the PM-sparing `reset()` fix: NOT required** — neither for the
+headless `lisadbg` flow (separate-process reboot re-reads the disk) nor, by the
+same `pmem_state` reconciliation, for the app's warm `reset()` (RAM PM zeroes,
+disk snapshot survives on the attached Widget, `READ_PMEM` rebuilds). The
+faithful match to real hardware (which also loses battery-less shared-RAM PM on
+power loss and rebuilds from the boot-volume snapshot) is exactly this
+zero-code behavior, so the fix is deliberately **not** taken. The one standing
+limitation: a config made against a *floppy*-only or *non-write-through* boot
+volume would not persist; our Widget is write-through (§10.10), so it does.
+The exact `pm_DevConfig` bytes were observed as a CDS-style table on the odd
+lanes from `$FCC181` (record-separated by `$F8` markers, e.g. `$FCC183=04`,
+`…95=1E $97=F8 …`); a precise (slot,chan,dev) decode was not pinned because the
+monitor's CPU-context read of `$FCC180` is domain-dependent (reads cleanly only
+when the current context maps the disk-controller window) — the load-bearing,
+reproducible fact is the **round-trip**: the config the Preferences UI writes
+survives a power cycle and re-enables channel B, which the live print proves
+end to end.
+
+
+## 12. ImageWriter escape contract (as ciprint emits it) — M7 Task 3
+
+This is the *wire contract* the Lisa OS's C.Itoh/ImageWriter driver actually
+puts on Serial-B, derived end-to-end from the driver source, **not** from a
+printer manual. `LibPr/CiDev` (`LibPr-cidev.text.unix.txt`) is the byte-level
+device layer — every escape sequence the printer ever sees is emitted by a
+`CiOut` in that unit — and `LibPr/CiProcs` + `LibPr/CiGlobals` supply the
+resolution/geometry choices above it. Citations are `file:line` into
+`~/Development/Lisa_Source/LISA_OS/LIBS/LIBPR/`. Where a public
+ImageWriter/C.Itoh 8510 reference disagrees, **the driver source wins** and the
+divergence is noted.
+
+### 12.1 Control bytes and the command alphabet
+Non-command control bytes (CiDev:103):
+`LF = 10`, `SO = 14`, `SI = 15`, `CAN = 24`, `ESC = 27`.
+
+Every command below is `ESC` followed by one command byte (and, where noted,
+ASCII decimal-digit operands or raw data), **except `SO`/`SI` which carry no
+`ESC`** (CiDev:114, `CiSetWide` CiDev:641-645). Command-byte table verbatim from
+CiDev:106-126:
+
+| Sequence | Meaning | Operands | Emitter (CiDev) |
+|---|---|---|---|
+| `ESC 'T' d d` | set line-feed pitch (line height) | 2 ASCII digits, 144ths of an inch, max 99 (`cLFMax`) | `CiSetLineHt` :618-625 |
+| `ESC 'G' d d d d` | **standard** bit-image graphics | 4 ASCII digits = column count `N`, then `N` data bytes | `CiPrGraf` :508-530 |
+| `ESC 'g' d d d` | **fast** bit-image graphics | 3 ASCII digits = `N/8`, then `N` data bytes (`N` = digits×8) | `CiPrGraf` :508-530 |
+| `ESC 'F' d d d d` | horizontal tab / absolute column | 4 ASCII digits = dot column from left | `CiPrTab` :532-538 |
+| `ESC 'f'` / `ESC 'r'` | line-feed direction forward / reverse | — | `CiSetLFFwd` :610-616 |
+| `ESC '<'` / `ESC '>'` | bidirectional / unidirectional print | — | `CiSetBiDir` :560-565 |
+| `ESC 'o'` / `ESC 'O'` | paper-empty stop / override | — | `CiSetPEStop` :627-632 |
+| `ESC '!'` / `ESC '"'` | emphasized (1/160" smear) on / off | — | `CiSetEmph` :598-603 |
+| `SO` / `SI` (no ESC) | elongated (horizontal bit-double) on / off | — | `CiSetWide` :641-645 |
+| `ESC 'X'` / `ESC 'Y'` | underline on / off | — | `CiSetUL` :634-639 |
+| `ESC 'n' N E q Q p P` | set horizontal density (bpi) — see 12.2 | — | `CiSetBpi` :567-581 |
+| `ESC 'Z' b1 b2` | open DIP switches (country) | 2 raw mask bytes | `CiSetCntry` :583-596 |
+| `ESC 'D' b1 b2` | close DIP switches (country) | 2 raw mask bytes | `CiSetCntry` :583-596 |
+| `ESC 'c'` | reset printer to power-on state | — | `CiDevClose` :253-255 |
+| `LF` (bare) | advance paper by current line height | — | `CiBindV` :184 |
+| `CAN` | abort a partial graphics line | — | `CiDevOpen` :272 |
+
+`cmRun = 'V'` (CiDev:109) is **declared but never emitted** by this driver
+(grep-confirmed: the only `'V'` reference is the constant declaration). Public
+references list `ESC 'V'` as a repeated-graphics command; the Lisa path does not
+use it, so the interpreter treats `ESC V` as unknown (bounded-log, no-op).
+
+There is **no `FF` (0x0C)** anywhere in the C.Itoh path (grep-confirmed; only the
+unrelated DaisyWheel driver defines `FF`). **Page ejection is done entirely by
+line feeds**, not a form-feed byte — see 12.4.
+
+### 12.2 Horizontal density (bpi) codes
+`CiSetBpi` (CiDev:567-581) maps the internal `TTybpi` enum to one command byte
+each (CiDev:117-118):
+
+| Code | bpi | Code | bpi |
+|---|---|---|---|
+| `ESC 'n'` | 72 | `ESC 'q'` | 120 |
+| `ESC 'N'` | 80 | `ESC 'Q'` | 136 |
+| `ESC 'E'` | 96 | `ESC 'p'` | 144 |
+| | | `ESC 'P'` | 160 |
+
+Max columns per scan at a given bpi = `8 × bpi` (`CiMaxBits`/`CiHRes`
+CiDev:355-377), i.e. an **8-inch** printable width at every density
+(72→576, 96→768, 144→1152, 160→1280 dots; these are the `cNNNBits` constants,
+CiGlobals:60-61). `CiDevOpen` initialises the printer to **96 bpi** (`tybpi96`,
+CiDev:277); the real print path then re-commands the density **per band** inside
+`CiPrBand` (`CiSetBpi(tybpi)` CiDev:435).
+
+### 12.3 Which density the OS actually uses
+`CiProcs.CiOpen` picks the band `tybpi`/`tyspi` once per job (CiProcs:531-546),
+and `CiMetrics` derives the page geometry from it (CiProcs:402-509). All four
+raster modes (paper page length is **always 11 in / 144ths**, independent of
+orientation — CiProcs:548-549):
+
+| Mode | H bpi | V spi | printable width | code emitted |
+|---|---|---|---|---|
+| Portrait Hi-Res | **160** | **144** | 1280 dots (`c160Bits`) | `ESC 'P'` |
+| Portrait Lo-Res | 96 | 72 | 768 dots (`c96Bits`) | `ESC 'E'` |
+| Landscape Hi-Res | 144 | 144 | 1152 dots (`c144Bits`) | `ESC 'p'` |
+| Landscape Lo-Res | 96 | 144 | 768 dots (`c96Bits`) | `ESC 'E'` |
+
+(CiProcs:408-421, :439-452, :531-546. `prPgFract = 120`, PrStdInfo:81, is the
+PgSize unit — US Letter = 1020×1320 of those; e.g. Portrait Hi-Res paper width
+= `1020×160/120 = 1360` dots, **clamped to the 1280-dot platen** `rPrintable`,
+CiProcs:429-433.)
+
+The WYSIWYG office path prints **purely as graphics** (`ESC G`/`ESC g` bands);
+QuickDraw text is rasterised into the band bitmap upstream (`PrStdText` bottleneck,
+CiPrint:197) and reaches CiDev already as dots. `CiPrText` (CiDev:540-558) emits
+**raw text bytes** *only* in **draft mode** (`CiPrMode.Draft`, CiProcs:306), where
+the driver leans on the printer's own ROM font (plus per-country DIP-switch
+swaps, `CiEuropeanOut` CiDev:310-348). Our interpreter therefore models graphics
+as the primary path; text bytes are handled defensively via a synthetic dot font
+(see 12.6).
+
+### 12.4 Graphics band format (`ESC G` / `ESC g`)
+`CiPrGraf` (CiDev:508-530):
+- **Standard** (`ESC 'G'`): operand = **4 ASCII decimal digits** = `cBits` =
+  the number of dot **columns** `N` (`cDigits = 4`, `cNumber = cBits`), then
+  `CiBlockOut(p, cBits)` sends exactly `N` **data bytes** — one byte per column.
+- **Fast** (`ESC 'g'`): operand = **3 ASCII decimal digits** = `cBits DIV 8`
+  (`cDigits = 3`, `cNumber = cBits DIV 8`), then `N = digits×8` data bytes.
+  `CiPrBand` rounds `cBits` up to a multiple of 8 before calling
+  (CiDev:440-441). Fast graphics is selected whenever the port is the built-in
+  Serial A/B (`fFastGraf := (port=PortA) OR (port=PortB)`, CiProcs:519) — i.e.
+  **the real Lisa serial printer uses `ESC g`**; `ESC G` is the parallel/slow path.
+
+Each data byte is one **column of 8 vertical dots** (the band is 8 scanlines
+tall; "Bit" runs along the scan = horizontal, "Scan" = vertical, CiDev:16-19).
+**Bit-within-byte order (top vs bottom pin) is NOT visible in the Pascal** — the
+byte columns are produced by the external assembly `PrVBand`/`PrHBand`
+(CiDev:154-155), so it was a documented **modeling decision** in the interpreter
+~~(we take bit 7 = top dot)~~ **[CORRECTED — M7 Task 4 fix round 3: bit 0 =
+top dot (LSB-top), settled empirically — see §12.6 decision 2.]** `CiPrBand` white-space-trims each band left and right
+and emits a leading `ESC 'F'` tab for the trimmed left margin (CiDev:419-448),
+so real streams interleave `ESC F` + short `ESC g` runs rather than one
+full-width band.
+
+### 12.5 Vertical positioning, line feeds, and page breaks
+There is **no absolute vertical command**; all vertical motion is relative LFs
+metered by the line-height pitch (`CiBindV` is "the only place emitting LFs",
+CiDev:164-197):
+- Vertical position is tracked in **144ths of an inch**. To move down `Δ`:
+  set direction (`ESC f`), and if `Δ > 99` emit `ESC 'T' 99` + `LF` repeatedly,
+  then `ESC 'T' (Δ mod 99)` + `LF` (CiDev:176-184).
+- Reverse motion sets `ESC r`, moves up, then **"burps"** a small forward LF
+  (`cBurp144ths = 24`, CiDev:123, :191-195) to take up gear lash.
+- Graphics bands advance vertically via `CiDeltaV` after each band: at 144 spi
+  the two interlaced half-bands advance **1** then **15** (=16/144" per 16
+  interlaced dots ⇒ 144 dpi), at 72 spi a band advances **16** (=16/144" per 8
+  dots ⇒ 72 dpi) (CiDev:468-476, :492-502).
+
+**Page eject** (`CiNewPage`, CiDev:379-395): `CiGotoV(cPg144ths + gap)` then
+`CiBindV` LFs the paper to the next page top; `CiBindV` wraps the position
+`cAct144ths := cCur144ths MOD cPg144ths` (CiDev:187). So **crossing the page
+length in the LF accumulator IS the form feed** — there is no distinct eject
+byte. `cPg144ths` defaults to `144×11 = 1584` (CiDev:276) and is reset from the
+real `PgSize.Height` in `CiOpen` (CiProcs:549). The gap `cCiGap144ths = 80`
+(≈0.55", CiGlobals:64) is the roller-to-printhead offset.
+
+### 12.6 Interpreter modeling decisions (ours, documented)
+The `ImageWriterInterpreter` implements 12.1-12.5 faithfully; the following are
+choices where the source is silent or where we deliberately simplify. None
+affect the byte-level command parsing:
+1. **Fixed page geometry from a `Config`** (default = Portrait Hi-Res:
+   1280×1584 dots at 160×144 dpi). The commanded density (12.2) is tracked and
+   used for the emitted page's `dpi.h`, and disagreement with the canvas is
+   bounded-logged; the canvas grid itself is fixed per page. Lo-Res preset =
+   768×792 at 96×72. (Real jobs command one density before any ink, CiOpen:531,
+   so no mid-page resize is needed.)
+2. ~~**Bit 7 = top dot** within each graphics column byte (see 12.4 — not
+   recoverable from the Pascal source).~~ **[CORRECTED — M7 Task 4 fix
+   round 3.]** **Bit 0 = top dot** (LSB-top, the C.Itoh 8510 graphics-byte
+   convention). Not recoverable from the Pascal (12.4), but settled
+   **empirically** against the captured live LisaWrite stream
+   (`m7-print-raw-stream.bin`): hand-decoding shows a normal 144-spi
+   interlace (band pairs at 144ths 64/65, 80/81, 96/97, 112/113 —
+   `ESC T 01`/`ESC T 15` advances exactly per 12.5), and re-rendering the
+   pass bytes under both bit orders shows LSB-top yields a **single clean
+   text line** ("This is a test of the lisa write application", inked rows
+   72–116) while the old MSB-top guess vertically mirrors each 8-pin pass
+   inside its 16/144 band window, scrambling the interlace into **two
+   stacked garbled copies** — exactly the doubling observed in
+   `m7-print-01.png`/`m7-print-02-interlace-corrected.png`. Pinned by
+   `standardGraphicsColumnBitOrderTopIsBit0` and
+   `capturedStreamSkeletonPlacesAscenderAtTopNotMirroredToBottom` (a
+   synthetic-ink reconstruction of the capture's exact command skeleton);
+   render evidence: `m7-print-03-full-page.png` /
+   `m7-print-03-single-text-crop.png`.
+3. **Vertical grid = the config's V dpi**, driven by the 144ths accumulator.
+   ~~Interlace half-band advances (1/15) land on adjacent rows rather than
+   physically interleaved passes — a raster-fidelity simplification, not a
+   parsing one.~~ **[CORRECTED — M7 Task 4 fix round 2.]** The simplification
+   made the two 144-spi half-bands **overlap** instead of interleave (a
+   within-band "comb"): the head is a **72-dpi 8-pin column**, so a pin `p` sits
+   `2/144"` below the band origin — its 144ths vertical position is
+   **`y144 + 2·p`**, canvas row `(y144 + 2·p) × dpiV ÷ 144`. The driver
+   (`CiPrBMVert`, LibPr-cidev:484-502) splits each hi-res band into two passes
+   via `PrHBand`/`PrVBand` (every-other source scanline) and prints them
+   `advance-1-then-15` (CiDeltaV, §12.5); with `2·p` pitch the two passes'
+   pins interleave (`row y, y+1, y+2, …`) into a solid 144-dpi stroke. At 72 spi
+   a single band's pins map through `dpiV=72` to consecutive rows (LO-res raster
+   unchanged). The old `y144 + p` mapping put the passes 1/144 apart so they
+   overlapped (rows 0..7 then 1..8). Pinned by
+   `interlacedHalfBandsProduceASolidVerticalStroke` (16 contiguous inked rows)
+   and the moved hi-res golden FNVs.
+
+   > ~~**SCOPE (honest).** This corrects the *within-band* interlace geometry
+   > only. The **whole-line vertical doubling** a user reported on a live
+   > LisaWrite print (the text appearing as two stacked copies, ~2× the screen
+   > height) is **NOT** this geometry and is not fixed by it: raw-stream capture
+   > (`lisadbg --printer-raw`) shows the OS emits the text region as a single
+   > 64-scanline `CiPrBMVert` block (8 interleaved sub-bands, print rows
+   > 64-127) whose upper and lower 32-scanline halves are **different** rasters
+   > (~3% aligned overlap) yet each read as the full line — i.e. the emitted
+   > raster is ~2× the screen height. That duplication is **upstream** of the
+   > `ImageWriterInterpreter` (the QuickDraw print-spool/banding path), which
+   > renders the wire bytes faithfully. Flagged for a separate investigation.~~
+   >
+   > **[REFUTED — M7 Task 4 fix round 3.]** The "upstream duplication" was a
+   > misreading of a stream rendered with the **wrong bit order** (decision 2):
+   > MSB-top mirrors every 8-pin pass vertically inside its band, so the one
+   > emitted text line *looked like* two different 32-scanline copies. The wire
+   > content is a single, correctly-interlaced line (~45 print rows, not 2×
+   > screen height — "64 scanlines" was the band-pair envelope 64–127, most of
+   > it blank); under LSB-top the captured stream renders as one solid line.
+   > Nothing is wrong upstream; no OS/QuickDraw involvement.
+4. **Page emission triggers**: (a) the LF accumulator forward-crossing the page
+   length (the real form-feed mechanism, 12.5); (b) `flush()` for an
+   end-of-stream partial page; (c) `ESC c` reset flushes any dirty page. A bare
+   `FF` (0x0C), which this driver never emits, is honored defensively as an
+   explicit eject.
+5. **Text bytes** (draft-mode raw ASCII, 12.3) render through a small **synthetic
+   5×7 dot font that is ours** (committed fixture — Lisa fonts are never
+   extracted), advancing the horizontal cursor per glyph.
+6. **Unknown / unmodeled codes** (including `ESC V`, malformed digit runs,
+   stray control bytes) are **bounded-logged and no-op'd, never fatal**
+   (house pattern: a capped log array + a dropped counter, per `Bus.mmuPortLog`).

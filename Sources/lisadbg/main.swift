@@ -97,6 +97,40 @@ func diskStatus(_ machine: Machine) -> String {
     return "disk=IN blocksRead=\(machine.bus.floppy.blocksRead)" + widget
 }
 
+/// The shared `g`/`gu` slice report: the SLIM/SORG port writes and I/O
+/// touches recorded during the slice, the status line, the instruction the
+/// PC now sits on, and the register dump. `prefix` (used by `gu` for its
+/// stop reason) is printed ahead of all of it.
+///
+/// Callers pass the `ioTrace`/`mmuPortLog` counts they sampled *before* the
+/// run. Both logs are bounded (`Bus.ioTraceLimit`, house capped-array
+/// pattern), so a slice late in a boot can legitimately show nothing:
+/// `iot clear` first when the I/O list matters.
+func reportSlice(_ machine: Machine, monitor: Monitor,
+                 beforeIO: Int, beforeMMU: Int, prefix: String? = nil) {
+    if let prefix { print(prefix) }
+    print("--- MMU port writes this slice ---")
+    // Clamped because `iot clear` can leave a stale, larger `beforeIO` from
+    // an earlier sample; slicing past the end would trap.
+    for e in machine.bus.mmuPortLog[min(beforeMMU, machine.bus.mmuPortLog.count)...] {
+        print(formatMMUPortWrite(e))
+    }
+    print("--- I/O touches this slice ---")
+    for access in machine.bus.ioTrace[min(beforeIO, machine.bus.ioTrace.count)...] {
+        print(formatIOAccess(access))
+    }
+    if machine.bus.ioTraceDropped > 0 {
+        print("      (ioTrace full: \(machine.bus.ioTraceDropped) accesses dropped -- `iot clear` / `iot limit <n>`)")
+    }
+    let pcl = machine.bus.cops.powerCommandLog
+    let powerSuffix = machine.powerState == .off
+        ? " power=OFF powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]"
+        : (pcl.isEmpty ? "" : " powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]")
+    print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted)\(powerSuffix) \(diskStatus(machine))")
+    print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
+    print(monitor.registerDump())
+}
+
 func formatIOAccess(_ access: IOAccess) -> String {
     let offsetStr = String(format: "%06X", access.offset)
     let rw = access.isWrite ? "W" : "R"
@@ -706,21 +740,22 @@ while let line = readLine(strippingNewline: true) {
         let beforeMMU = machine.bus.mmuPortLog.count
         let target = machine.cycles + UInt64(n)
         machine.run(until: target)
-        print("--- MMU port writes this slice ---")
-        for e in machine.bus.mmuPortLog[beforeMMU...] {
-            print(formatMMUPortWrite(e))
-        }
-        print("--- I/O touches this slice ---")
-        for access in machine.bus.ioTrace[beforeIO...] {
-            print(formatIOAccess(access))
-        }
-        let pcl = machine.bus.cops.powerCommandLog
-        let powerSuffix = machine.powerState == .off
-            ? " power=OFF powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]"
-            : (pcl.isEmpty ? "" : " powerCmds=[\(pcl.map { String(format: "$%02X", $0) }.joined(separator: ","))]")
-        print("      setup=\(machine.bus.setupMode ? "ON" : "OFF") domain=\(machine.bus.domain) mmuPortWrites=\(machine.bus.mmuPortWrites) busErrorPulses=\(machine.bus.busErrorPulseCount) halted=\(machine.halted)\(powerSuffix) \(diskStatus(machine))")
-        print(monitor.disassembly(from: machine.cpu[.pc], count: 1))
-        print(monitor.registerDump())
+        reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU)
+    case .goUntil(let addr, let n):
+        // Same slice report as `g`, plus WHY it stopped -- the whole point of
+        // `gu` is distinguishing "arrived at the breakpoint" from "ran out of
+        // budget", which a `g` of the same span cannot tell you.
+        let beforeIO = machine.bus.ioTrace.count
+        let beforeMMU = machine.bus.mmuPortLog.count
+        let reason = machine.run(untilPC: addr, maxCycles: UInt64(n))
+        reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU,
+                    prefix: "      gu $\(String(format: "%06X", Int(addr))) stop=\(reason) after \(n) cycle budget")
+    case .ioTraceClear:
+        machine.bus.clearIOTrace()
+        print("      ioTrace cleared (limit=\(machine.bus.ioTraceLimit)) -- the next g/gu slice starts from empty")
+    case .ioTraceLimit(let n):
+        machine.bus.ioTraceLimit = n
+        print("      ioTrace limit=\(n) (holding \(machine.bus.ioTrace.count), dropped=\(machine.bus.ioTraceDropped)); `iot clear` to start fresh")
     case .screenshot(let path):
         let snapshot = machine.bus.framebufferSnapshot()
         do {
@@ -828,7 +863,7 @@ while let line = readLine(strippingNewline: true) {
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | iot clear | iot limit <n> | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

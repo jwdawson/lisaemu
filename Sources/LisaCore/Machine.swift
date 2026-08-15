@@ -242,6 +242,65 @@ public final class Machine {
         }
     }
 
+    /// Why `run(untilPC:maxCycles:)` stopped.
+    public enum StopReason: String, Equatable, CustomStringConvertible {
+        /// The target PC was observed at an instruction boundary.
+        case reachedPC
+        /// `maxCycles` were spent without ever seeing the target PC.
+        case budgetExhausted
+        /// Fatal double fault (`halted`) before the target was reached.
+        case halted
+        /// A clean OS-requested power-off (`powerState == .off`).
+        case poweredOff
+
+        public var description: String { rawValue }
+    }
+
+    /// Runs until the PC reaches `targetPC` at an instruction boundary, at
+    /// most `maxCycles` cycles pass, or the machine halts / powers off --
+    /// the breakpoint primitive `lisadbg`'s `gu` is built on (M8 tooling,
+    /// added for the MacWorks Plus P0 probe: the guest's splash loop burns
+    /// a `$40000`-iteration delay, so `t` cannot practically be walked to
+    /// the interesting call and `g` can only stop on a cycle count).
+    ///
+    /// **Breakpoint semantics:** stops *before* executing the instruction
+    /// at `targetPC`, and always executes at least one instruction first --
+    /// so `gu <the PC you are sitting on>` means "run until you come back
+    /// here", not "return immediately".
+    ///
+    /// **Why single-step and not `run(until:)`:** that path hands Musashi
+    /// slices of up to `irqPollQuantum` cycles, so a PC only visible
+    /// mid-slice is invisible to it. Vendored Musashi's
+    /// `M68K_INSTRUCTION_HOOK` is `M68K_OPT_OFF`, and turning it on would
+    /// be a `Scripts/vendor-musashi.sh` patch billing every caller
+    /// (TomHarte's 807k cases included) for a debugger-only feature. So the
+    /// debugger pays instead. This is a **diagnostic** entry point, not an
+    /// emulation path -- nothing in `LisaShell`/`LisaApp` calls it.
+    ///
+    /// **Precision note:** stepping ticks the VIAs once per instruction
+    /// rather than once per <=1024-cycle slice, so IRQ recognition here is
+    /// *finer* than `run(until:)`'s (see `irqPollQuantum`). Identical
+    /// semantics, marginally different timing -- worth remembering if a
+    /// timing-sensitive repro is being chased through `gu` rather than `g`.
+    @discardableResult
+    public func run(untilPC targetPC: UInt32, maxCycles: UInt64) -> StopReason {
+        let deadline = cycles &+ maxCycles
+        var executedAny = false
+        while cycles < deadline {
+            if halted { return .halted }
+            if powerState != .on { return .poweredOff }
+            if executedAny && cpu[.pc] == targetPC { return .reachedPC }
+            step()
+            executedAny = true
+        }
+        // The budget can run out on the very step that lands on the target;
+        // report that as a hit rather than a miss.
+        if halted { return .halted }
+        if powerState != .on { return .poweredOff }
+        if executedAny && cpu[.pc] == targetPC { return .reachedPC }
+        return .budgetExhausted
+    }
+
     /// Advances both VIAs by the cycles just executed and recomputes the
     /// CPU's IRQ level (docs/hardware-notes.md §5 "Interrupt Levels": VIA1
     /// = level 1 -- OR'd with `vsyncPending`, the not-yet-modeled vsync

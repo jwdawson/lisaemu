@@ -25,9 +25,26 @@ public struct IOAccess: Equatable {
 final class IODispatcher {
     unowned let bus: Bus
 
-    private static let ioTraceLimit = 4096
+    static let defaultIOTraceLimit = 4096
+    /// The bounded-log cap (house pattern: capped array + drop counter).
+    /// A `var` rather than a constant so `lisadbg`'s `iot limit` can widen
+    /// it for a diagnostic session -- the cap is a TOTAL, not a rolling
+    /// window, so a long boot fills it and silently drops everything after
+    /// (M8 tooling; see `clearIOTrace`). Lowering it never truncates what
+    /// is already held; it only stops further recording.
+    var ioTraceLimit = defaultIOTraceLimit
     private(set) var ioTrace: [IOAccess] = []
     private(set) var ioTraceDropped = 0
+
+    /// Empties the trace and its drop counter so a later slice can be
+    /// observed on its own (M8 tooling). Without this, `lisadbg`'s `g`
+    /// prints an empty "I/O touches this slice" list for anything after
+    /// the first ~4096 accesses of a boot, which reads as "the guest
+    /// touched no I/O" when it means "the log filled up during POST".
+    func clearIOTrace() {
+        ioTrace.removeAll(keepingCapacity: true)
+        ioTraceDropped = 0
+    }
 
     /// $FCE800 -- video page latch (docs/hardware-notes.md "Video Latches").
     var videoPageLatch: UInt8 = 0
@@ -466,7 +483,7 @@ final class IODispatcher {
 
     private func record(offset: UInt32, value: UInt8, isWrite: Bool) {
         let access = IOAccess(offset: offset, value: value, isWrite: isWrite, cycles: bus.cycleProvider())
-        if ioTrace.count < Self.ioTraceLimit {
+        if ioTrace.count < ioTraceLimit {
             ioTrace.append(access)
         } else {
             ioTraceDropped += 1

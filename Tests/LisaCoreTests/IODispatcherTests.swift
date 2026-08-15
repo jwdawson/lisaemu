@@ -222,6 +222,46 @@ import Testing
     #expect(bus.ioTraceDropped == 5000 - 4096)
 }
 
+// MARK: - ioTrace debugger controls (M8 tooling)
+
+@Test func clearIOTraceEmptiesTheBufferAndTheDropCounter() {
+    // The cap is a TOTAL, not a per-slice window: once a long boot has
+    // filled it, every later access is dropped and `g`'s "I/O touches this
+    // slice" list is silently empty. Clearing is what makes a late-boot
+    // slice observable at all (docs/macworks-plus-notes.md P0).
+    let bus = Bus(ramSize: 0x1000)
+    for i in 0..<5000 {
+        _ = bus.read8(0xFC_1000 &+ UInt32(i % 0x100))
+    }
+    #expect(bus.ioTraceDropped > 0)
+
+    bus.clearIOTrace()
+
+    #expect(bus.ioTrace.isEmpty)
+    #expect(bus.ioTraceDropped == 0)
+
+    _ = bus.read8(0xFC_1234)
+    #expect(bus.ioTrace.count == 1, "recording resumes after a clear")
+}
+
+@Test func ioTraceLimitIsAdjustable() {
+    let bus = Bus(ramSize: 0x1000)
+    #expect(bus.ioTraceLimit == 4096, "default cap unchanged")
+
+    bus.ioTraceLimit = 10
+    for i in 0..<25 {
+        _ = bus.read8(0xFC_1000 &+ UInt32(i))
+    }
+    #expect(bus.ioTrace.count == 10)
+    #expect(bus.ioTraceDropped == 15)
+
+    // Raising the cap lets recording resume without discarding what is
+    // already held (a lowered cap likewise never truncates retroactively).
+    bus.ioTraceLimit = 12
+    _ = bus.read8(0xFC_1234)
+    #expect(bus.ioTrace.count == 11)
+}
+
 // MARK: - Peek suppresses IO side effects and logging
 
 @Test func peekDoesNotToggleLatchesOrLog() {

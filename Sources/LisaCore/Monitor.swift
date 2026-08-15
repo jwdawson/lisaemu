@@ -3,6 +3,19 @@ import Foundation
 public struct Monitor {
     public enum Command: Equatable {
         case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), go(Int)
+        /// `gu <hexaddr> [cycles]` (M8 tooling) -- run until the PC reaches
+        /// `hexaddr`, or `cycles` are spent (default `goUntilDefaultBudget`).
+        /// The breakpoint `g` never was: `g` can only stop on a cycle count,
+        /// and `t` cannot practically be walked through a guest's delay loop.
+        /// See `Machine.run(untilPC:maxCycles:)` for the stop semantics.
+        case goUntil(UInt32, Int)
+        /// `iot clear` (M8 tooling) -- empty `Bus.ioTrace` + its drop counter
+        /// so the NEXT slice's I/O is observable. The cap is a total, not a
+        /// rolling window, so a long boot fills it and `g`'s I/O list then
+        /// misleadingly prints nothing.
+        case ioTraceClear
+        /// `iot limit <n>` (M8 tooling) -- resize that cap for a session.
+        case ioTraceLimit(Int)
         case screenshot(String), asciiPreview
         /// The scripted menu-boot harness (M4 Task 2): cycle/instruction
         /// budget defaults to `bootdisk`'s own generous constant when no
@@ -90,6 +103,13 @@ public struct Monitor {
     public var symbols: LinkmapSymbols?
     public init(machine: Machine) { self.machine = machine }
 
+    /// `gu`'s default cycle budget when none is given: 50M cycles = ~10s of
+    /// emulated time at the Lisa's 5 MHz. Generous enough to cross a guest
+    /// delay loop, small enough that a wrong target address fails in
+    /// seconds rather than looking like a hang (`gu` single-steps, so it is
+    /// slower per cycle than `g` -- see `Machine.run(untilPC:maxCycles:)`).
+    public static let goUntilDefaultBudget = 50_000_000
+
     public static func parse(_ line: String) -> Command? {
         let parts = line.split(separator: " ").map(String.init)
         guard let cmd = parts.first else { return nil }
@@ -115,6 +135,17 @@ public struct Monitor {
                   return .mem(a, int(2, default: 64))
         case "t": return .trace(int(1, default: 1))
         case "g": return .go(int(1, default: 100000))
+        case "gu": guard let a = hex(1) else { return nil }
+                   return .goUntil(a, int(2, default: goUntilDefaultBudget))
+        case "iot":
+            guard parts.count >= 2 else { return nil }
+            switch parts[1] {
+            case "clear": return .ioTraceClear
+            case "limit":
+                guard parts.count >= 3, let n = Int(parts[2]), n >= 0 else { return nil }
+                return .ioTraceLimit(n)
+            default: return nil
+            }
         case "sc": guard parts.count > 1 else { return nil }
                    return .screenshot(parts[1])
         case "sca": return .asciiPreview

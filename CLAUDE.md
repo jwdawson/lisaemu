@@ -80,9 +80,12 @@ Never hand-edit `Sources/CMusashi`. All changes are patches applied by
 ## Debug facilities
 
 - `lisadbg --rom <dir> [--widget/--disk <img>] [--printer-dir <d>]
-  [--printer-raw <f>]`; prompt commands include `g`, `sc`/`sca`, `click`,
-  `dclick`, `press/release/moveto/drag`, `type`, `insert/eject`, `printer`,
-  `reset`, `power`.
+  [--printer-raw <f>]`; prompt commands include `g`, `gu <addr>` (run until
+  PC = breakpoint), `iot clear`/`iot limit <n>` (the ioTrace cap is a TOTAL,
+  not a window — it fills during POST, so clear it before a slice whose I/O
+  you need to see), `sc`/`sca`, `click`, `dclick`,
+  `press/release/moveto/drag`, `type`, `insert/eject`, `printer`, `reset`,
+  `power`.
 - Every closed print job auto-dumps raw wire bytes + page rasters +
   unknown-escape log to `~/Library/Application Support/LisaEmu/PrintDebug/`
   (`PrintDebugDump`; override dir with `LISAEMU_PRINT_DEBUG_DIR`). Check

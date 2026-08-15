@@ -55,6 +55,16 @@ extension MusashiSuites {
             #expect(Monitor.parse("reset") == .reset)
             // M6 Task 1: soft-power button.
             #expect(Monitor.parse("power") == .power)
+            // M8 tooling: run-until-PC (breakpoint) + ioTrace controls.
+            #expect(Monitor.parse("gu 407df2") == .goUntil(0x40_7DF2, 50_000_000))
+            #expect(Monitor.parse("gu 407df2 250000000") == .goUntil(0x40_7DF2, 250_000_000))
+            #expect(Monitor.parse("gu") == nil, "gu requires a target address")
+            #expect(Monitor.parse("gu zzz") == nil, "gu requires a HEX target address")
+            #expect(Monitor.parse("iot clear") == .ioTraceClear)
+            #expect(Monitor.parse("iot limit 65536") == .ioTraceLimit(65536))
+            #expect(Monitor.parse("iot") == nil, "iot requires a sub-command")
+            #expect(Monitor.parse("iot limit") == nil, "iot limit requires a count")
+            #expect(Monitor.parse("iot bogus") == nil, "unknown iot sub-command")
             #expect(Monitor.parse("q") == .quit)
             #expect(Monitor.parse("bogus") == nil)
         }

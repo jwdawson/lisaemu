@@ -452,6 +452,30 @@ private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeSch
     #expect(floppy.isInserted == false)
 }
 
+/// **DISKIN's present-value is `$FF`, not merely nonzero (M8).** The Lisa
+/// OS only ever tests `<> 0` (ISDISKIN SONYASM:437-441, hdinit
+/// SONY.TEXT:629-636), so this byte went unconstrained for six milestones.
+/// MacWorks Plus 1.0.18's patched `.Sony` reads it absolutely --
+/// `$41B892: cmpi.b #-$1,$fcc041.l`, falling to `move.w #$ffbf,D0` (-65
+/// offLinErr) on any other value -- which pins it. See
+/// `FloppyController.diskInPresent` for the full trace and reasoning.
+/// A regression to `1` here re-breaks the MacWorks boot while leaving
+/// every Lisa OS path green, so it needs its own pin.
+@Test func diskInCarriesFFWhileMediaIsPresent() {
+    let (floppy, _, _) = makeController()
+
+    floppy.insert(makeSyntheticImage())
+    #expect(floppy.read(FloppyController.Cell.diskIn) == 0xFF)
+
+    // Survives a warm reset with media still attached (reset() re-derives
+    // the presence cells from `image`).
+    floppy.reset()
+    #expect(floppy.read(FloppyController.Cell.diskIn) == 0xFF)
+
+    floppy.eject()
+    #expect(floppy.read(FloppyController.Cell.diskIn) == 0)
+}
+
 /// **M6 Task 4 -- the user-forced eject / OS-commanded unclamp asymmetry is
 /// INTENTIONAL, pinned here.** `insertWhileRunning` raises a media-change
 /// attention on insertion, and the `unclamp` sub-command (the OS's OWN

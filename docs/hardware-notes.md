@@ -1289,7 +1289,9 @@ Key files: `OS/SOURCE-SONY.TEXT.unix.txt` (Pascal driver, Rich Castro),
   - `$11` DISKERR (nonzero=error)
   - `$13` DISKFLG (single/double-sided flag)
   - `$19` DISKSKING (`$FF` while seeking)
-  - `$41` DISKIN (nonzero=disk present; Sony)
+  - `$41` DISKIN (~~nonzero=disk present; Sony~~ **M8 correction: the
+    value is `$FF` when present, not merely "nonzero" -- see the DISKIN
+    entry below**)
   - `$5F` DISKSTAT (interrupt/status)
   - `$95` DISKCS (checksum err count; mover says `TWIGCS=$BB`!)
   - `$B9` DISKB2
@@ -1437,6 +1439,29 @@ zone/track/sector/side:
   ldmicro:48-49,213-224): bit7 bot_int, bit6 bot_done, bit5 (Twiggy
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
+- **DISKIN (`$41`) present-value = `$FF` (M8, MacWorks Plus live trace).**
+  The Lisa OS constrains this cell only to "nonzero" (ISDISKIN returns the
+  raw byte; `hdinit` tests `response <> 0` -- SONYASM:437-441,
+  SONY.TEXT:629-636), so the HLE's original `1` was an unconstrained
+  choice, not evidence. **MacWorks Plus 1.0.18 pins it:** its patched
+  `.Sony` reads the cell ABSOLUTELY --
+  `$41B892: cmpi.b #-$1,$fcc041.l` / `beq $41b8a2`, falling through to
+  `move.w #$ffbf,D0` (`-65` `offLinErr`) on any other value. With `1` in
+  the cell, every Mac-side `_Read` returned `offLinErr`, the Mac drive
+  queue element's `diskInPlace` (`$1DE3`) stayed `0` forever (watched via
+  `lisadbg gw` across 600M cycles, never written), and MacWorks could not
+  leave its splash. `$FF` satisfies BOTH drivers, so it replaces the guess
+  outright rather than being special-cased per guest -- and it matches this
+  firmware's own true-flag idiom elsewhere in the same window (DISKSKING
+  `$19` is documented `$FF` while seeking). Evidence that it is the right
+  value, not merely a value MacWorks likes: with `$FF` the guest
+  immediately does what real hardware does and this model never could
+  before -- it unclamps and **ejects the non-Mac boot floppy by itself**
+  (`disk=OUT` at ~54M cycles), then mounts an inserted `'LK'` volume
+  (`blocksRead` 310 -> 485, `$100000` = `4C 4B`, `diskInPlace` -> `1`) and
+  reaches the Macintosh Finder. Pinned by
+  `FloppyControllerTests.diskInCarriesFFWhileMediaIsPresent`; see
+  `FloppyController.diskInPresent`.
 - **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
   **Round-2 (M4 Task 4) live confirmation — our HLE answers this correctly.**
   ISDISKIN does `MOVE.B DISKIN(A2),D0; MOVE D0,RESPONSE(A3)` (read window `$41`,

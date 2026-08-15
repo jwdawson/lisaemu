@@ -377,6 +377,36 @@ public final class FloppyController {
     /// visible protocol exchange).
     public var isInserted: Bool { image != nil }
 
+    /// The byte DISKIN (`$41`) carries while media is present: **`$FF`, not
+    /// a bare `1`** (M8, MacWorks Plus investigation).
+    ///
+    /// hardware-notes.md §9 documents DISKIN only as "nonzero = disk
+    /// present", because the Lisa OS never looks closer: `ISDISKIN`
+    /// (SONYASM:437-441) returns the raw byte and `hdinit` sets
+    /// `disk_present := gooddisk` when `response <> 0` (SONY.TEXT:629-636).
+    /// Any nonzero value satisfies that, so the original `1` was an
+    /// unconstrained choice, never evidence.
+    ///
+    /// **MacWorks Plus 1.0.18 constrains it.** Its patched `.Sony` reads
+    /// the cell ABSOLUTELY -- live `lisadbg` trace, guest code at
+    /// `$41B892`:
+    ///
+    ///     41B892  cmpi.b  #-$1, $fcc041.l   ; DISKIN == $FF ?
+    ///     41B89A  beq     $41b8a2           ;   yes -> proceed
+    ///     41B89C  move.w  #$ffbf, D0        ;   no  -> -65 offLinErr
+    ///     41B8A0  bra     $41b82e           ;          and return it
+    ///
+    /// With `1` in the cell every `_Read` returned offLinErr, the Mac drive
+    /// queue element's `diskInPlace` stayed `0` forever (watched with `gw
+    /// $1DE3` across 600M cycles, never written), and the boot could not
+    /// pass its splash. `$FF` satisfies BOTH drivers -- it is the only
+    /// value consistent with all known evidence, so it replaces the guess
+    /// rather than being special-cased per guest.
+    ///
+    /// Corroboration from the same window: DISKSKING (`$19`) is documented
+    /// `$FF while seeking` -- `$FF` is this firmware's true-flag idiom.
+    static let diskInPresent: UInt8 = 0xFF
+
     /// **`$C015` vs. double-sided images -- a known, documented
     /// inconsistency (M3 Task 3 doc note, not fixed here).** `insert(_:)`
     /// happily accepts a double-sided (1600-block) DC42 image and sets
@@ -401,7 +431,7 @@ public final class FloppyController {
         sessionOverlay.removeAll()   // fresh insertion = fresh write session
         blocksWritten = 0
         self.image = image
-        window[Cell.diskIn] = 1
+        window[Cell.diskIn] = Self.diskInPresent
         window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
         // DISKIN ($41) is the persistent presence cell. DISKSTAT bit4 `bot_in`
         // is NOT a presence mirror -- it is the media-change INTERRUPT bit,
@@ -501,7 +531,7 @@ public final class FloppyController {
         commandsProcessed = 0
         dropCompletionLine()
         if let image {
-            window[Cell.diskIn] = 1
+            window[Cell.diskIn] = Self.diskInPresent
             window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
             // DISKSTAT bot_in is an interrupt-event bit, not a presence mirror
             // (see insert(_:)); a warm reset leaves it clear (window is zeroed).

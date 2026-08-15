@@ -252,8 +252,39 @@ public final class Machine {
         case halted
         /// A clean OS-requested power-off (`powerState == .off`).
         case poweredOff
+        /// The watched byte changed (`run(untilChangeAt:maxCycles:)`).
+        case watchTriggered
 
         public var description: String { rawValue }
+    }
+
+    /// Runs until the byte at `address` changes value, at most `maxCycles`
+    /// pass, or the machine halts / powers off -- the write-watchpoint half
+    /// of the `gu` breakpoint (M8 tooling). Returns the stop reason and, on
+    /// `.watchTriggered`, the before/after bytes.
+    ///
+    /// Samples through `withPeek` so watching an I/O address cannot itself
+    /// toggle a latch or log to `ioTrace` (see `Bus.withPeek`) -- a
+    /// watchpoint that perturbed the thing it watched would be worse than
+    /// no watchpoint. Detects a CHANGE, not a write: a store of the value
+    /// already there is invisible, which is the right default when the
+    /// question is "does this flag ever become non-zero".
+    ///
+    /// Same diagnostic-only, single-stepping tradeoff as
+    /// `run(untilPC:maxCycles:)` -- see that method's doc comment.
+    public func run(untilChangeAt address: UInt32,
+                    maxCycles: UInt64) -> (reason: StopReason, before: UInt8, after: UInt8) {
+        func sample() -> UInt8 { bus.withPeek { bus.read8(address) } }
+        let deadline = cycles &+ maxCycles
+        let before = sample()
+        while cycles < deadline {
+            if halted { return (.halted, before, sample()) }
+            if powerState != .on { return (.poweredOff, before, sample()) }
+            step()
+            let now = sample()
+            if now != before { return (.watchTriggered, before, now) }
+        }
+        return (.budgetExhausted, before, sample())
     }
 
     /// Runs until the PC reaches `targetPC` at an instruction boundary, at

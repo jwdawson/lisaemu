@@ -9,6 +9,11 @@ public struct Monitor {
         /// and `t` cannot practically be walked through a guest's delay loop.
         /// See `Machine.run(untilPC:maxCycles:)` for the stop semantics.
         case goUntil(UInt32, Int)
+        /// `gw <hexaddr> [cycles]` (M8 tooling) -- run until the byte at
+        /// `hexaddr` CHANGES (not merely is written), or `cycles` are spent.
+        /// The question "does anything ever set this flag?" has no answer a
+        /// breakpoint can give: see `Machine.run(untilChangeAt:maxCycles:)`.
+        case goWatch(UInt32, Int)
         /// `iot clear` (M8 tooling) -- empty `Bus.ioTrace` + its drop counter
         /// so the NEXT slice's I/O is observable. The cap is a total, not a
         /// rolling window, so a long boot fills it and `g`'s I/O list then
@@ -137,6 +142,8 @@ public struct Monitor {
         case "g": return .go(int(1, default: 100000))
         case "gu": guard let a = hex(1) else { return nil }
                    return .goUntil(a, int(2, default: goUntilDefaultBudget))
+        case "gw": guard let a = hex(1) else { return nil }
+                   return .goWatch(a, int(2, default: goUntilDefaultBudget))
         case "iot":
             guard parts.count >= 2 else { return nil }
             switch parts[1] {

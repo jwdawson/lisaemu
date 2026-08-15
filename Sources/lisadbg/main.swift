@@ -750,6 +750,15 @@ while let line = readLine(strippingNewline: true) {
         let reason = machine.run(untilPC: addr, maxCycles: UInt64(n))
         reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU,
                     prefix: "      gu $\(String(format: "%06X", Int(addr))) stop=\(reason) after \(n) cycle budget")
+    case .goWatch(let addr, let n):
+        let beforeIO = machine.bus.ioTrace.count
+        let beforeMMU = machine.bus.mmuPortLog.count
+        let (reason, before, after) = machine.run(untilChangeAt: addr, maxCycles: UInt64(n))
+        let change = reason == .watchTriggered
+            ? String(format: "$%02X -> $%02X", Int(before), Int(after))
+            : String(format: "still $%02X", Int(before))
+        reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU,
+                    prefix: "      gw $\(String(format: "%06X", Int(addr))) stop=\(reason) (\(change)) after \(n) cycle budget")
     case .ioTraceClear:
         machine.bus.clearIOTrace()
         print("      ioTrace cleared (limit=\(machine.bus.ioTraceLimit)) -- the next g/gu slice starts from empty")
@@ -863,7 +872,7 @@ while let line = readLine(strippingNewline: true) {
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | iot clear | iot limit <n> | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | gw <hexaddr> [cycles] | iot clear | iot limit <n> | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
     case nil:
         print("? — unknown command")
     }

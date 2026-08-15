@@ -279,6 +279,61 @@ extension MusashiSuites {
             #expect(m.cycles > startCycles, "must have stepped, not returned immediately")
         }
 
+        // MARK: - run(untilChangeAt:maxCycles:) -- the watchpoint
+
+        @Test
+        func runUntilChangeStopsOnTheStoreThatChangesTheWatchedByte() {
+            // MOVEQ #$7F,D0 ; MOVE.B D0,$500 ; BRA.s spin -- watch $500.
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.load([0x70, 0x7F, 0x11, 0xC0, 0x05, 0x00, 0x60, 0xFE], at: 0x400)
+            m.reset()
+
+            let (reason, before, after) = m.run(untilChangeAt: 0x500, maxCycles: 10_000)
+
+            #expect(reason == .watchTriggered)
+            #expect(before == 0)
+            #expect(after == 0x7F)
+        }
+
+        @Test
+        func runUntilChangeReportsBudgetExhaustionWhenTheByteNeverMoves() {
+            // A store of the value already present is NOT a change -- the
+            // watchpoint answers "did this become something else", which is
+            // the question a stuck flag poses.
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.load([0x70, 0x00, 0x11, 0xC0, 0x05, 0x00, 0x60, 0xFE], at: 0x400)
+            m.reset()
+
+            let (reason, before, after) = m.run(untilChangeAt: 0x500, maxCycles: 2_000)
+
+            #expect(reason == .budgetExhausted)
+            #expect(before == 0)
+            #expect(after == 0)
+        }
+
+        @Test
+        func runUntilChangeDoesNotDisturbWhatItWatches() {
+            // Watching an I/O address must not toggle a latch or log an
+            // access -- the sample goes through Bus.withPeek. $FCE012 is the
+            // setup-OFF latch: a non-peek read would clear setupMode.
+            let m = Machine(ramSize: 0x10000)
+            m.bus.write32(0x0, 0x3000)
+            m.bus.write32(0x4, 0x400)
+            m.bus.load([0x60, 0xFE], at: 0x400)   // BRA.s spin
+            m.reset()
+            m.bus.clearIOTrace()
+
+            let (reason, _, _) = m.run(untilChangeAt: 0xFC_E012, maxCycles: 2_000)
+
+            #expect(reason == .budgetExhausted)
+            #expect(m.bus.setupMode == true, "watching a latch must not toggle it")
+            #expect(m.bus.ioTrace.isEmpty, "watch sampling must not log I/O accesses")
+        }
+
         @Test
         func runUntilPCStopsOnFatalHaltRatherThanSpinningOutTheBudget() {
             // Same double-fault setup as `doubleFaultProducesFatalHalt`: the

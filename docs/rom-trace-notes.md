@@ -3078,10 +3078,12 @@ and struck to its resolution; M7 opened no new boot-trace OQ (the SCC/PM work is
 device frontier, not a domain/MMU question). What M7 leaves is a **roster of
 device follow-ups**, not open questions about the boot:
 
-- **Interlace vertical doubling** — the printed page is legible/correct but the
-  two-pass 144-vpi interlace lands adjacent half-bands on adjacent rows under the
-  interpreter's simplified vertical mapping (Task 3 decision 3). Pixel-true
-  geometry needs the external `PrVBand`/`PrHBand` asm. M8.
+- ~~**Interlace vertical doubling** — … Pixel-true geometry needs the external
+  `PrVBand`/`PrHBand` asm. M8.~~ **CLOSED before merge (Task 4 fix rounds 2–3):**
+  two stacked root causes, both fixed — pin pitch **2/144″** (`CiPrBMVert`
+  two-pass interleave) and graphics bit order **LSB-top** (bit 0 = top pin; the
+  MSB-top guess mirrored every band). The captured live stream renders a single
+  solid text line (`m7-print-03-*`); see `hardware-notes.md` §12.4/§12.5/§12.6.
 - **Warm-reset + Widget-boot → boot error 42** — a **pre-existing** interaction
   (the M7 diff touches no reset paths; FNVs identical), surfaced but not caused by
   the printer work; the config→reboot flow uses a fresh power cycle. A real defect

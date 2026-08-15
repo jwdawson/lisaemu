@@ -33,7 +33,7 @@ register-level **Z8530 SCC** that the emulator turns back into pages — capture
 | M5 — Widget HD | Widget/ProFile hard-disk HLE; the Office System installs onto a blank Widget image and **boots off the hard disk to the desktop**, mouse live |
 | M6 — Real machine | The full daily loop: RTC (real clock), OS-driven soft-power shutdown, Filer work + LisaWrite typed into — **mouse, keyboard, and clock all live** |
 | M7 — The Printer | Register-level Z8530 SCC on Serial B; the OS's own ImageWriter driver **prints from LisaWrite** to `lisadbg` PNGs and the macOS print panel; printer config persists across a power cycle |
-| M8 — next | Receive-side serial (LisaTerminal / LisaBug console, on the M7 SCC); pixel-true 144-vpi interlace; daisy wheel / Canon devices; the warm-reset/Widget-boot error-42 fix |
+| M8 — next | Receive-side serial (LisaTerminal / LisaBug console, on the M7 SCC); daisy wheel / Canon devices; the warm-reset/Widget-boot error-42 fix |
 
 Each milestone has a demo document under [`docs/`](docs/) (`m1b-demo.md` … `m7-demo.md`)
 with reproduction steps, and the project keeps two citation-backed engineering records:

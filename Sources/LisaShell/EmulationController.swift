@@ -462,7 +462,17 @@ public final class EmulationController {
         // `machine.reset()` (SCC8530.reset), so this survives a warm reset.
         let printer = PrinterPipeline()
         machine.bus.scc.channelB.printerPort = printer.printerPort
-        printer.onJob = { job in shared.onPrintJob?(job) }
+        // M7 print-debug: tee the raw wire stream and dump per-job artifacts
+        // (raw bytes, page rasters, diagnostics) at every job close -- see
+        // `PrintDebugDump`. The interpreter is captured `weak` so the spooler's
+        // `onJob` doesn't complete an interpreter <-> spooler retain cycle
+        // (interpreter.onPage already holds the spooler strongly).
+        let printDebug = PrintDebugDump()
+        printer.rawByteSink = { printDebug.append($0) }
+        printer.onJob = { [weak interpreter = printer.interpreter] job in
+            printDebug.dump(job: job, interpreter: interpreter)
+            shared.onPrintJob?(job)
+        }
 
         startupGate.signal()
 
@@ -696,3 +706,82 @@ public final class EmulationController {
     }
 }
 
+
+/// M7 print-debug: captures the raw Serial-B wire stream (via
+/// `PrinterPipeline.rawByteSink`) and, at every job close, dumps that job's
+/// artifacts for offline corruption analysis:
+///
+///   - `job-N-raw.bin`   -- the exact bytes the OS transmitted since the
+///                          previous job closed (the ImageWriter wire stream),
+///   - `job-N-page-M.pgm` -- each rendered page raster as binary PGM (P5,
+///                          ink = black; Foundation-only, no ImageIO),
+///   - `job-N-info.txt`  -- byte/page counts plus the interpreter's bounded
+///                          unknown-byte log (unmodeled escapes surface here).
+///
+/// Always on: the files are small, written only when a print job actually
+/// closes, and land in `LISAEMU_PRINT_DEBUG_DIR` (default
+/// `~/Library/Application Support/LisaEmu/PrintDebug`). Emulation-thread-only,
+/// like the pipeline that feeds it.
+private final class PrintDebugDump {
+    private var raw: [UInt8] = []
+    private var jobIndex = 0
+    private let directory: URL
+
+    init() {
+        if let env = ProcessInfo.processInfo.environment["LISAEMU_PRINT_DEBUG_DIR"] {
+            directory = URL(fileURLWithPath: env, isDirectory: true)
+        } else {
+            directory = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                 in: .userDomainMask)[0]
+                .appendingPathComponent("LisaEmu/PrintDebug", isDirectory: true)
+        }
+    }
+
+    func append(_ byte: UInt8) { raw.append(byte) }
+
+    func dump(job: [PrinterPage], interpreter: ImageWriterInterpreter?) {
+        jobIndex += 1
+        let bytes = raw
+        raw.removeAll(keepingCapacity: true)
+        let prefix = "job-\(jobIndex)"
+        do {
+            try FileManager.default.createDirectory(at: directory,
+                                                    withIntermediateDirectories: true)
+            try Data(bytes).write(to: directory.appendingPathComponent("\(prefix)-raw.bin"))
+            for (n, page) in job.enumerated() {
+                try pgmData(for: page)
+                    .write(to: directory.appendingPathComponent("\(prefix)-page-\(n).pgm"))
+            }
+            var info = "raw bytes: \(bytes.count)\npages: \(job.count)\n"
+            for (n, page) in job.enumerated() {
+                info += "page \(n): \(page.width)x\(page.height) @ \(page.dpi.h)x\(page.dpi.v) dpi\n"
+            }
+            if let interpreter {
+                info += "unknown bytes logged: \(interpreter.unknownLog.count)"
+                    + " (+\(interpreter.unknownLogDropped) dropped)\n"
+                for entry in interpreter.unknownLog {
+                    info += String(format: "  byte 0x%02X at y144=%d\n", entry.byte, entry.y144)
+                }
+            }
+            try info.write(to: directory.appendingPathComponent("\(prefix)-info.txt"),
+                           atomically: true, encoding: .utf8)
+            print("[print-debug] wrote \(prefix)-* to \(directory.path)")
+        } catch {
+            print("[print-debug] dump failed: \(error)")
+        }
+    }
+
+    /// One page raster as binary PGM (P5), ink = black.
+    private func pgmData(for page: PrinterPage) -> Data {
+        var out = Data("P5\n\(page.width) \(page.height)\n255\n".utf8)
+        out.reserveCapacity(out.count + page.width * page.height)
+        for y in 0..<page.height {
+            let rowStart = y * page.rowBytes
+            for x in 0..<page.width {
+                let bit = page.bits[rowStart + (x >> 3)] & (0x80 >> UInt8(x & 7))
+                out.append(bit != 0 ? 0 : 255)
+            }
+        }
+        return out
+    }
+}

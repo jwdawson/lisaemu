@@ -126,16 +126,14 @@ public final class FloppyController {
         /// reads or writes it, which is why six milestones never needed it.
         ///
         /// MacWorks Plus uses it as a second handshake alongside DISKCMD,
-        /// booting System 6 off a MacWorks-formatted hard disk:
-        ///
-        ///     4242AE  clr.b   ($3,A0)         ; DISKPARM = 0
-        ///     4242B2  move.b  #$2, ($5,A0)    ; DISKDRIV = 2
-        ///     4242B8  st      ($d,A0)         ; $0D := $FF  (HOST sets it)
-        ///     4242BC  move.b  #$84, ($1,A0)   ; DISKCMD = $84
-        ///     4242C2  tst.b   ($d,A0)         ; spin until the 6504 CLEARS it
-        ///     4242C6  bne     $4242c2
-        ///     4242C8  move.b  ($11,A0), D0    ; then DISKERR ...
-        ///     4242D4  move.b  D0, (-$4,A0)    ; ... into the DrvQEl's dQFlags
+        /// booting System 6 off a MacWorks-formatted hard disk. Guest code at
+        /// `$4242AE`-`$4242D4` (described rather than transcribed -- it is
+        /// Apple/Sun-derived, and the repo takes no Apple-derived data):
+        /// it stages DISKPARM = 0 and DISKDRIV = 2, sets this cell to `$FF`
+        /// itself at `$4242B8`, writes go-byte `$84` to DISKCMD at
+        /// `$4242BC`, then spins at `$4242C2` reading this cell until the
+        /// controller zeroes it -- after which it reads DISKERR and stores
+        /// the masked result into the Mac drive queue element's `dQFlags`.
         ///
         /// Go-byte `$84` is itself undocumented (SONY.TEXT:61-68 lists
         /// `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/`$89`), so this model answers
@@ -432,13 +430,11 @@ public final class FloppyController {
     /// unconstrained choice, never evidence.
     ///
     /// **MacWorks Plus 1.0.18 constrains it.** Its patched `.Sony` reads
-    /// the cell ABSOLUTELY -- live `lisadbg` trace, guest code at
-    /// `$41B892`:
-    ///
-    ///     41B892  cmpi.b  #-$1, $fcc041.l   ; DISKIN == $FF ?
-    ///     41B89A  beq     $41b8a2           ;   yes -> proceed
-    ///     41B89C  move.w  #$ffbf, D0        ;   no  -> -65 offLinErr
-    ///     41B8A0  bra     $41b82e           ;          and return it
+    /// the cell ABSOLUTELY -- live `lisadbg` trace of guest code at
+    /// `$41B892` (described rather than transcribed; it is Apple/Sun-derived
+    /// and the repo takes no Apple-derived data): it compares the byte at
+    /// `$FCC041` against `$FF`, proceeding only on equality, and otherwise
+    /// loads `-65` (`offLinErr`) and returns it to the caller.
     ///
     /// With `1` in the cell every `_Read` returned offLinErr, the Mac drive
     /// queue element's `diskInPlace` stayed `0` forever (watched with `gw

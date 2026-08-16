@@ -1458,10 +1458,12 @@ zone/track/sector/side:
   `$0B` DISKTRAK -> `$0F` DISKCNFM) and never read or written by any Lisa
   OS path, so the HLE had no reason to model it. MacWorks Plus uses it as a
   second handshake alongside DISKCMD when booting System 6 off a
-  MacWorks-formatted hard disk: `$4242B8: st ($d,A0)` sets it to `$FF`,
-  `$4242BC` writes go-byte `$84`, and `$4242C2: tst.b ($d,A0) / bne` spins
-  until the controller zeroes it -- after which it reads DISKERR and stores
-  it into the Mac drive queue element's `dQFlags`. Go-byte `$84` is itself
+  MacWorks-formatted hard disk: guest code at `$4242B8` sets the cell to
+  `$FF` itself, `$4242BC` writes go-byte `$84`, and `$4242C2` spins reading
+  the cell until the controller zeroes it -- after which it reads DISKERR and
+  stores it into the Mac drive queue element's `dQFlags`. (Addresses and
+  behaviour only; the guest listing is Apple/Sun-derived and is not
+  transcribed here.) Go-byte `$84` is itself
   undocumented (SONY.TEXT:61-68 lists `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/
   `$89`); this model answers it as a handshake-only ack like any other
   unrecognized go-byte, and `clearDiskCmd()` now clears `$0D` for every
@@ -1475,8 +1477,8 @@ zone/track/sector/side:
   SONY.TEXT:629-636), so the HLE's original `1` was an unconstrained
   choice, not evidence. **MacWorks Plus 1.0.18 pins it:** its patched
   `.Sony` reads the cell ABSOLUTELY --
-  `$41B892: cmpi.b #-$1,$fcc041.l` / `beq $41b8a2`, falling through to
-  `move.w #$ffbf,D0` (`-65` `offLinErr`) on any other value. With `1` in
+  at `$41B892` it compares the byte at `$FCC041` against `$FF` and, on any
+  other value, loads `-65` (`offLinErr`) and returns it. With `1` in
   the cell, every Mac-side `_Read` returned `offLinErr`, the Mac drive
   queue element's `diskInPlace` (`$1DE3`) stayed `0` forever (watched via
   `lisadbg gw` across 600M cycles, never written), and MacWorks could not

@@ -790,9 +790,47 @@ MacWorks' `$02xxxx` load addresses. They are meaningless here; `DRAW1BAR`
 and `BGSTRIPB` are bar-*chart* routines, not evidence about the screen. This
 is `LinkmapSymbols.swift:52`'s "all 22 maps are app maps" hazard in the wild.
 
-### What remains open
+### CONFIRMED LIVE 2026-08-15 — one keystroke boots it
 
-Not "model CA1". The open questions are (a) which call site the headless
-boot actually parks at, (b) whether feeding it the keypress it wants lets it
-proceed, and (c) what `$FE00B8` renders. All three are one emulator run
-away; none of them is an emulator-capability gap on current evidence.
+Run: reach the wait loop, run **60M further cycles with no input**, then a
+single `type y`, then run on.
+
+| | no key, +60M cyc | after `type y` |
+|---|---|---|
+| PC | `$02373A` (still in the poll) | **`$423A9E`** |
+| `blocksRead` | 21 | 279+ |
+| `mmuPortWrites` | 4384 | 4608 |
+| disk | IN | **OUT** (guest ejects it itself) |
+| COPS | — | `powerCmds=[$25]` accepted |
+
+Sixty million cycles is more than four times site `$02315C`'s ~14M budget,
+so that site is ruled out: the boot parks at **`$023CD4`, the Y/N prompt**
+(4054 retries ≈ 414M cycles — which is why 80M-cycle repro runs looked like
+an infinite hang). A single keystroke releases it; MacWorks Plus II then
+loads ~258 more blocks, programs the MMU, ejects the Lisa boot floppy on its
+own, drives the COPS successfully, and **reaches `$423A9E` — inside the
+patched Mac ROM at `$400000`**, the same takeover MacWorks Plus 1.1 does.
+
+**So there is no emulator-capability gap, and nothing about CA1 needs
+building.** MW+II 2.5.0 boots on the existing hardware model.
+
+```
+printf 'iot limit 10\nbootdisk 1000\ngu 23736 60000000\ng 60000000\nr\ntype y\ng 300000000\nr\n' | \
+  .build/release/lisadbg --rom ~/Development/LisaROMs --disk <copy of the 2.5.0 boot disk>
+```
+
+### What actually remains open
+
+1. **The display is wrong.** The "garbage band" is not a legible prompt: it
+   renders as structured but misaligned character cells across the top rows,
+   growing as the boot proceeds. Suspect a framebuffer base/stride
+   disagreement between what MW+II programs and what scanout reads — this is
+   the real bug, and it is why the prompt was never readable.
+2. **A Mac volume is wanted next** — the guest ejected the boot floppy, so
+   the `'LK'` 800K installer (`MW+II Install V2.5.0.dc42`) is the next thing
+   to feed it.
+3. `$FE00B8` (the boot-ROM call the prompt routine makes each pass) is still
+   uncharacterized, and may or may not relate to item 1.
+4. Whether the prompt needs answering on real hardware at all, or whether
+   PRAM startup settings normally satisfy it (the 2.5.3 build's strings
+   mention `USING STARTUP SETTINGS STORED IN PRAM`, and `PFG` clips).

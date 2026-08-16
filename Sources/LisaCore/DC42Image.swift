@@ -154,6 +154,35 @@ public struct DC42Image {
         return Array(tagPlane[start..<end])
     }
 
+    /// Cheap CONTENT probe: does the file at `url` look like a DC42
+    /// container? Reads only the 84-byte header and checks the declared
+    /// plane sizes against the file's actual length -- it never loads the
+    /// data plane, so probing a 10MB Widget image costs one small read.
+    ///
+    /// Exists because `.image` is the classic Disk Copy 4.2 extension AND
+    /// the extension this project's Widget hard-disk images use, so the
+    /// extension alone cannot tell a floppy from a hard disk. Applies
+    /// exactly the same size arithmetic `init(data:)` does, so a file this
+    /// returns `true` for is one `init(data:)` will accept (barring I/O
+    /// failure); `false` means "don't bother", never "definitely invalid".
+    ///
+    /// Returns `false` for anything unreadable, so a caller can treat it as
+    /// a pure predicate.
+    public static func looksLikeDC42(url: URL) -> Bool {
+        guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
+              size >= 84,
+              let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        guard let header = try? handle.read(upToCount: 84), header.count == 84 else { return false }
+
+        let dataLen = Int(UInt32(bigEndian: header.subdata(in: 64..<68).withUnsafeBytes { $0.load(as: UInt32.self) }))
+        let tagLen = Int(UInt32(bigEndian: header.subdata(in: 68..<72).withUnsafeBytes { $0.load(as: UInt32.self) }))
+        guard dataLen > 0, dataLen % 512 == 0 else { return false }
+        let blockCount = dataLen / 512
+        guard tagLen == 0 || tagLen == blockCount * 12 else { return false }
+        return 84 + dataLen + tagLen == size
+    }
+
     /// Loads a DC42 image from a file URL.
     ///
     /// - Parameter url: File URL pointing to the DC42 image file

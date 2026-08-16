@@ -139,11 +139,13 @@ struct LisaEmuApp: App {
         }
     }
 
-    /// File > Insert Disk… (M2 Task 7, ⌘I). `NSOpenPanel` filtered to
-    /// `.dc42` files -- DC42 has no registered system UTType, so this
-    /// constructs one BY EXTENSION (`UTType(filenameExtension:)`), matching
-    /// the drag-and-drop filter's identical extension check
-    /// (`AppModel.isDC42File`, `ScreenView.swift`'s `.onDrop`). Falls back
+    /// File > Insert Disk… (M2 Task 7, ⌘I). `NSOpenPanel` filtered to the
+    /// floppy-image extensions -- DC42 has no registered system UTType, so
+    /// this constructs them BY EXTENSION (`UTType(filenameExtension:)`),
+    /// matching the drag-and-drop filter
+    /// (`AppModel.isFloppyImageFile`, `ScreenView.swift`'s `.onDrop`).
+    /// **M9: `.image`/`.img` joined `.dc42`** -- Mac-era disks ship as
+    /// `Something.image` while being DC42 containers inside. Falls back
     /// to `.data` (accept anything) if `UTType(filenameExtension:)` somehow
     /// returns `nil` -- it shouldn't for a well-formed extension string,
     /// but degrading to "no filter" is strictly safer than crashing on a
@@ -153,7 +155,8 @@ struct LisaEmuApp: App {
         let panel = NSOpenPanel()
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = [UTType(filenameExtension: "dc42") ?? .data]
+        let floppyTypes = ["dc42", "image", "img"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = floppyTypes.isEmpty ? [.data] : floppyTypes
 
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }

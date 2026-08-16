@@ -484,3 +484,44 @@ import Testing
             "BSY stays 1 (idle) -- non-PORTB VIA1 writes never assert the Widget CMD")
     #expect(bus.widget.completedCommands == 0, "no command was opened by non-PORTB traffic")
 }
+
+// MARK: - $C015 adr_intdisk drive capability (M8)
+
+/// `$FCC015` distinguishes drive types for the OS: 0 = Twiggy, 1 =
+/// single-sided Sony, 2 = double-sided Sony (STARTUP:1747-1748). It was a
+/// static `1` stub, which M3 Task 3 flagged as inconsistent with
+/// `FloppyController.insert(_:)` happily accepting an 800K double-sided
+/// image and setting DISKFLG for it. M8 derives the byte from the media so
+/// the two signals can no longer disagree -- needed by MacWorks Plus, whose
+/// hard-disk install ships on an 800K diskette.
+@Test func intDiskIdReflectsInsertedMediaSidedness() throws {
+    let bus = Bus(ramSize: 0x1000)
+
+    #expect(bus.read8(0xFC_C015) == 1, "empty drive keeps the single-sided Sony default")
+
+    bus.floppy.insert(try makeSidedImage(blockCount: 800))
+    #expect(bus.read8(0xFC_C015) == 1, "400K single-sided reads 1, exactly as before")
+
+    bus.floppy.insert(try makeSidedImage(blockCount: 1600))
+    #expect(bus.read8(0xFC_C015) == 2, "800K double-sided reads 2")
+    #expect(bus.floppy.read(FloppyController.Cell.diskFlg) == 1,
+            "DISKFLG agrees -- the two signals can no longer contradict")
+
+    bus.floppy.eject()
+    #expect(bus.read8(0xFC_C015) == 1)
+}
+
+/// Minimal DC42 container with a chosen block count (data plane only, zero
+/// tags -- `DC42Image` synthesizes the tag plane).
+private func makeSidedImage(blockCount: Int) throws -> DC42Image {
+    var container = Data([UInt8("T".utf8.first!)])
+    container = Data([1]) + container
+    container.append(Data(repeating: 0, count: 64 - container.count))
+    var dataLen = UInt32(blockCount * 512).bigEndian
+    container.append(Data(bytes: &dataLen, count: 4))
+    var tagLen: UInt32 = 0
+    container.append(Data(bytes: &tagLen, count: 4))
+    container.append(Data(repeating: 0, count: 12))
+    container.append(Data(repeating: 0, count: blockCount * 512))
+    return try DC42Image(data: container)
+}

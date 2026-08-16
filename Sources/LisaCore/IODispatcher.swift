@@ -343,7 +343,12 @@ final class IODispatcher {
         // window case below since $C015 falls inside that range but is a
         // distinct hardware register, not one of FloppyController's named
         // protocol cells.
-        case 0xC015: return 1
+        // M8: no longer a static `1` -- derived from the inserted media
+        // (1 = single-sided Sony, 2 = double-sided), closing the M3 Task 3
+        // "$C015 vs. double-sided images" inconsistency. See
+        // `FloppyController.intDiskId` for the encoding and the physical
+        // caveat.
+        case 0xC015: return floppy.intDiskId
         // FloppyController's 2KB shared-RAM window (docs/hardware-notes.md
         // §9), Task 4. Checked after the two explicit board-ID cases above.
         case 0xC000...0xC7FF: return floppy.read(Int(offset - 0xC000))

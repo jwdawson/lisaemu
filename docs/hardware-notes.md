@@ -1439,6 +1439,20 @@ zone/track/sector/side:
   ldmicro:48-49,213-224): bit7 bot_int, bit6 bot_done, bit5 (Twiggy
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
+- **Double-sided (800K) block order is INTERLEAVED BY TRACK (M8, MacWorks
+  Plus live trace).** A Sony 800K image orders blocks track-major,
+  side-minor — track 0 side 0's sectors, then track 0 side 1's, then track
+  1 side 0 — NOT all of side 0 followed by all of side 1. The HLE's
+  original `side == 1 -> block + 800` form dated from M2, when only
+  single-sided 400K images existed and no traced path had ever read side 1
+  (M3 Task 3 flagged the double-sided path as untested). MacWorks Plus's
+  800K installer is the first software to exercise it: it read (track 0,
+  side 0, sectors 0/2/4) then (track 0, **side 1**, sector 4) — block 16
+  interleaved, block 804 under the old form. Every read returned DISKERR 0,
+  so the guest received plausible garbage rather than an error and ejected
+  the diskette as unreadable; with the interleaved mapping the volume
+  mounts (`blocksRead` 656, "MW+ INSTALLER, 768K in disk"). Single-sided
+  mapping is unchanged. See `FloppyController.blockNumber`.
 - **DISKIN (`$41`) present-value = `$FF` (M8, MacWorks Plus live trace).**
   The Lisa OS constrains this cell only to "nonzero" (ISDISKIN returns the
   raw byte; `hdinit` tests `response <> 0` -- SONYASM:437-441,
@@ -1645,8 +1659,19 @@ zone/track/sector/side:
   the full disassembly); block 0 reads to completion and the boot block
   executes. The DISKERR raw-byte values remain uncited (the successful read
   path sets DISKERR=0, so no error code was exercised).
-- **`$C015`=1 vs. double-sided (1600-block) images — a known, documented
-  inconsistency (M3 Task 3 doc note, not fixed here).** `$C015` is a STATIC
+- **`$C015` vs. double-sided images — RESOLVED (M8).** `$FCC015`
+  (`adr_intdisk`) is no longer a static stub: `FloppyController.intDiskId`
+  derives it from the inserted media (1 = single-sided Sony, 2 =
+  double-sided Sony, per STARTUP:1747-1748), so DISKFLG and `$C015` can no
+  longer contradict each other. Needed by MacWorks Plus, whose hard-disk
+  installer ships on an 800K diskette. Physical caveat: on real hardware
+  this byte describes the DRIVE, which cannot change with the disk in it —
+  deriving it from media is sound only while a double-sided diskette is
+  assumed to be inserted into a drive that can read it. Pinned by
+  `IODispatcherTests.intDiskIdReflectsInsertedMediaSidedness`. The original
+  note is kept below, struck.
+- ~~**`$C015`=1 vs. double-sided (1600-block) images — a known, documented
+  inconsistency (M3 Task 3 doc note, not fixed here).**~~ `$C015` is a STATIC
   stub hardcoded to `1` (single-sided Sony), per the Task 4 update above --
   but `FloppyController.insert(_:)` accepts ANY DC42 image, including a
   double-sided 800K one (`blockCount > 800`), and sets DISKFLG accordingly

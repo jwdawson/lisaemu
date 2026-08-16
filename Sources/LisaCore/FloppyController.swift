@@ -530,7 +530,37 @@ public final class FloppyController {
     /// 800 blocks/side (`SNYSNGL`, hardware-notes.md §9) -- a single-sided
     /// 400K image has exactly this many; a double-sided image's `blockCount`
     /// exceeds it.
-    private static let blocksPerSide = 800
+    static let blocksPerSide = 800
+
+    /// `$FCC015` (`adr_intdisk`) -- the drive-capability byte the OS reads to
+    /// tell drive types apart: **0 = Twiggy, 1 = single-sided Sony, 2 =
+    /// double-sided Sony** (STARTUP:1747-1748, docs/hardware-notes.md
+    /// "Board IDs").
+    ///
+    /// Was a static `1` stub in `IODispatcher`, which M3 Task 3 flagged as a
+    /// latent inconsistency: `insert(_:)` accepts an 800K double-sided image
+    /// and sets DISKFLG accordingly while `$C015` kept claiming
+    /// single-sided -- a combination no real Lisa could produce. M8 takes
+    /// the resolution path that note prescribed and derives it from the
+    /// inserted media.
+    ///
+    /// **Physical caveat, stated because the model is deliberately loose
+    /// here:** on real hardware this byte describes the DRIVE, which cannot
+    /// change with the disk in it. Deriving it from the media is sound only
+    /// under the assumption a double-sided diskette is only ever inserted
+    /// into a drive that can read it -- true of any real configuration, and
+    /// it keeps 400K media reading exactly `1` as before. If a future task
+    /// ever needs to model a single-sided drive REJECTING 800K media, this
+    /// becomes a configured drive property instead.
+    /// True when the inserted image has more blocks than one side holds --
+    /// i.e. an 800K double-sided diskette, whose block ordering interleaves
+    /// the two sides per track (see `blockNumber`).
+    var isDoubleSidedMedia: Bool { (image?.blockCount ?? 0) > Self.blocksPerSide }
+
+    public var intDiskId: UInt8 {
+        guard let image else { return 1 }
+        return image.blockCount > Self.blocksPerSide ? 2 : 1
+    }
 
     // MARK: - Reset (Machine.reset(), M2 Task 2 warm-reset path)
 
@@ -657,7 +687,8 @@ public final class FloppyController {
     /// (SONYASM:304-321) -- the exact mirror of `performRead`'s layout.
     private func performWrite(track: Int, sector: Int, side: Int) {
         guard image != nil,
-              let block = Self.blockNumber(track: track, sector: sector, side: side),
+              let block = Self.blockNumber(track: track, sector: sector, side: side,
+                                           doubleSided: isDoubleSidedMedia),
               block < image!.blockCount else {
             log("FloppyController: writedisk rejected -- no disk or bad geometry, track=\(track) sector=\(sector) side=\(side)")
             setError(ErrorCode.write)
@@ -681,7 +712,8 @@ public final class FloppyController {
             raiseCompletionLineAfterDelay()
             return
         }
-        guard let block = Self.blockNumber(track: track, sector: sector, side: side),
+        guard let block = Self.blockNumber(track: track, sector: sector, side: side,
+                                           doubleSided: isDoubleSidedMedia),
               block < image.blockCount else {
             setError(ErrorCode.read)
             raiseCompletionLineAfterDelay()
@@ -746,12 +778,37 @@ public final class FloppyController {
     /// (base 672); 80 tracks/side, 800 blocks/side. Side 1 (double-sided)
     /// adds 800. `nil` for an out-of-range track/sector (bad-track error
     /// path).
-    static func blockNumber(track: Int, sector: Int, side: Int) -> Int? {
+    /// **Double-sided (800K) layout is INTERLEAVED BY TRACK (M8).** A Sony
+    /// 800K image orders blocks track-major, side-minor: track 0 side 0's
+    /// sectors, then track 0 side 1's, then track 1 side 0, and so on --
+    /// NOT all of side 0 followed by all of side 1.
+    ///
+    /// The `side == 1 ? block + 800` form this replaces was written in M2
+    /// when only single-sided 400K images existed and no traced path had
+    /// ever read side 1; M3 Task 3 flagged the whole double-sided path as
+    /// untested. MacWorks Plus's 800K installer is the first thing to
+    /// exercise it, and it caught the error immediately: live trace shows
+    /// it read (track 0, side 0, sectors 0/2/4) and then (track 0, **side
+    /// 1**, sector 4). Interleaved that is block 16; under the old form it
+    /// was block 804 -- deep in the middle of the volume. Every read
+    /// returned DISKERR 0, so MacWorks got plausible-looking garbage rather
+    /// than an error, and ejected the diskette as unreadable.
+    ///
+    /// `doubleSided` defaults to false, leaving the single-sided mapping
+    /// (including its physically-meaningless `side 1 -> +800`, which no
+    /// caller reaches for 400K media) byte-identical for every existing
+    /// pin, notably `FloppyControllerTests`' full-range property test.
+    static func blockNumber(track: Int, sector: Int, side: Int,
+                            doubleSided: Bool = false) -> Int? {
         guard side == 0 || side == 1 else { return nil }
         guard let (secPerTrack, base) = zoneInfo(forTrack: track) else { return nil }
         guard sector >= 0, sector < secPerTrack else { return nil }
-        let block = base + (track % 16) * secPerTrack + sector
-        return side == 0 ? block : block + blocksPerSide
+        // Blocks preceding this track, counting ONE side.
+        let cumulative = base + (track % 16) * secPerTrack
+        guard doubleSided else {
+            return side == 0 ? cumulative + sector : cumulative + sector + blocksPerSide
+        }
+        return 2 * cumulative + side * secPerTrack + sector
     }
 
     private static func zoneInfo(forTrack track: Int) -> (secPerTrack: Int, base: Int)? {

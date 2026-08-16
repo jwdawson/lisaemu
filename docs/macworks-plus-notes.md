@@ -760,8 +760,15 @@ Keycap `$5C` = Space (`Sources/LisaShell/KeyMap.swift:96`), `$06` = mouse
 button (M1c), `$67` = Y and `$6F` = N (`KeyMap.swift:64,53`); bit 7 set is
 key-down. Site `$02315C` is exactly the 2.5.3 build's own string
 `HOLD DOWN SPACE BAR OR MOUSE BUTTON / TO ADJUST STARTUP CONFIGURATION`;
-site `$023CD4` is a yes/no prompt that reprints and re-waits on any other
-key.
+site `$023CD4` accepts only `$E7`/`$EF` and reprints on any other key.
+
+**Live-screen correction (2026-08-16).** With the display fixed, the screen
+this site paints reads `--- TYPE A KEY TO CONTINUE ---`, above the PFG
+diagnostics and the "HOLD DOWN SPACE BAR OR MOUSE BUTTON" line. So calling
+`$023CD4` "the Y/N prompt" was an inference from the two compare values, not
+what the user is shown; the Y/N reading more likely belongs to the startup
+*configuration* menu reached by holding Space. The mechanism is unchanged —
+it waits, and a keystroke releases it.
 
 **So the machine is sitting at a prompt waiting for a keypress.** The 40,000
 reads of `$FCDD9B` per 2M cycles are the sound of an unanswered prompt, not
@@ -804,7 +811,8 @@ single `type y`, then run on.
 | COPS | — | `powerCmds=[$25]` accepted |
 
 Sixty million cycles is more than four times site `$02315C`'s ~14M budget,
-so that site is ruled out: the boot parks at **`$023CD4`, the Y/N prompt**
+so that site is ruled out: the boot parks at **`$023CD4`, the "type a key to
+continue" prompt**
 (4054 retries ≈ 414M cycles — which is why 80M-cycle repro runs looked like
 an infinite hang). A single keystroke releases it; MacWorks Plus II then
 loads ~258 more blocks, programs the MMU, ejects the Lisa boot floppy on its
@@ -892,7 +900,7 @@ Repro, end to end from cold:
 ```
 iot limit 10
 bootdisk 1000
-gu 23736 60000000     # the Y/N startup prompt (§10′)
+gu 23736 60000000     # the "type a key to continue" prompt (§10′)
 type y
 g 300000000           # -> $423Axx, inside the patched Mac ROM
 insert <MW+II Install V2.5.0.dc42 copy>
@@ -907,3 +915,57 @@ The splash shows the floppy-`?` icon, i.e. it is still asking for a
 MacWorks route is to install onto a Widget rather than boot the installer.
 Driving MW+II's installer to build a bootable volume is the next step, and
 is now unblocked because the screen is readable.
+
+## 10‴. The PFG — hardware we do not model (2026-08-16, expected, non-fatal)
+
+With the display fixed, MacWorks Plus II's startup screen is legible, and it
+reports:
+
+```
+PFG NOT RESPONDING - CHECK INSTALLATION
+TIMEOUT WAITING FOR FDC - CHECK PFG CLIPS
+FAILED TO INITIALIZE PFG PARAMETER RAM
+```
+
+The **PFG is a hardware add-on** shipped alongside MacWorks Plus II (Sun
+Remarketing). The strings say what it does: it clips onto the floppy
+controller ("CHECK PFG CLIPS", "PFG CANNOT CONTROL FDC") and provides
+parameter RAM ("PFG PARAMETER RAM INITIALIZED", alongside the separate
+`USING STARTUP SETTINGS STORED IN PRAM`). The acronym's expansion is not
+established here — only its function, from the guest's own strings and code.
+
+### The probe
+
+`$022FA4` sets up and calls a helper with `A0 = $00F80000` — **expansion-slot
+space, not Lisa I/O at `$FCxxxx`** — then:
+
+```
+$022FD2  move.b D1,D7
+$022FD4  andi.b #$0F,D7
+$022FD8  subi.b #$0A,D7        ; low nibble must be $A
+$022FDC  beq.s  (present)
+$022FE0  lea    <"PFG NOT RESPONDING">,A3
+```
+
+`Bus` models nothing in slot space, so the reply cannot have low nibble `$A`
+and the check always fails. All five PFG strings are reachable from
+`$022FE0`, `$0230BC`, `$0230C2`, `$023306`/`$023D2A`, `$02330E`/`$023D4E`.
+
+### It does not block anything
+
+MW+II prints the diagnostics, waits for a key, and continues to its splash.
+Ordinary Lisa floppy I/O is unaffected: in the same session an inserted 800K
+installer took `blocksRead` from 279 to **340** with all three PFG failures
+already reported. The remaining `?` icon is "no bootable Mac volume", not a
+PFG consequence — the 800K disk is the installer (§1′/§6: the MacWorks route
+is to install onto a Widget and boot that).
+
+### If it is ever modeled
+
+One requirement is known — low nibble `$A` read back from `$F80000` — which
+is nowhere near enough to build a device under the repo's evidence-gated
+rule. The payoff would be more than silencing three lines: working PFG
+parameter RAM is what `USING STARTUP SETTINGS STORED IN PRAM` refers to, so
+it would plausibly stop MW+II pausing at the startup prompt on every boot.
+Scope it as its own piece of work, with real evidence, or leave it alone —
+the errors are cosmetic today.

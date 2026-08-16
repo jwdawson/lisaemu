@@ -23,12 +23,17 @@ xcodegen generate --spec LisaApp/project.yml
 xcodebuild -project LisaApp/LisaApp.xcodeproj -scheme LisaApp test
 ```
 
-Full-env runs (release, one process at a time; ROMPrinterTests alone ~60s):
+Full-env runs (release, one process at a time; ROMPrinterTests alone ~60s).
+**Omitting `LISAEMU_DISK_DIR` silently SKIPS checkpoints E/G/H/I/J** — the
+floppy-path pixel/FNV anchors — and the run still reports all green, so a
+video/display change can look validated when its most exposed tests never
+ran (M9, 2026-08-16):
 
 ```sh
 LISAEMU_ROM_DIR=~/Development/LisaROMs \
 LISAEMU_WIDGET_DIR=~/Development/LisaImages \
-  swift test -c release
+LISAEMU_DISK_DIR=~/Development/LisaImages \
+  swift test -c release   # all three: DISK_DIR gates checkpoints E/G/H/I/J
 LISAEMU_TH_DIR=<tomharte-dir> swift test -c release   # expected EXACTLY 807147 passed / 0 failed / 192913 known-failure skips
 ```
 

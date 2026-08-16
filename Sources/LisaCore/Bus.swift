@@ -561,6 +561,16 @@ public final class Bus {
 
     public var ioTrace: [IOAccess] { io.ioTrace }
     public var ioTraceDropped: Int { io.ioTraceDropped }
+    /// Cap on `ioTrace` (default `IODispatcher.defaultIOTraceLimit`).
+    /// Adjustable for diagnostic sessions -- see `IODispatcher.ioTraceLimit`
+    /// for why a total-not-window cap needs both this and `clearIOTrace()`.
+    public var ioTraceLimit: Int {
+        get { io.ioTraceLimit }
+        set { io.ioTraceLimit = newValue }
+    }
+    /// Empties `ioTrace` + `ioTraceDropped` so a later slice is observable
+    /// on its own (M8 tooling; `lisadbg`'s `iot clear`).
+    public func clearIOTrace() { io.clearIOTrace() }
     public var videoPageLatch: UInt8 { io.videoPageLatch }
     /// VIA1 ($D901, stride 8) / VIA2 ($DD81, stride 2) -- the real 6522
     /// register files `IODispatcher` routes those IOSpace windows to (see

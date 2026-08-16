@@ -3,6 +3,29 @@ import Foundation
 public struct Monitor {
     public enum Command: Equatable {
         case regs, step(Int), disasm(UInt32?, Int), mem(UInt32, Int), trace(Int), go(Int)
+        /// `gu <hexaddr> [cycles]` (M8 tooling) -- run until the PC reaches
+        /// `hexaddr`, or `cycles` are spent (default `goUntilDefaultBudget`).
+        /// The breakpoint `g` never was: `g` can only stop on a cycle count,
+        /// and `t` cannot practically be walked through a guest's delay loop.
+        /// See `Machine.run(untilPC:maxCycles:)` for the stop semantics.
+        case goUntil(UInt32, Int)
+        /// `gw <hexaddr> [cycles]` (M8 tooling) -- run until the byte at
+        /// `hexaddr` CHANGES (not merely is written), or `cycles` are spent.
+        /// The question "does anything ever set this flag?" has no answer a
+        /// breakpoint can give: see `Machine.run(untilChangeAt:maxCycles:)`.
+        case goWatch(UInt32, Int)
+        /// `iot clear` (M8 tooling) -- empty `Bus.ioTrace` + its drop counter
+        /// so the NEXT slice's I/O is observable. The cap is a total, not a
+        /// rolling window, so a long boot fills it and `g`'s I/O list then
+        /// misleadingly prints nothing.
+        case ioTraceClear
+        /// `iot limit <n>` (M8 tooling) -- resize that cap for a session.
+        case ioTraceLimit(Int)
+        /// `guest mac` / `guest lisa` (M8) -- which guest's cursor the
+        /// click/moveto/press/drag steering should read back. A Macintosh
+        /// guest (MacWorks Plus) keeps its mouse in Mac low memory, not in
+        /// the Lisa OS's cells, so the loop steers blind under the default.
+        case guestCursor(mac: Bool)
         case screenshot(String), asciiPreview
         /// The scripted menu-boot harness (M4 Task 2): cycle/instruction
         /// budget defaults to `bootdisk`'s own generous constant when no
@@ -18,6 +41,12 @@ public struct Monitor {
         /// Widget-10 hard-disk image at `<path>` and attaches it, so the
         /// installer can format-and-populate a blank disk (§10.10).
         case widgetCreate(String)
+        /// `widget log` (M8) -- dump `WidgetDrive`'s bounded command log
+        /// (command byte + block + accepted/rejected), run-length summarized.
+        /// `WidgetDrive`'s `log` closure is not wired up in `lisadbg`, so a
+        /// guest hammering one block or hitting an unsupported command was
+        /// invisible.
+        case widgetLog
         /// `click <x> <y>` (M5 Task 3) -- feedback-steer the cursor to screen
         /// pixel `(x,y)` and press/release the mouse button. Unlike `bootdisk`'s
         /// ROM-menu clicks (which steer the ROM cursor cells `$496`/`$498`),
@@ -90,6 +119,13 @@ public struct Monitor {
     public var symbols: LinkmapSymbols?
     public init(machine: Machine) { self.machine = machine }
 
+    /// `gu`'s default cycle budget when none is given: 50M cycles = ~10s of
+    /// emulated time at the Lisa's 5 MHz. Generous enough to cross a guest
+    /// delay loop, small enough that a wrong target address fails in
+    /// seconds rather than looking like a hang (`gu` single-steps, so it is
+    /// slower per cycle than `g` -- see `Machine.run(untilPC:maxCycles:)`).
+    public static let goUntilDefaultBudget = 50_000_000
+
     public static func parse(_ line: String) -> Command? {
         let parts = line.split(separator: " ").map(String.init)
         guard let cmd = parts.first else { return nil }
@@ -115,6 +151,26 @@ public struct Monitor {
                   return .mem(a, int(2, default: 64))
         case "t": return .trace(int(1, default: 1))
         case "g": return .go(int(1, default: 100000))
+        case "gu": guard let a = hex(1) else { return nil }
+                   return .goUntil(a, int(2, default: goUntilDefaultBudget))
+        case "gw": guard let a = hex(1) else { return nil }
+                   return .goWatch(a, int(2, default: goUntilDefaultBudget))
+        case "guest":
+            guard parts.count >= 2 else { return nil }
+            switch parts[1] {
+            case "mac": return .guestCursor(mac: true)
+            case "lisa": return .guestCursor(mac: false)
+            default: return nil
+            }
+        case "iot":
+            guard parts.count >= 2 else { return nil }
+            switch parts[1] {
+            case "clear": return .ioTraceClear
+            case "limit":
+                guard parts.count >= 3, let n = Int(parts[2]), n >= 0 else { return nil }
+                return .ioTraceLimit(n)
+            default: return nil
+            }
         case "sc": guard parts.count > 1 else { return nil }
                    return .screenshot(parts[1])
         case "sca": return .asciiPreview
@@ -127,6 +183,7 @@ public struct Monitor {
                         return .symbase(a)
         case "widget":
             // `widget create <path>` -- only sub-command today.
+            if parts.count == 2, parts[1] == "log" { return .widgetLog }
             guard parts.count >= 3, parts[1] == "create" else { return nil }
             // Rejoin the tail so paths containing spaces survive the split.
             let path = parts[2...].joined(separator: " ")

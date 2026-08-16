@@ -242,6 +242,96 @@ public final class Machine {
         }
     }
 
+    /// Why `run(untilPC:maxCycles:)` stopped.
+    public enum StopReason: String, Equatable, CustomStringConvertible {
+        /// The target PC was observed at an instruction boundary.
+        case reachedPC
+        /// `maxCycles` were spent without ever seeing the target PC.
+        case budgetExhausted
+        /// Fatal double fault (`halted`) before the target was reached.
+        case halted
+        /// A clean OS-requested power-off (`powerState == .off`).
+        case poweredOff
+        /// The watched byte changed (`run(untilChangeAt:maxCycles:)`).
+        case watchTriggered
+
+        public var description: String { rawValue }
+    }
+
+    /// Runs until the byte at `address` changes value, at most `maxCycles`
+    /// pass, or the machine halts / powers off -- the write-watchpoint half
+    /// of the `gu` breakpoint (M8 tooling). Returns the stop reason and, on
+    /// `.watchTriggered`, the before/after bytes.
+    ///
+    /// Samples through `withPeek` so watching an I/O address cannot itself
+    /// toggle a latch or log to `ioTrace` (see `Bus.withPeek`) -- a
+    /// watchpoint that perturbed the thing it watched would be worse than
+    /// no watchpoint. Detects a CHANGE, not a write: a store of the value
+    /// already there is invisible, which is the right default when the
+    /// question is "does this flag ever become non-zero".
+    ///
+    /// Same diagnostic-only, single-stepping tradeoff as
+    /// `run(untilPC:maxCycles:)` -- see that method's doc comment.
+    public func run(untilChangeAt address: UInt32,
+                    maxCycles: UInt64) -> (reason: StopReason, before: UInt8, after: UInt8) {
+        func sample() -> UInt8 { bus.withPeek { bus.read8(address) } }
+        let deadline = cycles &+ maxCycles
+        let before = sample()
+        while cycles < deadline {
+            if halted { return (.halted, before, sample()) }
+            if powerState != .on { return (.poweredOff, before, sample()) }
+            step()
+            let now = sample()
+            if now != before { return (.watchTriggered, before, now) }
+        }
+        return (.budgetExhausted, before, sample())
+    }
+
+    /// Runs until the PC reaches `targetPC` at an instruction boundary, at
+    /// most `maxCycles` cycles pass, or the machine halts / powers off --
+    /// the breakpoint primitive `lisadbg`'s `gu` is built on (M8 tooling,
+    /// added for the MacWorks Plus P0 probe: the guest's splash loop burns
+    /// a `$40000`-iteration delay, so `t` cannot practically be walked to
+    /// the interesting call and `g` can only stop on a cycle count).
+    ///
+    /// **Breakpoint semantics:** stops *before* executing the instruction
+    /// at `targetPC`, and always executes at least one instruction first --
+    /// so `gu <the PC you are sitting on>` means "run until you come back
+    /// here", not "return immediately".
+    ///
+    /// **Why single-step and not `run(until:)`:** that path hands Musashi
+    /// slices of up to `irqPollQuantum` cycles, so a PC only visible
+    /// mid-slice is invisible to it. Vendored Musashi's
+    /// `M68K_INSTRUCTION_HOOK` is `M68K_OPT_OFF`, and turning it on would
+    /// be a `Scripts/vendor-musashi.sh` patch billing every caller
+    /// (TomHarte's 807k cases included) for a debugger-only feature. So the
+    /// debugger pays instead. This is a **diagnostic** entry point, not an
+    /// emulation path -- nothing in `LisaShell`/`LisaApp` calls it.
+    ///
+    /// **Precision note:** stepping ticks the VIAs once per instruction
+    /// rather than once per <=1024-cycle slice, so IRQ recognition here is
+    /// *finer* than `run(until:)`'s (see `irqPollQuantum`). Identical
+    /// semantics, marginally different timing -- worth remembering if a
+    /// timing-sensitive repro is being chased through `gu` rather than `g`.
+    @discardableResult
+    public func run(untilPC targetPC: UInt32, maxCycles: UInt64) -> StopReason {
+        let deadline = cycles &+ maxCycles
+        var executedAny = false
+        while cycles < deadline {
+            if halted { return .halted }
+            if powerState != .on { return .poweredOff }
+            if executedAny && cpu[.pc] == targetPC { return .reachedPC }
+            step()
+            executedAny = true
+        }
+        // The budget can run out on the very step that lands on the target;
+        // report that as a hit rather than a miss.
+        if halted { return .halted }
+        if powerState != .on { return .poweredOff }
+        if executedAny && cpu[.pc] == targetPC { return .reachedPC }
+        return .budgetExhausted
+    }
+
     /// Advances both VIAs by the cycles just executed and recomputes the
     /// CPU's IRQ level (docs/hardware-notes.md §5 "Interrupt Levels": VIA1
     /// = level 1 -- OR'd with `vsyncPending`, the not-yet-modeled vsync
@@ -308,10 +398,25 @@ public final class Machine {
     ///
     /// `0x06` is the COPS mouse-button keycode (same code `lisadbg`'s single
     /// `click` posts).
-    public func postDoubleClick() {
+    ///
+    /// **`phaseCycles` (M8).** Each button phase (down-held, then up-held)
+    /// lasts this long; the two button-DOWNS therefore land `2 *
+    /// phaseCycles` apart. The default `100_000` (~20ms at 5MHz) is the M7
+    /// value tuned against the Lisa OS and is left untouched -- the Lisa's
+    /// driver consumes queued COPS *events*, so short phases are fine.
+    ///
+    /// A **Macintosh guest (MacWorks Plus) needs longer phases**: it samples
+    /// the button LEVEL at VBL (~16.7ms), so a 20ms phase gets barely one
+    /// sample and a phase is easily missed entirely -- observed live at the
+    /// MacWorks Finder, where this gesture only ever selected an icon while
+    /// two ordinary `click`s (60ms phases) opened it. There is ample room:
+    /// the Mac's own `DoubleTime` ($2F0) reads `$20` = 32 ticks = 533ms, far
+    /// wider than either spacing, so the fix is slower phases rather than
+    /// tighter ones. `lisadbg` passes 300_000 under `guest mac`.
+    public func postDoubleClick(phaseCycles: UInt64 = 100_000) {
         for _ in 0..<2 {
-            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + 100_000)
-            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + 100_000)
+            bus.cops.postKey(code: 0x06, down: true);  run(until: cycles + phaseCycles)
+            bus.cops.postKey(code: 0x06, down: false); run(until: cycles + phaseCycles)
         }
     }
 }

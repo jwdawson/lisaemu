@@ -1289,7 +1289,9 @@ Key files: `OS/SOURCE-SONY.TEXT.unix.txt` (Pascal driver, Rich Castro),
   - `$11` DISKERR (nonzero=error)
   - `$13` DISKFLG (single/double-sided flag)
   - `$19` DISKSKING (`$FF` while seeking)
-  - `$41` DISKIN (nonzero=disk present; Sony)
+  - `$41` DISKIN (~~nonzero=disk present; Sony~~ **M8 correction: the
+    value is `$FF` when present, not merely "nonzero" -- see the DISKIN
+    entry below**)
   - `$5F` DISKSTAT (interrupt/status)
   - `$95` DISKCS (checksum err count; mover says `TWIGCS=$BB`!)
   - `$B9` DISKB2
@@ -1437,6 +1439,59 @@ zone/track/sector/side:
   ldmicro:48-49,213-224): bit7 bot_int, bit6 bot_done, bit5 (Twiggy
   button/unused Sony), bit4 bot_in, bit3 top_int, bit2 top_done, bit1
   top_button, bit0 top_in (Sony uses "bot" nibble only; low nibble unused).
+- **Double-sided (800K) block order is INTERLEAVED BY TRACK (M8, MacWorks
+  Plus live trace).** A Sony 800K image orders blocks track-major,
+  side-minor — track 0 side 0's sectors, then track 0 side 1's, then track
+  1 side 0 — NOT all of side 0 followed by all of side 1. The HLE's
+  original `side == 1 -> block + 800` form dated from M2, when only
+  single-sided 400K images existed and no traced path had ever read side 1
+  (M3 Task 3 flagged the double-sided path as untested). MacWorks Plus's
+  800K installer is the first software to exercise it: it read (track 0,
+  side 0, sectors 0/2/4) then (track 0, **side 1**, sector 4) — block 16
+  interleaved, block 804 under the old form. Every read returned DISKERR 0,
+  so the guest received plausible garbage rather than an error and ejected
+  the diskette as unreadable; with the interleaved mapping the volume
+  mounts (`blocksRead` 656, "MW+ INSTALLER, 768K in disk"). Single-sided
+  mapping is unchanged. See `FloppyController.blockNumber`.
+- **Cell `$0D` -- a host-set busy flag the controller clears (M8, MacWorks
+  Plus live trace).** Absent from SONYASM's equate table (which jumps
+  `$0B` DISKTRAK -> `$0F` DISKCNFM) and never read or written by any Lisa
+  OS path, so the HLE had no reason to model it. MacWorks Plus uses it as a
+  second handshake alongside DISKCMD when booting System 6 off a
+  MacWorks-formatted hard disk: `$4242B8: st ($d,A0)` sets it to `$FF`,
+  `$4242BC` writes go-byte `$84`, and `$4242C2: tst.b ($d,A0) / bne` spins
+  until the controller zeroes it -- after which it reads DISKERR and stores
+  it into the Mac drive queue element's `dQFlags`. Go-byte `$84` is itself
+  undocumented (SONY.TEXT:61-68 lists `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/
+  `$89`); this model answers it as a handshake-only ack like any other
+  unrecognized go-byte, and `clearDiskCmd()` now clears `$0D` for every
+  command. Symptom when it is missing: the Mac Finder draws its menu bar
+  and hangs with the watch cursor, no desktop, ~40,000 reads of `$FCC00D`
+  per 2M cycles. Uncertainty noted in code: the clear fires when the go-byte
+  is consumed, which for `excmd` precedes the data-completion interrupt.
+- **DISKIN (`$41`) present-value = `$FF` (M8, MacWorks Plus live trace).**
+  The Lisa OS constrains this cell only to "nonzero" (ISDISKIN returns the
+  raw byte; `hdinit` tests `response <> 0` -- SONYASM:437-441,
+  SONY.TEXT:629-636), so the HLE's original `1` was an unconstrained
+  choice, not evidence. **MacWorks Plus 1.0.18 pins it:** its patched
+  `.Sony` reads the cell ABSOLUTELY --
+  `$41B892: cmpi.b #-$1,$fcc041.l` / `beq $41b8a2`, falling through to
+  `move.w #$ffbf,D0` (`-65` `offLinErr`) on any other value. With `1` in
+  the cell, every Mac-side `_Read` returned `offLinErr`, the Mac drive
+  queue element's `diskInPlace` (`$1DE3`) stayed `0` forever (watched via
+  `lisadbg gw` across 600M cycles, never written), and MacWorks could not
+  leave its splash. `$FF` satisfies BOTH drivers, so it replaces the guess
+  outright rather than being special-cased per guest -- and it matches this
+  firmware's own true-flag idiom elsewhere in the same window (DISKSKING
+  `$19` is documented `$FF` while seeking). Evidence that it is the right
+  value, not merely a value MacWorks likes: with `$FF` the guest
+  immediately does what real hardware does and this model never could
+  before -- it unclamps and **ejects the non-Mac boot floppy by itself**
+  (`disk=OUT` at ~54M cycles), then mounts an inserted `'LK'` volume
+  (`blocksRead` 310 -> 485, `$100000` = `4C 4B`, `diskInPlace` -> `1`) and
+  reaches the Macintosh Finder. Pinned by
+  `FloppyControllerTests.diskInCarriesFFWhileMediaIsPresent`; see
+  `FloppyController.diskInPresent`.
 - **DISKIN (`$41`)** polled at driver init via ISDISKIN (SONYASM:437-441).
   **Round-2 (M4 Task 4) live confirmation — our HLE answers this correctly.**
   ISDISKIN does `MOVE.B DISKIN(A2),D0; MOVE D0,RESPONSE(A3)` (read window `$41`,
@@ -1620,8 +1675,19 @@ zone/track/sector/side:
   the full disassembly); block 0 reads to completion and the boot block
   executes. The DISKERR raw-byte values remain uncited (the successful read
   path sets DISKERR=0, so no error code was exercised).
-- **`$C015`=1 vs. double-sided (1600-block) images — a known, documented
-  inconsistency (M3 Task 3 doc note, not fixed here).** `$C015` is a STATIC
+- **`$C015` vs. double-sided images — RESOLVED (M8).** `$FCC015`
+  (`adr_intdisk`) is no longer a static stub: `FloppyController.intDiskId`
+  derives it from the inserted media (1 = single-sided Sony, 2 =
+  double-sided Sony, per STARTUP:1747-1748), so DISKFLG and `$C015` can no
+  longer contradict each other. Needed by MacWorks Plus, whose hard-disk
+  installer ships on an 800K diskette. Physical caveat: on real hardware
+  this byte describes the DRIVE, which cannot change with the disk in it —
+  deriving it from media is sound only while a double-sided diskette is
+  assumed to be inserted into a drive that can read it. Pinned by
+  `IODispatcherTests.intDiskIdReflectsInsertedMediaSidedness`. The original
+  note is kept below, struck.
+- ~~**`$C015`=1 vs. double-sided (1600-block) images — a known, documented
+  inconsistency (M3 Task 3 doc note, not fixed here).**~~ `$C015` is a STATIC
   stub hardcoded to `1` (single-sided Sony), per the Task 4 update above --
   but `FloppyController.insert(_:)` accepts ANY DC42 image, including a
   double-sided 800K one (`blockCount > 800`), and sets DISKFLG accordingly

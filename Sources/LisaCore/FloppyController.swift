@@ -120,6 +120,31 @@ public final class FloppyController {
         static let diskHead = 0x07
         static let diskSec = 0x09
         static let diskTrak = 0x0B
+        /// **`$0D` -- host-set busy/ack flag the controller clears on
+        /// command completion (M8, MacWorks Plus live trace).** Absent from
+        /// SONYASM's equate table and from every Lisa OS path: the OS never
+        /// reads or writes it, which is why six milestones never needed it.
+        ///
+        /// MacWorks Plus uses it as a second handshake alongside DISKCMD,
+        /// booting System 6 off a MacWorks-formatted hard disk:
+        ///
+        ///     4242AE  clr.b   ($3,A0)         ; DISKPARM = 0
+        ///     4242B2  move.b  #$2, ($5,A0)    ; DISKDRIV = 2
+        ///     4242B8  st      ($d,A0)         ; $0D := $FF  (HOST sets it)
+        ///     4242BC  move.b  #$84, ($1,A0)   ; DISKCMD = $84
+        ///     4242C2  tst.b   ($d,A0)         ; spin until the 6504 CLEARS it
+        ///     4242C6  bne     $4242c2
+        ///     4242C8  move.b  ($11,A0), D0    ; then DISKERR ...
+        ///     4242D4  move.b  D0, (-$4,A0)    ; ... into the DrvQEl's dQFlags
+        ///
+        /// Go-byte `$84` is itself undocumented (SONY.TEXT:61-68 lists
+        /// `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/`$89`), so this model answers
+        /// it the way it answers every other unrecognized go-byte -- a
+        /// handshake-only ack -- and now also clears `$0D`, which is what
+        /// the guest is actually waiting on. Without it the Finder draws its
+        /// menu bar and then spins here forever with the watch cursor up:
+        /// ~40,000 reads of `$FCC00D` per 2M cycles, and no desktop.
+        static let diskAck = 0x0D
         static let diskCnfm = 0x0F
         static let diskErr = 0x11
         static let diskFlg = 0x13
@@ -186,6 +211,25 @@ public final class FloppyController {
         case verifytrk = 6
         case readBf = 7
         case writeBf = 8
+        /// **`clampcmd` = 9 -- Twiggy-only, deliberately NOT implemented
+        /// (M8).** hardware-notes.md §9 lists 0-8 for the Sony and notes
+        /// "Twiggy adds clampcmd=9" (twiggy:83), so the Lisa OS never
+        /// issues it. MacWorks Plus DOES, in the hard-disk configuration:
+        /// live trace at an insert with a Widget attached shows `$C003 W 09`
+        /// + `$C005 W 80` + `$C001 W 81` (excmd), then `$C011 R 09` reading
+        /// back this model's `notIssued`. The floppy-only path never issues
+        /// it at all (zero occurrences in the same trace without
+        /// `--widget`).
+        ///
+        /// Answering it as a success no-op was TRIED and REVERTED: DISKERR
+        /// went 9 -> 0 as intended, but MacWorks still ejected the diskette
+        /// immediately afterwards, so the clamp answer is not what gates
+        /// that path -- MacWorks never reads a block from the floppy at all
+        /// while it is looping on the hard disk. Since no source states what
+        /// real Sony firmware returns for a Twiggy-only sub-command, an
+        /// unfalsified guess that fixes nothing does not belong in the
+        /// model. Revisit only with evidence that the answer matters.
+        case clampcmd = 9
     }
 
     /// DISKERR raw byte values. hardware-notes.md §9 documents the OS-level
@@ -377,6 +421,36 @@ public final class FloppyController {
     /// visible protocol exchange).
     public var isInserted: Bool { image != nil }
 
+    /// The byte DISKIN (`$41`) carries while media is present: **`$FF`, not
+    /// a bare `1`** (M8, MacWorks Plus investigation).
+    ///
+    /// hardware-notes.md §9 documents DISKIN only as "nonzero = disk
+    /// present", because the Lisa OS never looks closer: `ISDISKIN`
+    /// (SONYASM:437-441) returns the raw byte and `hdinit` sets
+    /// `disk_present := gooddisk` when `response <> 0` (SONY.TEXT:629-636).
+    /// Any nonzero value satisfies that, so the original `1` was an
+    /// unconstrained choice, never evidence.
+    ///
+    /// **MacWorks Plus 1.0.18 constrains it.** Its patched `.Sony` reads
+    /// the cell ABSOLUTELY -- live `lisadbg` trace, guest code at
+    /// `$41B892`:
+    ///
+    ///     41B892  cmpi.b  #-$1, $fcc041.l   ; DISKIN == $FF ?
+    ///     41B89A  beq     $41b8a2           ;   yes -> proceed
+    ///     41B89C  move.w  #$ffbf, D0        ;   no  -> -65 offLinErr
+    ///     41B8A0  bra     $41b82e           ;          and return it
+    ///
+    /// With `1` in the cell every `_Read` returned offLinErr, the Mac drive
+    /// queue element's `diskInPlace` stayed `0` forever (watched with `gw
+    /// $1DE3` across 600M cycles, never written), and the boot could not
+    /// pass its splash. `$FF` satisfies BOTH drivers -- it is the only
+    /// value consistent with all known evidence, so it replaces the guess
+    /// rather than being special-cased per guest.
+    ///
+    /// Corroboration from the same window: DISKSKING (`$19`) is documented
+    /// `$FF while seeking` -- `$FF` is this firmware's true-flag idiom.
+    static let diskInPresent: UInt8 = 0xFF
+
     /// **`$C015` vs. double-sided images -- a known, documented
     /// inconsistency (M3 Task 3 doc note, not fixed here).** `insert(_:)`
     /// happily accepts a double-sided (1600-block) DC42 image and sets
@@ -401,7 +475,7 @@ public final class FloppyController {
         sessionOverlay.removeAll()   // fresh insertion = fresh write session
         blocksWritten = 0
         self.image = image
-        window[Cell.diskIn] = 1
+        window[Cell.diskIn] = Self.diskInPresent
         window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
         // DISKIN ($41) is the persistent presence cell. DISKSTAT bit4 `bot_in`
         // is NOT a presence mirror -- it is the media-change INTERRUPT bit,
@@ -481,7 +555,37 @@ public final class FloppyController {
     /// 800 blocks/side (`SNYSNGL`, hardware-notes.md §9) -- a single-sided
     /// 400K image has exactly this many; a double-sided image's `blockCount`
     /// exceeds it.
-    private static let blocksPerSide = 800
+    static let blocksPerSide = 800
+
+    /// `$FCC015` (`adr_intdisk`) -- the drive-capability byte the OS reads to
+    /// tell drive types apart: **0 = Twiggy, 1 = single-sided Sony, 2 =
+    /// double-sided Sony** (STARTUP:1747-1748, docs/hardware-notes.md
+    /// "Board IDs").
+    ///
+    /// Was a static `1` stub in `IODispatcher`, which M3 Task 3 flagged as a
+    /// latent inconsistency: `insert(_:)` accepts an 800K double-sided image
+    /// and sets DISKFLG accordingly while `$C015` kept claiming
+    /// single-sided -- a combination no real Lisa could produce. M8 takes
+    /// the resolution path that note prescribed and derives it from the
+    /// inserted media.
+    ///
+    /// **Physical caveat, stated because the model is deliberately loose
+    /// here:** on real hardware this byte describes the DRIVE, which cannot
+    /// change with the disk in it. Deriving it from the media is sound only
+    /// under the assumption a double-sided diskette is only ever inserted
+    /// into a drive that can read it -- true of any real configuration, and
+    /// it keeps 400K media reading exactly `1` as before. If a future task
+    /// ever needs to model a single-sided drive REJECTING 800K media, this
+    /// becomes a configured drive property instead.
+    /// True when the inserted image has more blocks than one side holds --
+    /// i.e. an 800K double-sided diskette, whose block ordering interleaves
+    /// the two sides per track (see `blockNumber`).
+    var isDoubleSidedMedia: Bool { (image?.blockCount ?? 0) > Self.blocksPerSide }
+
+    public var intDiskId: UInt8 {
+        guard let image else { return 1 }
+        return image.blockCount > Self.blocksPerSide ? 2 : 1
+    }
 
     // MARK: - Reset (Machine.reset(), M2 Task 2 warm-reset path)
 
@@ -501,7 +605,7 @@ public final class FloppyController {
         commandsProcessed = 0
         dropCompletionLine()
         if let image {
-            window[Cell.diskIn] = 1
+            window[Cell.diskIn] = Self.diskInPresent
             window[Cell.diskFlg] = image.blockCount > Self.blocksPerSide ? 1 : 0
             // DISKSTAT bot_in is an interrupt-event bit, not a presence mirror
             // (see insert(_:)); a warm reset leaves it clear (window is zeroed).
@@ -559,6 +663,16 @@ public final class FloppyController {
 
     private func clearDiskCmd() {
         window[Cell.diskCmd] = 0
+        // The other half of the handshake for guests that use it. Cleared
+        // for EVERY command, not just the `$84` that revealed it: `$0D` is
+        // the controller's "done with your request" signal and the Lisa OS
+        // never reads it, so this cannot disturb any OS path. UNCERTAIN and
+        // deliberately noted: this fires when the go-byte is consumed, which
+        // for `excmd` is BEFORE the data transfer's completion interrupt --
+        // if a guest is ever seen using `$0D` to wait on an excmd's DATA
+        // rather than its ack, that guest will need the clear moved to
+        // `raiseCompletionLineAfterDelay` instead.
+        window[Cell.diskAck] = 0
         commandInFlight = false
         commandsProcessed += 1
     }
@@ -608,7 +722,8 @@ public final class FloppyController {
     /// (SONYASM:304-321) -- the exact mirror of `performRead`'s layout.
     private func performWrite(track: Int, sector: Int, side: Int) {
         guard image != nil,
-              let block = Self.blockNumber(track: track, sector: sector, side: side),
+              let block = Self.blockNumber(track: track, sector: sector, side: side,
+                                           doubleSided: isDoubleSidedMedia),
               block < image!.blockCount else {
             log("FloppyController: writedisk rejected -- no disk or bad geometry, track=\(track) sector=\(sector) side=\(side)")
             setError(ErrorCode.write)
@@ -632,7 +747,8 @@ public final class FloppyController {
             raiseCompletionLineAfterDelay()
             return
         }
-        guard let block = Self.blockNumber(track: track, sector: sector, side: side),
+        guard let block = Self.blockNumber(track: track, sector: sector, side: side,
+                                           doubleSided: isDoubleSidedMedia),
               block < image.blockCount else {
             setError(ErrorCode.read)
             raiseCompletionLineAfterDelay()
@@ -697,12 +813,37 @@ public final class FloppyController {
     /// (base 672); 80 tracks/side, 800 blocks/side. Side 1 (double-sided)
     /// adds 800. `nil` for an out-of-range track/sector (bad-track error
     /// path).
-    static func blockNumber(track: Int, sector: Int, side: Int) -> Int? {
+    /// **Double-sided (800K) layout is INTERLEAVED BY TRACK (M8).** A Sony
+    /// 800K image orders blocks track-major, side-minor: track 0 side 0's
+    /// sectors, then track 0 side 1's, then track 1 side 0, and so on --
+    /// NOT all of side 0 followed by all of side 1.
+    ///
+    /// The `side == 1 ? block + 800` form this replaces was written in M2
+    /// when only single-sided 400K images existed and no traced path had
+    /// ever read side 1; M3 Task 3 flagged the whole double-sided path as
+    /// untested. MacWorks Plus's 800K installer is the first thing to
+    /// exercise it, and it caught the error immediately: live trace shows
+    /// it read (track 0, side 0, sectors 0/2/4) and then (track 0, **side
+    /// 1**, sector 4). Interleaved that is block 16; under the old form it
+    /// was block 804 -- deep in the middle of the volume. Every read
+    /// returned DISKERR 0, so MacWorks got plausible-looking garbage rather
+    /// than an error, and ejected the diskette as unreadable.
+    ///
+    /// `doubleSided` defaults to false, leaving the single-sided mapping
+    /// (including its physically-meaningless `side 1 -> +800`, which no
+    /// caller reaches for 400K media) byte-identical for every existing
+    /// pin, notably `FloppyControllerTests`' full-range property test.
+    static func blockNumber(track: Int, sector: Int, side: Int,
+                            doubleSided: Bool = false) -> Int? {
         guard side == 0 || side == 1 else { return nil }
         guard let (secPerTrack, base) = zoneInfo(forTrack: track) else { return nil }
         guard sector >= 0, sector < secPerTrack else { return nil }
-        let block = base + (track % 16) * secPerTrack + sector
-        return side == 0 ? block : block + blocksPerSide
+        // Blocks preceding this track, counting ONE side.
+        let cumulative = base + (track % 16) * secPerTrack
+        guard doubleSided else {
+            return side == 0 ? cumulative + sector : cumulative + sector + blocksPerSide
+        }
+        return 2 * cumulative + side * secPerTrack + sector
     }
 
     private static func zoneInfo(forTrack track: Int) -> (secPerTrack: Int, base: Int)? {

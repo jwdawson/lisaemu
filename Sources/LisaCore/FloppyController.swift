@@ -186,6 +186,25 @@ public final class FloppyController {
         case verifytrk = 6
         case readBf = 7
         case writeBf = 8
+        /// **`clampcmd` = 9 -- Twiggy-only, deliberately NOT implemented
+        /// (M8).** hardware-notes.md §9 lists 0-8 for the Sony and notes
+        /// "Twiggy adds clampcmd=9" (twiggy:83), so the Lisa OS never
+        /// issues it. MacWorks Plus DOES, in the hard-disk configuration:
+        /// live trace at an insert with a Widget attached shows `$C003 W 09`
+        /// + `$C005 W 80` + `$C001 W 81` (excmd), then `$C011 R 09` reading
+        /// back this model's `notIssued`. The floppy-only path never issues
+        /// it at all (zero occurrences in the same trace without
+        /// `--widget`).
+        ///
+        /// Answering it as a success no-op was TRIED and REVERTED: DISKERR
+        /// went 9 -> 0 as intended, but MacWorks still ejected the diskette
+        /// immediately afterwards, so the clamp answer is not what gates
+        /// that path -- MacWorks never reads a block from the floppy at all
+        /// while it is looping on the hard disk. Since no source states what
+        /// real Sony firmware returns for a Twiggy-only sub-command, an
+        /// unfalsified guess that fixes nothing does not belong in the
+        /// model. Revisit only with evidence that the answer matters.
+        case clampcmd = 9
     }
 
     /// DISKERR raw byte values. hardware-notes.md §9 documents the OS-level

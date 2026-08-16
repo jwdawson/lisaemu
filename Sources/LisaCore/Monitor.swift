@@ -41,6 +41,12 @@ public struct Monitor {
         /// Widget-10 hard-disk image at `<path>` and attaches it, so the
         /// installer can format-and-populate a blank disk (§10.10).
         case widgetCreate(String)
+        /// `widget log` (M8) -- dump `WidgetDrive`'s bounded command log
+        /// (command byte + block + accepted/rejected), run-length summarized.
+        /// `WidgetDrive`'s `log` closure is not wired up in `lisadbg`, so a
+        /// guest hammering one block or hitting an unsupported command was
+        /// invisible.
+        case widgetLog
         /// `click <x> <y>` (M5 Task 3) -- feedback-steer the cursor to screen
         /// pixel `(x,y)` and press/release the mouse button. Unlike `bootdisk`'s
         /// ROM-menu clicks (which steer the ROM cursor cells `$496`/`$498`),
@@ -177,6 +183,7 @@ public struct Monitor {
                         return .symbase(a)
         case "widget":
             // `widget create <path>` -- only sub-command today.
+            if parts.count == 2, parts[1] == "log" { return .widgetLog }
             guard parts.count >= 3, parts[1] == "create" else { return nil }
             // Rejoin the tail so paths containing spaces survive the split.
             let path = parts[2...].joined(separator: " ")

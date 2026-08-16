@@ -798,6 +798,24 @@ while let line = readLine(strippingNewline: true) {
             : String(format: "still $%02X", Int(before))
         reportSlice(machine, monitor: monitor, beforeIO: beforeIO, beforeMMU: beforeMMU,
                     prefix: "      gw $\(String(format: "%06X", Int(addr))) stop=\(reason) (\(change)) after \(n) cycle budget")
+    case .widgetLog:
+        let entries = machine.bus.widget.commandLog
+        guard !entries.isEmpty else {
+            print("      widget log empty (no ProFile commands decoded yet)")
+            break
+        }
+        // Run-length summarize: a retry loop is the shape we are usually
+        // looking for, and 512 identical lines would bury it.
+        var runs: [(WidgetDrive.LoggedCommand, Int)] = []
+        for e in entries {
+            if let last = runs.last, last.0 == e { runs[runs.count - 1].1 += 1 } else { runs.append((e, 1)) }
+        }
+        for (e, count) in runs {
+            let name = e.command == 0x00 ? "read" : (e.command == 0x01 ? "write" : "cmd $\(String(e.command, radix: 16))")
+            let verdict = e.accepted ? "" : "  <-- REJECTED (outside the single-block T_Seagate contract)"
+            print("      widget \(name) block \(e.block)\(count > 1 ? "  x\(count)" : "")\(verdict)")
+        }
+        print("      \(entries.count) logged, \(machine.bus.widget.commandLogDropped) dropped, \(machine.bus.widget.completedCommands) completed")
     case .guestCursor(let mac):
         guestCursorMode = mac ? .mac : .lisa
         cachedCursorSigns = nil   // re-probe against the new guest's driver
@@ -917,7 +935,7 @@ while let line = readLine(strippingNewline: true) {
     case .quit:
         exit(0)
     case .help:
-        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | gw <hexaddr> [cycles] | iot clear | iot limit <n> | guest mac|lisa | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | q")
+        print("r | s [n] | d [hexaddr] [n] | m <hexaddr> [n] | t [n] | g [cycles] | gu <hexaddr> [cycles] | gw <hexaddr> [cycles] | iot clear | iot limit <n> | guest mac|lisa | sc <path.png> | sca | bootdisk [cycles] | click <x> <y> | dclick <x> <y> | press <x> <y> | release | moveto <x> <y> | drag <x1> <y1> <x2> <y2> | type <text> | insert <path.dc42> | eject | power | printer | sym <hexaddr> | symbase <hexaddr> | widget create <path> | widget log | q")
     case nil:
         print("? — unknown command")
     }

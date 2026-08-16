@@ -107,6 +107,36 @@ public final class WidgetDrive {
     public private(set) var completedCommands = 0
     public private(set) var lastStatus: [UInt8] = [0, 0, 0, 0]
 
+    /// One decoded ProFile command, for the bounded diagnostic log below.
+    public struct LoggedCommand: Equatable {
+        public let command: UInt8
+        public let block: Int
+        public let accepted: Bool
+    }
+
+    /// Bounded command log (capped array + drop counter, the house pattern
+    /// for device-level telemetry). Added M8: `WidgetDrive`'s `log` closure
+    /// is not wired up by `lisadbg`, so an unsupported-command rejection or
+    /// a driver hammering one block was invisible -- exactly the question
+    /// "what is the guest asking the hard disk for?" that a stuck boot
+    /// poses. Dumped by `lisadbg`'s `widget log`.
+    public private(set) var commandLog: [LoggedCommand] = []
+    public private(set) var commandLogDropped = 0
+    private static let commandLogLimit = 512
+
+    public func clearCommandLog() {
+        commandLog.removeAll(keepingCapacity: true)
+        commandLogDropped = 0
+    }
+
+    private func recordCommand(_ command: UInt8, block: Int, accepted: Bool) {
+        if commandLog.count < Self.commandLogLimit {
+            commandLog.append(LoggedCommand(command: command, block: block, accepted: accepted))
+        } else {
+            commandLogDropped += 1
+        }
+    }
+
     public func attach(_ image: WidgetImage) {
         self.image = image
         resetTransaction()
@@ -297,12 +327,15 @@ public final class WidgetDrive {
         pendingBlock = block
         switch cmd {
         case Command.read:
+            recordCommand(cmd, block: block, accepted: true)
             responseCode = Code.respReadAccepted
             phase = .acceptHS
         case Command.write:
+            recordCommand(cmd, block: block, accepted: true)
             responseCode = Code.respWriteAccepted
             phase = .acceptHS
         default:
+            recordCommand(cmd, block: block, accepted: false)
             // Out of the advertised single-block T_Seagate contract (§10.8):
             // Formatcmd ($02), multi-block ($26), diagnostics — reject with a
             // fatal ERRSTAT rather than mishandle as a read (review I2).

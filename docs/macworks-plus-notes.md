@@ -583,6 +583,9 @@ the MW+ Installer. Failure that still counts as progress: a cited
 
 ## 9. Surviving roster
 
+- **MacWorks Plus II 2.5.0 — VIA2 CA1 (§10).** The one item here with a
+  known root cause, a bounded scope and an acceptance test.
+
 - **VIA2 shift register / SR interrupts** (§6 P2) — for whatever first waits
   on IFR bit 2. Nothing has yet.
 - **`clampcmd` (sub-command 9)** — MacWorks issues this Twiggy-only command in
@@ -602,3 +605,89 @@ the MW+ Installer. Failure that still counts as progress: a cited
   actually commands is unknown; MacWorks only uses its DISKERR result.
 
 ---
+
+---
+
+## 10. MacWorks Plus II 2.5.0 — diagnosed 2026-08-15, NOT fixed (next milestone)
+
+**Status:** root-caused, bounded, and deliberately not started. It needs one
+emulator capability the Lisa OS never forced us to build, and adding that
+capability is milestone-sized.
+
+### Images
+
+`~/Development/LisaImages/MacWorksPlusII/` — both well-formed DC42:
+
+| File | Blocks | Notes |
+|---|---|---|
+| `MW+II 2.5.0 BOOT disk.dc42` | 800 (400K) | Lisa boot block (`46FC2700`), DC42 name is literally `-not a Macintosh disk-` |
+| `MW+II Install V2.5.0.dc42` | 1600 (800K) | `'LK'` Mac volume, "MW+II Install v2.5.0" |
+
+### Symptom and root cause
+
+Boot it and you get a garbage band across the top of the screen and nothing
+else. Reproduced headlessly: `PC = $023742` in the Lisa-side loader,
+`SR = $2704` (IPL 7), `blocksRead` frozen at 21. Profiling the slice
+(`iot clear` then `g 2000000`) gives one address, 40,000 times: `$FCDD9B` =
+**VIA2 IFR**.
+
+The loop (addresses only; guest code is not transcribed here — §4's
+redaction note applies):
+
+- `$023736` loads a 2047-iteration timeout counter
+- `$02373A` tests **IFR2 bit 1 = CA1**
+- `$023742` `dbne`s back until CA1 sets or the count expires
+- `$023748` on success reads **PORTA2 reg 1 (`$FCDD83`)** — the COPS data
+  port, and the read that clears CA1 on real hardware
+
+It **never polls CRDY**: zero accesses to `$FCDD81` in the entire boot,
+unlike the Rev H ROM and the Lisa OS. So MacWorks Plus II drives the COPS
+purely through the CA1 handshake, times out, and an outer loop retries
+forever.
+
+This is the fifth instance of one pattern — DISKIN, the 800K interleave,
+cell `$0D`, `clampcmd`, now CA1: **a signal the Lisa OS's own habits left
+unconstrained, which a second guest depends on.**
+
+### Why it is a milestone and not a patch
+
+The Lisa OS **already enables CA1** — see hardware-notes.md "VIA2 CA1" for
+the traced evidence (IER2 `$82` six times, PCR2 positive-edge, 93 reads of
+the CA1-clearing handshake port per boot). So this is genuine hardware
+fidelity, not a MacWorks-specific hack — but it also means the risk is live:
+
+- CA1 interrupts are enabled on a **level-2** line during every normal boot.
+- Asserting IFR bit 1 starts dispatching an OS interrupt path that has
+  **never executed** in this emulator.
+- That path races the existing COPS model, whose delivery is gated on read
+  counts — a concrete double-consume hazard for keyboard and mouse bytes.
+- Every checkpoint FNV, menu anchor, input pin and print test is exposed.
+
+Comparable in shape to M4's COPS handshake rework, which the ledger calls
+"the frontier gate".
+
+### Scope sketch
+
+1. Model CA1 in `VIA6522`: edge selection from PCR bit 0, IFR bit 1, clear
+   on a register-1 (handshake) PORTA read, IER gating for the IRQ line.
+   `setInterruptFlag(_:)` and the `onPortAAccess` hook already exist.
+2. Decide what asserts it — COPS byte-ready is the evident answer — and
+   reconcile with the CRDY/read-count gate so a byte cannot be consumed
+   twice.
+3. Re-validate the full env-gated suite: checkpoint FNVs, menu anchors,
+   COPSTests, the M1c input pins, ROMPrinterTests.
+4. CA2 is unmodeled too; decide whether it is in scope or explicitly parked.
+
+### Acceptance test
+
+MacWorks Plus II 2.5.0 boots past `$023742` and reaches its splash — with
+every existing Lisa OS anchor unchanged. That is a clean pass/fail, which is
+what makes this a good milestone rather than an open-ended one.
+
+### Repro
+
+```
+cp "$HOME/Development/LisaImages/MacWorksPlusII/MW+II 2.5.0 BOOT disk.dc42" /tmp/mw2boot.dc42
+printf 'bootdisk 80000000\nd 23730 20\niot limit 40000\niot clear\ng 2000000\n' | \
+  .build/release/lisadbg --rom ~/Development/LisaROMs --disk /tmp/mw2boot.dc42
+```

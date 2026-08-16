@@ -414,6 +414,40 @@ Note: Stride differs from VIA1—a common emulation gotcha.
 | IER2     | 28     |
 | IORA2    | 30     |
 
+### VIA2 CA1 — the COPS receive handshake (M8 finding, UNMODELED)
+
+**`VIA6522` models neither CA1 nor CA2.** The Rev H boot ROM does not need
+them: it polls CRDY (PORTB2 bit 6) exclusively, which is what this emulator
+grew up satisfying. The Lisa OS, however, **enables CA1 and expects the
+handshake** — live trace of a full Office System boot off a Widget
+(`lisadbg`, `iot limit 600000`, 164k VIA2 accesses):
+
+| Access | Count | Meaning |
+|---|---|---|
+| `$FCDD9D` (IER2) W `$82` | 6 | bit 7 = *set*, bit 1 = **enable CA1 interrupts** |
+| `$FCDD9D` (IER2) W `$7F` | 2 | clear all sources |
+| `$FCDD99` (PCR2) W `$09` / `$C9` | 3 | CA1 = **positive edge** (PCR bit 0) |
+| `$FCDD83` (PORTA2 reg 1) R | **93** | the HANDSHAKE port — a real 6522 clears the CA1 flag on this read |
+
+PORTA2 carries COPS command/reply DATA (see "COPS" above), so CA1 is the
+COPS byte-ready strobe and the OS's driver is written for interrupt-driven
+receive. The emulator reaches the desktop with working keyboard and mouse
+regardless, because the COPS HLE satisfies the polled path — the CA1 ISR has
+simply never executed here.
+
+**Consequence for anyone implementing it:** CA1 interrupts are *already
+enabled* on a level-2 line during a normal boot. Asserting IFR bit 1 will
+start dispatching an OS interrupt path that has never run in this emulator,
+against a COPS model whose delivery is gated on read counts — a concrete
+double-consume hazard, and a risk to every checkpoint FNV, menu anchor and
+input pin. Treat it as a milestone, not a patch.
+
+**Who needs it:** MacWorks Plus II 2.5.0, which uses CA1 *exclusively* — its
+loader polls `btst #$1,$fcdd9b` (IFR2 bit 1) with a 2047-try timeout and
+then reads PORTA2 reg 1, and never touches CRDY at all (0 accesses to
+`$FCDD81` across its entire boot). Without CA1 it times out forever. See
+docs/macworks-plus-notes.md §10.
+
 ### VIA1 Function
 
 Source: libhw-DRIVERS:578-588, 595-596

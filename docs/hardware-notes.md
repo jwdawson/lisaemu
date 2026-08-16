@@ -224,6 +224,21 @@ Source: starasm1:186-214 (trap dispatch); implementation do_an_mmu LDASM:257-450
   - Value: (ScrnPhys + MemoryBase) >> 15
   - Alignment: 32KB-aligned physical page
   - Source: SetScreenKeybd, libhw-MACHINE:138-149
+  - **Both bytes of the word latch (M9 finding, 2026-08-16).** The register
+    captures whichever data lane the CPU drives, so `$FCE801` sets it just as
+    `$FCE800` does. Evidence: the Rev H ROM writes it at 5 sites, every one a
+    `MOVE.B` to the EVEN address (`13FC`/`13C0`/`13C6` + `00FCE800`), and the
+    whole ROM image contains **zero** references to `$FCE801`; the Lisa OS
+    likewise uses `MOVE.B D1,VideoLatch` (libhw-MACHINE:147). A 68000 `MOVE.B`
+    to an even address drives D15-D8. **MacWorks Plus II writes the same
+    register as a WORD (`$003E`)**, putting the page on D7-D0 — the odd byte.
+    Both work on real hardware, so the latch cannot be tied to a single lane.
+    Modeled in `IODispatcher.applyNonLatchWrite` as "either address latches";
+    since `Bus` decomposes a word write into even-then-odd byte writes,
+    last-write-wins yields the low byte for a word write and leaves the
+    ROM/OS byte path bit-identical. Found because MacWorks Plus II latched
+    `$00` and scanned out physical page 0 — its own data tables and `$55`/`$AA`
+    memory-test patterns — instead of its screen.
 
 - **ContrastLatch:** IOSpace + $D01C = $FCD01C (libhw-DRIVERS:136)
   - Range: 0 (max contrast) – 255 (min)
@@ -414,7 +429,23 @@ Note: Stride differs from VIA1—a common emulation gotcha.
 | IER2     | 28     |
 | IORA2    | 30     |
 
-### VIA2 CA1 — the COPS receive handshake (M8 finding, UNMODELED)
+### VIA2 CA1 — the COPS receive handshake (M8 finding, PARTLY UNMODELED)
+
+> **CORRECTION 2026-08-15 (M9 opening probe).** This section originally
+> claimed the CA1 flag "never sets" and that raising it would light up an
+> untested interrupt path. **Both are wrong**, and the "who needs it" claim
+> below is wrong too. What is genuinely unmodeled is narrower than it reads:
+> `VIA6522` has no CA1/CA2 *edge* logic (PCR edge select, auto-clear of IFR
+> bit 1 on a register-1 read) **inside the chip core** — but the COPS HLE
+> already performs the externally observable half of it. `IODispatcher.swift`
+> wires `COPS`'s `raiseInterrupt`/`clearInterrupt` onto
+> `VIA6522.setInterruptFlag(0x02)` / `clearInterruptFlag(0x02)`, and
+> `COPS.scheduleDeliveryIfIdle` raises IFR2 bit 1 the moment a byte is ready
+> while `COPS.handleByteConsumed` clears it on a genuine handshake read. So
+> **IFR2 bit 1 is asserted and cleared on the real byte-ready/handshake
+> conditions today**, and `VIA6522.peek(13)` returns it regardless of IER.
+> The gap that remains matters only to a guest that drives CA1 for something
+> *other* than COPS byte-ready, or that depends on PCR edge polarity.
 
 **`VIA6522` models neither CA1 nor CA2.** The Rev H boot ROM does not need
 them: it polls CRDY (PORTB2 bit 6) exclusively, which is what this emulator
@@ -435,17 +466,31 @@ receive. The emulator reaches the desktop with working keyboard and mouse
 regardless, because the COPS HLE satisfies the polled path — the CA1 ISR has
 simply never executed here.
 
-**Consequence for anyone implementing it:** CA1 interrupts are *already
+~~**Consequence for anyone implementing it:** CA1 interrupts are *already
 enabled* on a level-2 line during a normal boot. Asserting IFR bit 1 will
 start dispatching an OS interrupt path that has never run in this emulator,
 against a COPS model whose delivery is gated on read counts — a concrete
 double-consume hazard, and a risk to every checkpoint FNV, menu anchor and
-input pin. Treat it as a milestone, not a patch.
+input pin. Treat it as a milestone, not a patch.~~
 
-**Who needs it:** MacWorks Plus II 2.5.0, which uses CA1 *exclusively* — its
-loader polls `btst #$1,$fcdd9b` (IFR2 bit 1) with a 2047-try timeout and
-then reads PORTA2 reg 1, and never touches CRDY at all (0 accesses to
-`$FCDD81` across its entire boot). Without CA1 it times out forever. See
+**CORRECTED 2026-08-15.** IFR2 bit 1 is not a dormant path: the COPS HLE
+raises it on **every keyboard byte and every mouse packet**, so the level-2
+line it feeds has been exercised continuously since M4. There is no
+"never-run interrupt path" to light up, and no new double-consume hazard —
+`COPS` already owns both the raise and the clear, and has since M4's
+read-count gate landed.
+
+~~**Who needs it:** MacWorks Plus II 2.5.0, which uses CA1 *exclusively* —
+its loader polls IFR2 bit 1 with a 2047-try timeout and then reads PORTA2
+reg 1, and never touches CRDY at all. Without CA1 it times out forever.~~
+
+**CORRECTED 2026-08-15 — MacWorks Plus II does not need this.** Its loader
+does poll IFR2 bit 1 on a 2047-try budget and read PORTA2 on success, but
+that routine is a bounded "receive one COPS byte, or time out" helper that
+**returns either way**; its callers are keyboard prompts waiting for the
+user (Space/mouse-button, then Y/N). It stalls because nobody presses a key,
+not because the flag cannot set — and it polls at IPL 7, where no interrupt
+could be delivered even if CA1 were fully modeled. See
 docs/macworks-plus-notes.md §10.
 
 ### VIA1 Function

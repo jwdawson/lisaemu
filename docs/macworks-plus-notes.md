@@ -610,9 +610,14 @@ the MW+ Installer. Failure that still counts as progress: a cited
 
 ## 10. MacWorks Plus II 2.5.0 — diagnosed 2026-08-15, NOT fixed (next milestone)
 
-**Status:** root-caused, bounded, and deliberately not started. It needs one
+> **SUPERSEDED 2026-08-15 by §10′.** The root cause recorded below — "CA1 is
+> unmodeled, so the flag never sets" — is **refuted**. The emulator already
+> raises IFR2 bit 1 on COPS byte-ready. Read §10′ first; the symptom
+> observations here are all still accurate, only the diagnosis is not.
+
+~~**Status:** root-caused, bounded, and deliberately not started. It needs one
 emulator capability the Lisa OS never forced us to build, and adding that
-capability is milestone-sized.
+capability is milestone-sized.~~
 
 ### Images
 
@@ -640,16 +645,25 @@ redaction note applies):
 - `$023748` on success reads **PORTA2 reg 1 (`$FCDD83`)** — the COPS data
   port, and the read that clears CA1 on real hardware
 
-It **never polls CRDY**: zero accesses to `$FCDD81` in the entire boot,
-unlike the Rev H ROM and the Lisa OS. So MacWorks Plus II drives the COPS
+It **never polls CRDY** ~~: zero accesses to `$FCDD81` in the entire boot~~,
+unlike the Rev H ROM and the Lisa OS. ~~So MacWorks Plus II drives the COPS
 purely through the CA1 handshake, times out, and an outer loop retries
-forever.
+forever.~~
 
-This is the fifth instance of one pattern — DISKIN, the 800K interleave,
+**Corrected 2026-08-15 (§10′):** "zero accesses to `$FCDD81`" is wrong as
+stated — a pre-spin trace records **3,476** reads of it. They are not CRDY
+polls: `$FCDD81` is PORTB2, and `IODispatcher` puts the **floppy completion
+line** on bit 4 (DDRB2 = `$AF` leaves only bits 4 and 6 as inputs), so the
+guest is polling the disk handshake and CRDY on bit 6 merely rides along in
+the same byte. The substance survives — MacWorks Plus II never polls CRDY
+*as CRDY* — but the address is touched constantly.
+
+~~This is the fifth instance of one pattern — DISKIN, the 800K interleave,
 cell `$0D`, `clampcmd`, now CA1: **a signal the Lisa OS's own habits left
-unconstrained, which a second guest depends on.**
+unconstrained, which a second guest depends on.**~~ Not an instance of that
+pattern at all — see §10′.
 
-### Why it is a milestone and not a patch
+### ~~Why it is a milestone and not a patch~~ (REFUTED — see §10′)
 
 The Lisa OS **already enables CA1** — see hardware-notes.md "VIA2 CA1" for
 the traced evidence (IER2 `$82` six times, PCR2 positive-edge, 93 reads of
@@ -657,16 +671,21 @@ the CA1-clearing handshake port per boot). So this is genuine hardware
 fidelity, not a MacWorks-specific hack — but it also means the risk is live:
 
 - CA1 interrupts are enabled on a **level-2** line during every normal boot.
-- Asserting IFR bit 1 starts dispatching an OS interrupt path that has
-  **never executed** in this emulator.
-- That path races the existing COPS model, whose delivery is gated on read
-  counts — a concrete double-consume hazard for keyboard and mouse bytes.
-- Every checkpoint FNV, menu anchor, input pin and print test is exposed.
+- ~~Asserting IFR bit 1 starts dispatching an OS interrupt path that has
+  **never executed** in this emulator.~~ **False** — the COPS HLE raises
+  IFR2 bit 1 on every key and every mouse packet, so that path has run
+  continuously since M4.
+- ~~That path races the existing COPS model, whose delivery is gated on read
+  counts — a concrete double-consume hazard for keyboard and mouse bytes.~~
+  **False** — `COPS` already owns both the raise and the clear; there is no
+  second writer to race.
+- ~~Every checkpoint FNV, menu anchor, input pin and print test is exposed.~~
+  Not by this; nothing in the emulator needs to change for the flag to set.
 
-Comparable in shape to M4's COPS handshake rework, which the ledger calls
-"the frontier gate".
+~~Comparable in shape to M4's COPS handshake rework, which the ledger calls
+"the frontier gate".~~
 
-### Scope sketch
+### ~~Scope sketch~~ (obsolete — see §10′)
 
 1. Model CA1 in `VIA6522`: edge selection from PCR bit 0, IFR bit 1, clear
    on a register-1 (handshake) PORTA read, IER gating for the IRQ line.
@@ -691,3 +710,200 @@ cp "$HOME/Development/LisaImages/MacWorksPlusII/MW+II 2.5.0 BOOT disk.dc42" /tmp
 printf 'bootdisk 80000000\nd 23730 20\niot limit 40000\niot clear\ng 2000000\n' | \
   .build/release/lisadbg --rom ~/Development/LisaROMs --disk /tmp/mw2boot.dc42
 ```
+
+## 10′. What it actually is (2026-08-15, M9 opening probe) — a keyboard prompt
+
+§10's symptom observations are all reproducible. Its *diagnosis* is not. Two
+independent lines of evidence — one live trace, one static read of the boot
+image — say MacWorks Plus II is not blocked on an unmodeled hardware signal.
+
+### The flag was never the problem
+
+`VIA6522` has no CA1 edge logic, but the COPS HLE supplies the externally
+observable half of CA1 and always has: `IODispatcher` wires COPS's
+`raiseInterrupt`/`clearInterrupt` onto `VIA6522.setInterruptFlag(0x02)` /
+`clearInterruptFlag(0x02)`; `COPS.scheduleDeliveryIfIdle` raises IFR2 bit 1
+when a byte becomes ready, `COPS.handleByteConsumed` clears it on a
+register-1 handshake read, and `COPS.armReassertTimer` re-raises it if
+software blanket-clears IFR. **IFR2 bit 1 sets on every keystroke and every
+mouse packet in this emulator**, and has since M4. See the correction block
+in hardware-notes.md "VIA2 CA1".
+
+### The loop is a receive helper, and it is bounded
+
+The boot image contains the traced code, and the instruction offsets pin the
+mapping exactly (file offset `0x2FF2` ↔ memory `$023736`; the `btst` at +4
+and the `dbne` at +12 match the recorded PCs byte-for-byte).
+
+`$023736` is a **"receive one COPS byte, or give up"** subroutine: load a
+2047-try budget, poll IFR2 bit 1, and on success read PORTA2 reg 1 — then
+`rts` **on both paths**, returning `D0.w = $FFFF` when it times out. Nothing
+here loops forever.
+
+Its caller at `$02370C` is a COPS input-stream drain implementing the §4
+Input Packet State Machine: `$00` → mouse packet (2 more bytes), `< $80` →
+keycode, `$80` → reset code (sub-code, and if `$E0-$EF`, 5 clock bytes).
+
+### The callers are user prompts
+
+Four call sites reach the drain. Each loops `DBPL` around it — retrying only
+while the helper *times out*, exiting the instant any byte arrives:
+
+| Site | Retry budget | Waits for | Keycaps |
+|---|---|---|---|
+| `$022F1E` | drain-until-quiet | — | startup COPS flush |
+| `$02315C` | `#$0087` = 135 (~14M cyc) | `$5C`/`$DC`, `$06`/`$86` | **Space**, **mouse button** |
+| `$023220` | — | `$86`, `$A0`, `$D8`, `$C4` | — |
+| `$023CD4` | `#$0FD6` = 4054 (~414M cyc) | `$E7`, `$EF` | **Y**, **N** |
+
+Keycap `$5C` = Space (`Sources/LisaShell/KeyMap.swift:96`), `$06` = mouse
+button (M1c), `$67` = Y and `$6F` = N (`KeyMap.swift:64,53`); bit 7 set is
+key-down. Site `$02315C` is exactly the 2.5.3 build's own string
+`HOLD DOWN SPACE BAR OR MOUSE BUTTON / TO ADJUST STARTUP CONFIGURATION`;
+site `$023CD4` is a yes/no prompt that reprints and re-waits on any other
+key.
+
+**So the machine is sitting at a prompt waiting for a keypress.** The 40,000
+reads of `$FCDD9B` per 2M cycles are the sound of an unanswered prompt, not
+a failing handshake. `SR = $2704` (IPL 7) at the spin confirms the loop is
+purely polled — no interrupt could be delivered there even with CA1 fully
+modeled.
+
+The prompt routine also does `jsr $00FE00B8` — a call into the **Lisa boot
+ROM** — on each pass, which is a candidate for the garbage band across the
+top of the screen and is independent of anything COPS-related.
+
+### 2.5.3 behaves identically — don't chase a newer build
+
+The MacWorks Plus II 2.5.3 installer's data fork is the booter blob itself,
+and a spliced 2.5.3 boot disk boots and parks the same way (same
+single-address profile, 40,000 reads of `$FCDD9B`). The receive helper is
+byte-identical between 2.5.0 and 2.5.3, with the same four call sites and
+the same `#$0087` / `#$0FD6` budgets.
+
+### Symbol-overlay warning
+
+`lisadbg`'s Linkmap overlay labels MacWorks guest code with **LisaGraph**
+symbols — `CKY2RGRS` (`$023644`), `DRAW1BAR` (`$023CE6`), `BGSTRIPB`
+(`$023F76`) are all from `linkmap-lisagraph.TEXT.unix.txt`, colliding with
+MacWorks' `$02xxxx` load addresses. They are meaningless here; `DRAW1BAR`
+and `BGSTRIPB` are bar-*chart* routines, not evidence about the screen. This
+is `LinkmapSymbols.swift:52`'s "all 22 maps are app maps" hazard in the wild.
+
+### CONFIRMED LIVE 2026-08-15 — one keystroke boots it
+
+Run: reach the wait loop, run **60M further cycles with no input**, then a
+single `type y`, then run on.
+
+| | no key, +60M cyc | after `type y` |
+|---|---|---|
+| PC | `$02373A` (still in the poll) | **`$423A9E`** |
+| `blocksRead` | 21 | 279+ |
+| `mmuPortWrites` | 4384 | 4608 |
+| disk | IN | **OUT** (guest ejects it itself) |
+| COPS | — | `powerCmds=[$25]` accepted |
+
+Sixty million cycles is more than four times site `$02315C`'s ~14M budget,
+so that site is ruled out: the boot parks at **`$023CD4`, the Y/N prompt**
+(4054 retries ≈ 414M cycles — which is why 80M-cycle repro runs looked like
+an infinite hang). A single keystroke releases it; MacWorks Plus II then
+loads ~258 more blocks, programs the MMU, ejects the Lisa boot floppy on its
+own, drives the COPS successfully, and **reaches `$423A9E` — inside the
+patched Mac ROM at `$400000`**, the same takeover MacWorks Plus 1.1 does.
+
+**So there is no emulator-capability gap, and nothing about CA1 needs
+building.** MW+II 2.5.0 boots on the existing hardware model.
+
+```
+printf 'iot limit 10\nbootdisk 1000\ngu 23736 60000000\ng 60000000\nr\ntype y\ng 300000000\nr\n' | \
+  .build/release/lisadbg --rom ~/Development/LisaROMs --disk <copy of the 2.5.0 boot disk>
+```
+
+### What actually remains open
+
+1. **The display is wrong.** The "garbage band" is not a legible prompt: it
+   renders as structured but misaligned character cells across the top rows,
+   growing as the boot proceeds. Suspect a framebuffer base/stride
+   disagreement between what MW+II programs and what scanout reads — this is
+   the real bug, and it is why the prompt was never readable.
+2. **A Mac volume is wanted next** — the guest ejected the boot floppy, so
+   the `'LK'` 800K installer (`MW+II Install V2.5.0.dc42`) is the next thing
+   to feed it.
+3. `$FE00B8` (the boot-ROM call the prompt routine makes each pass) is still
+   uncharacterized, and may or may not relate to item 1.
+4. Whether the prompt needs answering on real hardware at all, or whether
+   PRAM startup settings normally satisfy it (the 2.5.3 build's strings
+   mention `USING STARTUP SETTINGS STORED IN PRAM`, and `PFG` clips).
+
+## 10″. The display bug — one latch lane (2026-08-16, FIXED)
+
+§10′ left "the display is wrong" as the only real defect. It was a
+**one-lane video-latch decode bug**, and MacWorks Plus II now reaches its
+splash screen.
+
+### Symptom
+
+Everything MW+II drew was invisible; the screen showed a growing band of
+structured noise. Pulling the framebuffer back out of a `sc` screenshot (the
+PNG is 1bpp 720×364 = the 32,760 raw bytes verbatim) and autocorrelating it
+gave a dominant period of **4 bytes**, not any row stride — plus byte groups
+like `ff bf ee d7 / ee d5 / ee d3` (a table stepping by −2) and `55555555` /
+`aaaaaaaa` memory-test patterns. That is not a screen at all: we were
+scanning out **physical page 0**, which MW+II uses for data.
+
+### Cause
+
+`Bus.framebufferSnapshot()` reads RAM at `videoPageLatch << 15`, and
+`IODispatcher` latched only on an exact write to offset `$E800`. MacWorks
+Plus II sets the screen with a **word** write:
+
+```
+io 00E800 W 00  [video page latch]
+io 00E801 W 3E
+```
+
+so the real page (`$3E` → `$1F0000`, top of RAM) landed on the odd byte and
+was dropped; we kept the `$00`. The Rev H ROM and the Lisa OS both write the
+latch as a `MOVE.B` to the even address, which is why six milestones of
+Office System work never exposed it — the same "unconstrained by the Lisa
+OS's habits" shape as DISKIN, the 800K interleave, cell `$0D` and `clampcmd`.
+(So §10's "fifth instance of one pattern" claim was right about the pattern —
+just wrong about which signal.)
+
+### Fix
+
+`IODispatcher.applyNonLatchWrite`: `case 0xE800, 0xE801`. `Bus` decomposes a
+word write into even-then-odd byte writes, so last-write-wins takes the low
+byte for a word write and leaves the ROM/OS byte path bit-identical. Write
+side only — no guest has been seen reading `$FCE801`. Full citation block on
+the case; hardware fact recorded in hardware-notes.md §2 "VideoLatch".
+Pinned by `IODispatcherTests.videoPageLatchTakesTheLowByteOfAWordWrite` and
+`...ByteWriteToEvenAddressIsUnchanged`.
+
+### Result
+
+`MacWorks Plus II 2.5.0` splash renders correctly — logo, the 1994 Query
+Engineering / Dafax / Sun Remarketing / Apple copyright block, version
+`II2.5.0`, the floppy-`?` icon and the mouse cursor. Artifact (outside the
+repo): `~/Development/LisaEmu-artifacts/mw2-fixed.png`.
+
+Repro, end to end from cold:
+
+```
+iot limit 10
+bootdisk 1000
+gu 23736 60000000     # the Y/N startup prompt (§10′)
+type y
+g 300000000           # -> $423Axx, inside the patched Mac ROM
+insert <MW+II Install V2.5.0.dc42 copy>
+g 400000000           # blocksRead 340 -- volume mounted
+sc <artifacts>/mw2-fixed.png
+```
+
+### Still open
+
+The splash shows the floppy-`?` icon, i.e. it is still asking for a
+*bootable* Mac volume — the 800K disk is the installer, and per §1′/§6 the
+MacWorks route is to install onto a Widget rather than boot the installer.
+Driving MW+II's installer to build a bootable volume is the next step, and
+is now unblocked because the screen is readable.

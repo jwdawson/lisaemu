@@ -2,6 +2,7 @@ import AppKit
 import CoreGraphics
 import Foundation
 import ImageIO
+import LisaCore
 import LisaShell
 import Observation
 import UniformTypeIdentifiers
@@ -272,15 +273,46 @@ final class AppModel {
         diskError = nil
     }
 
-    /// Pure predicate behind the drag-and-drop filter (`ScreenView.swift`'s
-    /// `.onDrop`): only a `.dc42` file is accepted as an insertable floppy
-    /// image, matching File > Insert Disk…'s `NSOpenPanel` filter
-    /// (`LisaApp.swift`'s `presentInsertDiskPanel`). Extracted as a
-    /// `nonisolated static` pure function (no `AppModel` instance state) so
-    /// `LisaAppTests` can exercise it directly without a real drag session
-    /// -- same shape as `InputCapture.isReservedMenuShortcut`.
-    nonisolated static func isDC42File(_ url: URL) -> Bool {
-        url.pathExtension.lowercased() == "dc42"
+    /// LEXICAL filter for an insertable floppy image, matching File > Insert
+    /// Disk…'s `NSOpenPanel` filter (`LisaApp.swift`'s
+    /// `presentInsertDiskPanel`). Extracted as a `nonisolated static` pure
+    /// function (no `AppModel` instance state) so `LisaAppTests` can
+    /// exercise it directly without a real drag session -- same shape as
+    /// `InputCapture.isReservedMenuShortcut`.
+    ///
+    /// **M9: `.image`/`.img` joined `.dc42`.** `.image` is the classic Disk
+    /// Copy 4.2 extension -- Mac-era disks are routinely distributed as
+    /// `Something.image` while being byte-for-byte DC42 containers (verified
+    /// against a System 6.0.7 Tools image: 84-byte header, 819200-byte data
+    /// plane, 19200 bytes of real tags). No parser work was needed for
+    /// those; only this filter stood in the way.
+    ///
+    /// Still purely lexical, and `.image` therefore OVERLAPS `isWidgetFile`.
+    /// That is deliberate and harmless for the two `NSOpenPanel`s, where the
+    /// menu item the user chose states the intent. Drag-and-drop has no such
+    /// signal, so it uses `isDroppableFloppyImage` instead.
+    nonisolated static func isFloppyImageFile(_ url: URL) -> Bool {
+        ["dc42", "image", "img"].contains(url.pathExtension.lowercased())
+    }
+
+    /// The drag-and-drop gate (`ScreenView.swift`'s `.onDrop`): the lexical
+    /// filter above, then -- for the ambiguous `.image`/`.img` extensions a
+    /// Widget hard-disk image can equally carry -- a cheap CONTENT probe, so
+    /// dropping a Widget is silently ignored rather than bounced off
+    /// `insertFloppy`'s error alert. `DC42Image.looksLikeDC42` reads 84
+    /// bytes, not the file.
+    ///
+    /// `.dc42` deliberately skips the probe: the extension is unambiguous,
+    /// and skipping keeps the documented "purely lexical, no filesystem
+    /// check" behaviour intact for the format that has always worked (see
+    /// `DiskInsertLogicTests.isPurelyLexicalNoFilesystemCheck`) -- a
+    /// nonexistent or malformed `.dc42` still reaches
+    /// `EmulationController.insertFloppy`'s try/catch and its dismissible
+    /// alert, which is where bad images are meant to be reported.
+    nonisolated static func isDroppableFloppyImage(_ url: URL) -> Bool {
+        guard isFloppyImageFile(url) else { return false }
+        if url.pathExtension.lowercased() == "dc42" { return true }
+        return DC42Image.looksLikeDC42(url: url)
     }
 
     /// Supports `--insert-disk <path>`: a debug-only launch argument,

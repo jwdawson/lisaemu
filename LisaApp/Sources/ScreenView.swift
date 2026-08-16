@@ -96,7 +96,7 @@ struct ScreenView: View {
         .onDrop(of: [.fileURL], isTargeted: nil) { providers in
             guard let provider = providers.first else { return false }
             _ = provider.loadObject(ofClass: URL.self) { url, _ in
-                guard let url, AppModel.isDC42File(url) else { return }
+                guard let url, AppModel.isDroppableFloppyImage(url) else { return }
                 DispatchQueue.main.async {
                     model.insertFloppy(url: url)
                 }

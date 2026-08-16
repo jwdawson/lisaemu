@@ -282,3 +282,47 @@ struct RealDC42ImageTests {
         #expect(tagHasNonZero, "expected tag plane to contain non-zero bytes")
     }
 }
+
+// MARK: - looksLikeDC42 content probe (M9)
+
+/// The probe backs LisaApp's drag-and-drop filter, where `.image` is
+/// ambiguous: it is both the classic Disk Copy 4.2 extension and the
+/// extension this project's Widget hard-disk images use. It must agree with
+/// `init(data:)` -- anything it accepts, the parser accepts.
+@Test func looksLikeDC42AgreesWithTheParser() throws {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("dc42probe-\(UInt32.random(in: 0...UInt32.max))")
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    func write(_ data: Data, _ name: String) throws -> URL {
+        let url = dir.appendingPathComponent(name)
+        try data.write(to: url)
+        return url
+    }
+
+    // A real (tagged) container, and a tagless one -- both parse, both probe true.
+    for (name, tagged) in [("tagged.image", true), ("tagless.image", false)] {
+        let blocks = 4
+        var c = Data([4]); c.append(contentsOf: Array("TEST".utf8))
+        c.append(Data(repeating: 0, count: 64 - c.count))
+        var dl = UInt32(blocks * 512).bigEndian; c.append(Data(bytes: &dl, count: 4))
+        var tl = UInt32(tagged ? blocks * 12 : 0).bigEndian; c.append(Data(bytes: &tl, count: 4))
+        c.append(Data(repeating: 0, count: 12))
+        c.append(Data(repeating: 0xAB, count: blocks * 512))
+        if tagged { c.append(Data(repeating: 0xCD, count: blocks * 12)) }
+        let url = try write(c, name)
+        #expect(DC42Image.looksLikeDC42(url: url), "\(name) should probe true")
+        #expect(throws: Never.self) { _ = try DC42Image.load(url: url) }
+    }
+
+    // A Widget-shaped file (all zeros, 532-byte blocks) must probe FALSE --
+    // this is the case the probe exists for.
+    let widgetish = try write(Data(repeating: 0, count: 532 * 64), "HD.image")
+    #expect(!DC42Image.looksLikeDC42(url: widgetish))
+
+    // Truncated, oversized and nonexistent all probe false rather than throw.
+    var short = Data([4]); short.append(Data(repeating: 0, count: 40))
+    #expect(!DC42Image.looksLikeDC42(url: try write(short, "short.image")))
+    #expect(!DC42Image.looksLikeDC42(url: dir.appendingPathComponent("nope.image")))
+}

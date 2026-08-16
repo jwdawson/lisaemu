@@ -66,13 +66,22 @@ Never hand-edit `Sources/CMusashi`. All changes are patches applied by
 
 ## Workflow
 
-- Milestone branches + PR; **the user reviews and merges on GitHub** (squash
-  preferred). Don't merge or push to main without being asked (docs-only
-  hygiene commits to main are OK).
-- **The user runs live-app/manual emulator tests themselves** — prepare the
-  code, say it's ready, and let them run it and paste results. Quick builds
-  and the no-env `swift test` are fine to run directly. Avoid token-heavy
-  agent fan-outs; this project is run lean.
+- **Everything goes through a PR — never push to `main`, not even docs-only.**
+  `main` is branch-protected ("Changes must be made through a pull request");
+  an admin bypass is not a workflow. Milestone branches + PR; **the user
+  reviews and merges on GitHub** (squash preferred — set the merge method
+  explicitly rather than asking for it in the PR body).
+- **Say when more commits are still coming.** The user merges promptly; a PR
+  opened mid-stream can be merged before the rest lands (this cost a
+  follow-up PR in M8).
+- **ALWAYS ASK before running any emulator test** — headless `lisadbg`
+  probes, boot runs, env-gated suites, anything long. Sometimes the user
+  wants you to run it; sometimes they want to run it themselves and paste the
+  output. Ask every time; don't infer from last time. Say what the run will
+  do and roughly how long it takes, then ask.
+- Fine to run WITHOUT asking: `swift build`, the no-env `swift test`,
+  `xcodegen`, git/`gh`, reading files. Never token-heavy agent fan-outs; this
+  project is run lean.
 - Session/resume state lives in the SDD ledgers
   (`.superpowers/sdd/<date-milestone>/progress.md`, gitignored) and in
   Claude's persistent memory — not in this file.

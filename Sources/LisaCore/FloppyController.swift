@@ -120,6 +120,31 @@ public final class FloppyController {
         static let diskHead = 0x07
         static let diskSec = 0x09
         static let diskTrak = 0x0B
+        /// **`$0D` -- host-set busy/ack flag the controller clears on
+        /// command completion (M8, MacWorks Plus live trace).** Absent from
+        /// SONYASM's equate table and from every Lisa OS path: the OS never
+        /// reads or writes it, which is why six milestones never needed it.
+        ///
+        /// MacWorks Plus uses it as a second handshake alongside DISKCMD,
+        /// booting System 6 off a MacWorks-formatted hard disk:
+        ///
+        ///     4242AE  clr.b   ($3,A0)         ; DISKPARM = 0
+        ///     4242B2  move.b  #$2, ($5,A0)    ; DISKDRIV = 2
+        ///     4242B8  st      ($d,A0)         ; $0D := $FF  (HOST sets it)
+        ///     4242BC  move.b  #$84, ($1,A0)   ; DISKCMD = $84
+        ///     4242C2  tst.b   ($d,A0)         ; spin until the 6504 CLEARS it
+        ///     4242C6  bne     $4242c2
+        ///     4242C8  move.b  ($11,A0), D0    ; then DISKERR ...
+        ///     4242D4  move.b  D0, (-$4,A0)    ; ... into the DrvQEl's dQFlags
+        ///
+        /// Go-byte `$84` is itself undocumented (SONY.TEXT:61-68 lists
+        /// `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/`$89`), so this model answers
+        /// it the way it answers every other unrecognized go-byte -- a
+        /// handshake-only ack -- and now also clears `$0D`, which is what
+        /// the guest is actually waiting on. Without it the Finder draws its
+        /// menu bar and then spins here forever with the watch cursor up:
+        /// ~40,000 reads of `$FCC00D` per 2M cycles, and no desktop.
+        static let diskAck = 0x0D
         static let diskCnfm = 0x0F
         static let diskErr = 0x11
         static let diskFlg = 0x13
@@ -638,6 +663,16 @@ public final class FloppyController {
 
     private func clearDiskCmd() {
         window[Cell.diskCmd] = 0
+        // The other half of the handshake for guests that use it. Cleared
+        // for EVERY command, not just the `$84` that revealed it: `$0D` is
+        // the controller's "done with your request" signal and the Lisa OS
+        // never reads it, so this cannot disturb any OS path. UNCERTAIN and
+        // deliberately noted: this fires when the go-byte is consumed, which
+        // for `excmd` is BEFORE the data transfer's completion interrupt --
+        // if a guest is ever seen using `$0D` to wait on an excmd's DATA
+        // rather than its ack, that guest will need the clear moved to
+        // `raiseCompletionLineAfterDelay` instead.
+        window[Cell.diskAck] = 0
         commandInFlight = false
         commandsProcessed += 1
     }

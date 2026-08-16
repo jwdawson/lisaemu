@@ -678,3 +678,27 @@ private func stageAndIssueWrite(_ floppy: FloppyController, _ scheduler: FakeSch
             "the reinserted disk retains its earlier writes (boot_remount can re-verify the MDDF)")
     #expect(floppy.blocksWritten == 1)
 }
+
+/// **Cell `$0D` is a host-set busy flag the controller clears (M8).** The
+/// Lisa OS never touches it; MacWorks Plus sets it to `$FF`, writes a
+/// go-byte, and spins on `tst.b ($d,A0)` until the controller zeroes it
+/// (trace at `$4242B8`-`$4242C6`, booting System 6 from a MacWorks hard
+/// disk). Cleared for every command, including go-bytes this model does not
+/// recognize -- `$84` is the one MacWorks uses and it is undocumented.
+@Test func commandCompletionClearsTheHostSetAckFlag() {
+    let (floppy, scheduler, _) = makeController()
+    floppy.insert(makeSyntheticImage())
+
+    for goByte: UInt8 in [0x84, 0x80, 0x85] {
+        floppy.write(FloppyController.Cell.diskAck, 0xFF)
+        #expect(floppy.read(FloppyController.Cell.diskAck) == 0xFF)
+
+        floppy.write(FloppyController.Cell.diskCmd, goByte)
+        scheduler.advance(by: FloppyController.commandDelayCycles)
+
+        #expect(floppy.read(FloppyController.Cell.diskCmd) == 0,
+                "go-byte $\(String(goByte, radix: 16)) acked")
+        #expect(floppy.read(FloppyController.Cell.diskAck) == 0,
+                "go-byte $\(String(goByte, radix: 16)) must also clear the $0D busy flag")
+    }
+}

@@ -1453,6 +1453,22 @@ zone/track/sector/side:
   the diskette as unreadable; with the interleaved mapping the volume
   mounts (`blocksRead` 656, "MW+ INSTALLER, 768K in disk"). Single-sided
   mapping is unchanged. See `FloppyController.blockNumber`.
+- **Cell `$0D` -- a host-set busy flag the controller clears (M8, MacWorks
+  Plus live trace).** Absent from SONYASM's equate table (which jumps
+  `$0B` DISKTRAK -> `$0F` DISKCNFM) and never read or written by any Lisa
+  OS path, so the HLE had no reason to model it. MacWorks Plus uses it as a
+  second handshake alongside DISKCMD when booting System 6 off a
+  MacWorks-formatted hard disk: `$4242B8: st ($d,A0)` sets it to `$FF`,
+  `$4242BC` writes go-byte `$84`, and `$4242C2: tst.b ($d,A0) / bne` spins
+  until the controller zeroes it -- after which it reads DISKERR and stores
+  it into the Mac drive queue element's `dQFlags`. Go-byte `$84` is itself
+  undocumented (SONY.TEXT:61-68 lists `$80`/`$81`/`$83`/`$85`/`$86`/`$87`/
+  `$89`); this model answers it as a handshake-only ack like any other
+  unrecognized go-byte, and `clearDiskCmd()` now clears `$0D` for every
+  command. Symptom when it is missing: the Mac Finder draws its menu bar
+  and hangs with the watch cursor, no desktop, ~40,000 reads of `$FCC00D`
+  per 2M cycles. Uncertainty noted in code: the clear fires when the go-byte
+  is consumed, which for `excmd` precedes the data-completion interrupt.
 - **DISKIN (`$41`) present-value = `$FF` (M8, MacWorks Plus live trace).**
   The Lisa OS constrains this cell only to "nonzero" (ISDISKIN returns the
   raw byte; `hdinit` tests `response <> 0` -- SONYASM:437-441,

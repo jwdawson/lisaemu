@@ -224,6 +224,21 @@ Source: starasm1:186-214 (trap dispatch); implementation do_an_mmu LDASM:257-450
   - Value: (ScrnPhys + MemoryBase) >> 15
   - Alignment: 32KB-aligned physical page
   - Source: SetScreenKeybd, libhw-MACHINE:138-149
+  - **Both bytes of the word latch (M9 finding, 2026-08-16).** The register
+    captures whichever data lane the CPU drives, so `$FCE801` sets it just as
+    `$FCE800` does. Evidence: the Rev H ROM writes it at 5 sites, every one a
+    `MOVE.B` to the EVEN address (`13FC`/`13C0`/`13C6` + `00FCE800`), and the
+    whole ROM image contains **zero** references to `$FCE801`; the Lisa OS
+    likewise uses `MOVE.B D1,VideoLatch` (libhw-MACHINE:147). A 68000 `MOVE.B`
+    to an even address drives D15-D8. **MacWorks Plus II writes the same
+    register as a WORD (`$003E`)**, putting the page on D7-D0 — the odd byte.
+    Both work on real hardware, so the latch cannot be tied to a single lane.
+    Modeled in `IODispatcher.applyNonLatchWrite` as "either address latches";
+    since `Bus` decomposes a word write into even-then-odd byte writes,
+    last-write-wins yields the low byte for a word write and leaves the
+    ROM/OS byte path bit-identical. Found because MacWorks Plus II latched
+    `$00` and scanned out physical page 0 — its own data tables and `$55`/`$AA`
+    memory-test patterns — instead of its screen.
 
 - **ContrastLatch:** IOSpace + $D01C = $FCD01C (libhw-DRIVERS:136)
   - Range: 0 (max contrast) – 255 (min)

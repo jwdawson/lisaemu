@@ -834,3 +834,76 @@ printf 'iot limit 10\nbootdisk 1000\ngu 23736 60000000\ng 60000000\nr\ntype y\ng
 4. Whether the prompt needs answering on real hardware at all, or whether
    PRAM startup settings normally satisfy it (the 2.5.3 build's strings
    mention `USING STARTUP SETTINGS STORED IN PRAM`, and `PFG` clips).
+
+## 10″. The display bug — one latch lane (2026-08-16, FIXED)
+
+§10′ left "the display is wrong" as the only real defect. It was a
+**one-lane video-latch decode bug**, and MacWorks Plus II now reaches its
+splash screen.
+
+### Symptom
+
+Everything MW+II drew was invisible; the screen showed a growing band of
+structured noise. Pulling the framebuffer back out of a `sc` screenshot (the
+PNG is 1bpp 720×364 = the 32,760 raw bytes verbatim) and autocorrelating it
+gave a dominant period of **4 bytes**, not any row stride — plus byte groups
+like `ff bf ee d7 / ee d5 / ee d3` (a table stepping by −2) and `55555555` /
+`aaaaaaaa` memory-test patterns. That is not a screen at all: we were
+scanning out **physical page 0**, which MW+II uses for data.
+
+### Cause
+
+`Bus.framebufferSnapshot()` reads RAM at `videoPageLatch << 15`, and
+`IODispatcher` latched only on an exact write to offset `$E800`. MacWorks
+Plus II sets the screen with a **word** write:
+
+```
+io 00E800 W 00  [video page latch]
+io 00E801 W 3E
+```
+
+so the real page (`$3E` → `$1F0000`, top of RAM) landed on the odd byte and
+was dropped; we kept the `$00`. The Rev H ROM and the Lisa OS both write the
+latch as a `MOVE.B` to the even address, which is why six milestones of
+Office System work never exposed it — the same "unconstrained by the Lisa
+OS's habits" shape as DISKIN, the 800K interleave, cell `$0D` and `clampcmd`.
+(So §10's "fifth instance of one pattern" claim was right about the pattern —
+just wrong about which signal.)
+
+### Fix
+
+`IODispatcher.applyNonLatchWrite`: `case 0xE800, 0xE801`. `Bus` decomposes a
+word write into even-then-odd byte writes, so last-write-wins takes the low
+byte for a word write and leaves the ROM/OS byte path bit-identical. Write
+side only — no guest has been seen reading `$FCE801`. Full citation block on
+the case; hardware fact recorded in hardware-notes.md §2 "VideoLatch".
+Pinned by `IODispatcherTests.videoPageLatchTakesTheLowByteOfAWordWrite` and
+`...ByteWriteToEvenAddressIsUnchanged`.
+
+### Result
+
+`MacWorks Plus II 2.5.0` splash renders correctly — logo, the 1994 Query
+Engineering / Dafax / Sun Remarketing / Apple copyright block, version
+`II2.5.0`, the floppy-`?` icon and the mouse cursor. Artifact (outside the
+repo): `~/Development/LisaEmu-artifacts/mw2-fixed.png`.
+
+Repro, end to end from cold:
+
+```
+iot limit 10
+bootdisk 1000
+gu 23736 60000000     # the Y/N startup prompt (§10′)
+type y
+g 300000000           # -> $423Axx, inside the patched Mac ROM
+insert <MW+II Install V2.5.0.dc42 copy>
+g 400000000           # blocksRead 340 -- volume mounted
+sc <artifacts>/mw2-fixed.png
+```
+
+### Still open
+
+The splash shows the floppy-`?` icon, i.e. it is still asking for a
+*bootable* Mac volume — the 800K disk is the installer, and per §1′/§6 the
+MacWorks route is to install onto a Widget rather than boot the installer.
+Driving MW+II's installer to build a bootable volume is the next step, and
+is now unblocked because the screen is readable.

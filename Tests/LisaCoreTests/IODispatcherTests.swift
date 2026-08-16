@@ -92,6 +92,32 @@ import Testing
     #expect(bus.read8(0xFC_E800) == 0x42)
 }
 
+/// A WORD write to the video latch leaves the ODD (low) byte latched -- the
+/// lane a 68000 `MOVE.W` puts the page number on. MacWorks Plus II sets the
+/// screen this way (`$003E`); the Rev H ROM and the Lisa OS both use a BYTE
+/// write to the even address instead, so both lanes must latch. Regression
+/// pin for the "MacWorks Plus II renders physical page 0" bug -- see
+/// `IODispatcher.applyNonLatchWrite`'s citation block.
+@Test func videoPageLatchTakesTheLowByteOfAWordWrite() {
+    let bus = Bus(ramSize: 0x1000)
+    bus.write8(0xFC_E800, 0x3F)          // start from a ROM-style byte write
+    #expect(bus.videoPageLatch == 0x3F)
+
+    bus.write16(0xFC_E800, 0x003E)       // MacWorks-style word write
+    #expect(bus.videoPageLatch == 0x3E)
+}
+
+/// The even-address byte write the ROM and OS actually use must keep
+/// working unchanged after the odd byte started latching -- a lone byte
+/// write to `$FCE800` never touches `$FCE801`, so nothing overwrites it.
+@Test func videoPageLatchByteWriteToEvenAddressIsUnchanged() {
+    let bus = Bus(ramSize: 0x1000)
+    bus.write8(0xFC_E800, 0xAF)          // the ROM's own first value
+    #expect(bus.videoPageLatch == 0xAF)
+    bus.write8(0xFC_E800, 0x2F)          // and its second
+    #expect(bus.videoPageLatch == 0x2F)
+}
+
 // MARK: - Status register low byte ($F801)
 
 @Test func statusByteIsSoftwareDrivenAlongsideTheActiveLowVsyncBit() {

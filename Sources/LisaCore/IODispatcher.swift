@@ -404,7 +404,32 @@ final class IODispatcher {
     /// non-VIA offsets.
     private func applyNonLatchWrite(_ offset: UInt32, _ value: UInt8) {
         switch offset {
-        case 0xE800: videoPageLatch = value
+        // Video page latch. BOTH bytes of the word at $FCE800 latch, because
+        // the register captures whichever data lane the CPU actually drives
+        // (docs/hardware-notes.md §2 "VideoLatch"):
+        //
+        // - The Rev H ROM (5 sites, all `MOVE.B` -- `13FC`/`13C0`/`13C6` to
+        //   `$00FCE800`, zero references to `$FCE801` anywhere in the image)
+        //   and the Lisa OS (`MOVE.B D1,VideoLatch`, libhw-MACHINE:147, with
+        //   `VideoLatch .EQU IOSpace+$E800`, libhw-DRIVERS:142) both write the
+        //   EVEN address as a BYTE -- which on a 68000 drives D15-D8.
+        // - MacWorks Plus II writes the same register as a WORD (`$003E`),
+        //   putting the page number on D7-D0, i.e. at the ODD address.
+        //
+        // Both work on real hardware, so the latch cannot be tied to one lane;
+        // it decodes the address and takes the byte being driven. `Bus`
+        // decomposes a word write into even-then-odd byte writes, so
+        // last-write-wins reproduces that exactly: the ROM/OS byte path is
+        // untouched, and a word write ends with the odd (low) byte latched.
+        // Found via MacWorks Plus II scanning out physical page 0 (its own
+        // data tables and $55/$AA memory-test patterns) instead of its screen
+        // -- see docs/macworks-plus-notes.md §10″.
+        //
+        // Deliberately WRITE-side only: no guest has been observed reading
+        // `$FCE801`, and mirroring the latch onto the odd read would make a
+        // word read of $FCE800 return the page in both halves, which no
+        // evidence supports.
+        case 0xE800, 0xE801: videoPageLatch = value
         case 0xF801, 0xC031, 0xC015: break   // hardware-driven; CPU writes have no effect
         case 0xC000...0xC7FF: floppy.write(Int(offset - 0xC000), value)
         default: break   // unknown I/O space -- write has no effect beyond being logged

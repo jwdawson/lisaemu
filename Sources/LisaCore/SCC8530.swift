@@ -63,9 +63,35 @@ public final class SCC8530 {
     public let channelA: SCCChannel
     public let channelB: SCCChannel
 
+    /// The optional **PFG** board plugged into this chip's socket.
+    /// `nil` (the default) = not installed, which is a stock Lisa: both seams
+    /// stay unwired, so WR7 writes keep falling into the unknown-access log
+    /// and `RR0` bit 3 stays clear. Attach with `bus.scc.pfg = PFG()`
+    /// (`lisadbg --pfg`). See `PFG` for what is and is not modeled.
+    public var pfg: PFG? {
+        didSet { wirePFG() }
+    }
+
     public init() {
         channelA = SCCChannel(id: .a)
         channelB = SCCChannel(id: .b)
+    }
+
+    /// Connects/disconnects the PFG's two seams. Weak `self` capture: the
+    /// channels are owned by this chip and hold these closures, so a strong
+    /// capture would retain the chip through its own channel.
+    private func wirePFG() {
+        guard pfg != nil else {
+            channelA.onSyncCharacterWrite = nil
+            channelB.dcdInput = nil
+            return
+        }
+        channelA.onSyncCharacterWrite = { [weak self] value in
+            self?.pfg?.writeCommand(value)
+        }
+        channelB.dcdInput = { [weak self] in
+            self?.pfg?.dcdAsserted ?? false
+        }
     }
 
     /// True while either channel asserts the Z8530 `/INT` line -- the Lisa's
@@ -113,6 +139,9 @@ public final class SCC8530 {
     public func reset() {
         channelA.reset()
         channelB.reset()
+        // A board in the socket is reset alongside the chip, but stays
+        // plugged in -- same shape as `COPS.reset()` under `Machine.reset()`.
+        pfg?.reset()
     }
 }
 
@@ -126,6 +155,22 @@ public final class SCCChannel {
     /// The channel-B transmitter's byte sink (§11.4). `nil` = detached (bytes
     /// absorbed and dropped). Attach via `bus.scc.channelB.printerPort`.
     public var printerPort: PrinterPort?
+
+    /// Fired when this channel's **WR7** (SDLC sync character) is written.
+    /// `nil` = nothing is listening, and WR7 keeps its existing behavior of
+    /// falling into `logUnknown` untouched.
+    ///
+    /// This is the PFG's command port: that board plugs into the SCC socket
+    /// and snoops WR7, a register the Lisa's own RS-232 driver never programs
+    /// (`modeledWriteRegisters` deliberately omits WR6/WR7). Wired to channel
+    /// A only, by `SCC8530.pfg` -- see `PFG` for the protocol.
+    var onSyncCharacterWrite: ((UInt8) -> Void)?
+
+    /// Supplies **RR0 bit 3 (DCD)** when something is driving that modem-
+    /// control input. `nil` = the line is idle and `rr0()` reports bit 3
+    /// clear, exactly as it did before any of this existed. Wired to channel
+    /// B only, by `SCC8530.pfg`.
+    var dcdInput: (() -> Bool)?
 
     // MARK: - Register file + pointer (§11.2)
 
@@ -224,6 +269,15 @@ public final class SCCChannel {
     /// Second control write: deposit `value` into WR`register`. WR9 reset codes
     /// (bits 7-6) soft-reset the channel (§11.3 step 2 `$4A`, §11.5 POST `$C0`).
     private func writeRegister(_ register: Int, _ value: UInt8) {
+        // WR7 with a listener attached is the PFG's command port (see
+        // `onSyncCharacterWrite`). Still not stored -- WR7 is not otherwise
+        // modeled -- and with no listener this falls through to the unchanged
+        // `logUnknown` path below, so a detached machine behaves exactly as
+        // it did before.
+        if register == 7, let sink = onSyncCharacterWrite {
+            sink(value)
+            return
+        }
         guard Self.modeledWriteRegisters.contains(register) else {
             logUnknown(register: register, value: value, isWrite: true)
             return
@@ -296,7 +350,13 @@ public final class SCCChannel {
     /// reads "asserted/ready". Bit 0 (Rx char available) is 0 (no Rx). No other
     /// bit gates the transmit path.
     private func rr0() -> UInt8 {
-        return 0x04   // bit2 = Tx buffer empty; bit5 = 0 (CTS asserted); rest 0
+        // bit2 = Tx buffer empty; bit5 = 0 (CTS asserted); rest 0.
+        // Bit 3 is DCD: 0 (idle) unless something is driving that input --
+        // the PFG is the only such device, and only while attached, so a
+        // machine without one returns the same literal $04 as always.
+        var status: UInt8 = 0x04
+        if dcdInput?() == true { status |= 0x08 }
+        return status
     }
 
     /// RR1 input-error status (§11.4). No framing/overrun/parity errors ever --

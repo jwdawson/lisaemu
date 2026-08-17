@@ -59,6 +59,7 @@ private enum Command {
     case ejectFloppy
     case attachWidget(URL)
     case detachWidget
+    case setPFGInstalled(Bool)
     case powerButton
     case shutdown
 }
@@ -358,6 +359,14 @@ public final class EmulationController {
     /// Widget is currently attached.
     public func detachWidget() { shared.mailbox.post(.detachWidget) }
 
+    /// Installs or removes the **PFG** board in the SCC socket (M10).
+    /// Off by default -- a stock Lisa has none, and while it is absent the
+    /// SCC behaves exactly as it always has. MacWorks Plus II 2.5 is the
+    /// only known guest that requires one; see `PFG`.
+    public func setPFGInstalled(_ installed: Bool) {
+        shared.mailbox.post(.setPFGInstalled(installed))
+    }
+
     /// Presses the Lisa's soft-power button (M6 Task 1): posts a mailbox
     /// command that calls `Machine.bus.cops.pressPowerButton()` on the
     /// emulation thread. The OS sees the COPS `$FB` reset-dispatch byte and
@@ -575,6 +584,11 @@ public final class EmulationController {
                     }
                 case .detachWidget:
                     machine.bus.widget.detach()
+                case .setPFGInstalled(let installed):
+                    // Plugging a board into the socket, not reconfiguring the chip:
+                    // `SCC8530` wires/unwires its two seams and is otherwise
+                    // untouched, so removing it restores stock behavior exactly.
+                    machine.bus.scc.pfg = installed ? PFG() : nil
                 case .powerButton:
                     machine.bus.cops.pressPowerButton()
                 case .shutdown:

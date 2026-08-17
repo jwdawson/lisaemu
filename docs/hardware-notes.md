@@ -2829,3 +2829,128 @@ affect the byte-level command parsing:
 6. **Unknown / unmodeled codes** (including `ESC V`, malformed digit runs,
    stray control bytes) are **bounded-logged and no-op'd, never fatal**
    (house pattern: a capped log array + a dropped counter, per `Bus.mmuPortLog`).
+
+## §13 — The PFG (Programmable Frequency Generator)
+
+**Optional third-party hardware, not part of a stock Lisa.** Modeled by
+`PFG`, off by default (`SCC8530.pfg == nil`); `lisadbg --pfg`, or the
+LisaApp Machine menu's "PFG Installed (SCC socket)".
+
+### What it is
+
+A board that **plugs into the Z8530 SCC socket** (9D on the I/O board), with
+two flying leads to an LS132 at 6A. It provides real-time adjustment of the
+floppy controller's bit-cell timing under software control, letting a Lisa
+read Macintosh diskettes written with **3 bytes of bit-slip `$FF`** where the
+Lisa's controller expects 5. **MacWorks Plus II 2.5 requires one and will not
+boot without it.** No public technical documentation exists — the MacWorks
+Plus II manual covers installation only — so everything below is derived from
+the guest's own code and a live trace.
+
+### Electrical seam
+
+| Direction | Path |
+|---|---|
+| Host → PFG | SCC **channel A `WR7`** (`$FCD203`), the SDLC sync-character register |
+| PFG → host | SCC **channel B `RR0` bit 3** (`$FCD201`), the DCD modem input |
+
+`WR7` is the natural command port for a board in this socket: the Lisa's own
+RS-232 driver never programs WR6/WR7, which is why `SCCChannel`'s
+`modeledWriteRegisters` deliberately omits them.
+
+### Identity handshake (MODELED — evidence: live `iot` trace + guest code)
+
+Guest sites: writer `$023D7C`, sampler `$023E78`, boot gate `$423A96`.
+Byte-identical in 2.5.0 and 2.5.3.
+
+```text
+setup   ch-A: read (reset pointer), WR9 <- $0D, WR7 <- $50, WR9 <- $09
+        ch-B: read RR0, WR15 read, WR15 <- $00
+
+8 iterations, addr stepping $10, $12, $14 ... $1E:
+        ch-A: WR7 <- $00
+        ch-A: WR7 <- addr      -> selects a bit pair
+        ch-B: read RR0         -> bit, from DCD
+        ch-A: WR7 <- $08       -> second phase
+        ch-B: read RR0         -> bit, from DCD
+```
+
+16 bits, shifted MSB-first (`lsl.l #1,D1` + `ori.b #1,D1` when DCD is high).
+Iteration `k` supplies bits `15-2k` and `14-2k`. The guest requires the
+result's **low nibble to be `$A`** — `andi.w #$f` / `subi.w #$a`, applied
+both at the probe and again at the boot gate `$423A96`, which is a literal
+`beq`-to-itself spin on failure.
+
+**Only the low nibble is evidenced.** `PFG.identity` defaults to `$000A`, the
+minimal assumption; the upper 12 bits have never been observed being tested.
+
+### The three real functions (user-supplied field report, 2026-08-16)
+
+A first-hand account of the hardware, which reframes two things this section
+previously got wrong. Recorded as provenance: a field report, not a datasheet.
+
+1. **Floppy controller clock.** The Lisa clocks its FDC at 2 MHz; the PFG
+   injects its own clock into **U6A via the two clip leads**, varying it
+   slightly above/below 2 MHz *under MW+II software control*, which is what
+   lets it read Mac disks the stock clock cannot. **A PFG works with the
+   clips disconnected** -- you get a startup warning and lose the
+   disk-reading improvement, nothing more. Inert under any other OS, since
+   only MW+II ever asks for a change.
+2. **256 bytes of PRAM in an on-board EEPROM** (the 8-pin chip). The stock
+   Lisa has almost none -- it borrows leftover space in the floppy
+   controller's shared RAM, and loses it when the I/O board batteries die.
+   The PFG's is non-volatile and much larger, and **this is where MW+II keeps
+   its startup configuration** (XLerator present/mode, etc.). Inert under
+   other OSes.
+3. **SCC clock 4 MHz -> 3.672 MHz** (the Mac Plus rate), for serial-port
+   compatibility. **Unlike the other two this is always active, even under
+   other operating systems** -- the one way a fitted PFG perturbs a
+   non-MacWorks machine. No reported ill effects. We model no SCC baud clock
+   at all, so it has no effect here; noted for fidelity.
+
+**Consequences for this model.** Our PFG is, permanently and by
+construction, *a PFG with the clips disconnected*: `FloppyController` is an
+HLE that serves whole 512-byte blocks and never synthesizes a bit stream, so
+there is no 2 MHz clock to vary and function 1 cannot exist here. MacWorks
+Plus II's `TIMEOUT WAITING FOR FDC - CHECK PFG CLIPS` and `PFG CANNOT
+CONTROL FDC - CHECK PFG CLIPS` are therefore **correct, expected output for
+the configuration we present**, not defects to suppress. Function 2 (the
+EEPROM) is the one with real work behind it -- see below. Function 3 is a
+no-op for us.
+
+### PRAM EEPROM (MODELED at the protocol level -- outcome unresolved)
+
+After a successful identity read the guest opens again (`WR7 <- $50`) and
+then bit-bangs a serial write, captured as ~74,000 `WR7` writes in a single
+boot:
+
+| Byte | bit 3 (clock) | bit 1 (data) |
+|---|---|---|
+| `$04` | low | 0 |
+| `$0C` | **high** | 0 |
+| `$06` | low | 1 |
+| `$0E` | **high** | 1 |
+
+Bit 2 stays asserted throughout. `PFG` accepts and logs these with **no
+modeled effect**, which is deliberate on two grounds: the real device's
+function is retiming the floppy bit clock, and `FloppyController` is an HLE
+that serves whole 512-byte blocks and never synthesizes a bit stream — there
+is no frequency here to generate; and the register semantics behind the
+stream are not evidenced, so modeling them would be invention.
+
+**There is a read-back path we do not model.** The guest contains **8**
+`btst #3,$00FCD201` sites (`$023E9C`/`$023EB2` are the identity sampler's
+two; four more live in a second copy inside the later-loaded payload), so
+DCD is consulted well beyond the identity exchange.
+
+### Status
+
+With the PFG installed, MacWorks Plus II 2.5.0 clears the `$423AA2` boot gate
+that otherwise spins forever, and proceeds into code never previously
+reached. It then reaches a **Sad Mac, code `000014`**, and still does with the PRAM
+EEPROM modeled and demonstrably being read. The cause is **not established**;
+the leading candidates are the PRAM's expected contents (see above) and the
+guessed upper 12 identity bits.
+
+**We model a presence/identity responder, not a frequency generator.** Do not
+read more into `PFG` than that.

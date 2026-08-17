@@ -47,6 +47,8 @@ public struct Monitor {
         /// guest hammering one block or hitting an unsupported command was
         /// invisible.
         case widgetLog
+        /// `pfg log` -- dump the PFG board's WR7 command log (M10).
+        case pfgLog
         /// `click <x> <y>` (M5 Task 3) -- feedback-steer the cursor to screen
         /// pixel `(x,y)` and press/release the mouse button. Unlike `bootdisk`'s
         /// ROM-menu clicks (which steer the ROM cursor cells `$496`/`$498`),
@@ -181,6 +183,10 @@ public struct Monitor {
                     return .sym(a)
         case "symbase": guard let a = hex(1) else { return nil }
                         return .symbase(a)
+        case "pfg":
+            // `pfg log` -- the PFG board's WR7 command log (M10).
+            if parts.count == 2, parts[1] == "log" { return .pfgLog }
+            return nil
         case "widget":
             // `widget create <path>` -- only sub-command today.
             if parts.count == 2, parts[1] == "log" { return .widgetLog }

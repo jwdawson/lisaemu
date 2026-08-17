@@ -99,6 +99,17 @@ final class AppModel {
     /// toggle is the app's own "should I surface print jobs" switch.
     var printerConnected: Bool = true
 
+    /// Whether the **PFG** board is installed in the SCC socket (M10).
+    /// Defaults to **false** -- a stock Lisa has none, and with it absent the
+    /// SCC behaves exactly as it always has. Only MacWorks Plus II 2.5 asks
+    /// for one; see `PFG` for what is modeled (the handshake only).
+    var pfgInstalled: Bool = false {
+        didSet {
+            guard pfgInstalled != oldValue else { return }
+            controller?.setPFGInstalled(pfgInstalled)
+        }
+    }
+
     private var controller: EmulationController?
 
     /// Long-lived, reused across `apply(_:)` calls (perf-fix round, "CGImage

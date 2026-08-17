@@ -633,8 +633,17 @@ if let printerFlagIndex = args.firstIndex(of: "--printer-dir") {
     args.removeSubrange(printerFlagIndex...(printerFlagIndex + 1))
 }
 
+// `--pfg` (M10): plug the PFG board into the SCC socket. Off by default --
+// a stock Lisa has none, and MacWorks Plus II 2.5 is the only guest that
+// asks for it. Takes no argument; position-independent.
+var attachPFG = false
+if let pfgFlagIndex = args.firstIndex(of: "--pfg") {
+    attachPFG = true
+    args.remove(at: pfgFlagIndex)
+}
+
 guard args.count >= 2 else {
-    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>] [--widget <path.widget>] [--printer-dir <path>]")
+    fail("usage: lisadbg <binary> [hex-load-address]  |  lisadbg --rom <dir>  [--disk <path.dc42>] [--widget <path.widget>] [--printer-dir <path>] [--pfg]")
 }
 
 let machine = Machine()
@@ -691,6 +700,11 @@ if let widgetPath {
     } catch {
         fail("cannot attach Widget image \(widgetPath): \(error)")
     }
+}
+
+if attachPFG {
+    machine.bus.scc.pfg = PFG()
+    print("lisadbg — PFG installed in the SCC socket (identity $\(String(machine.bus.scc.pfg!.identity, radix: 16, uppercase: true)))")
 }
 
 // M7 Task 4: the printer pipeline. When `--printer-dir` is given, attach the
@@ -816,6 +830,34 @@ while let line = readLine(strippingNewline: true) {
             print("      widget \(name) block \(e.block)\(count > 1 ? "  x\(count)" : "")\(verdict)")
         }
         print("      \(entries.count) logged, \(machine.bus.widget.commandLogDropped) dropped, \(machine.bus.widget.completedCommands) completed")
+    case .pfgLog:
+        guard let pfg = machine.bus.scc.pfg else {
+            print("      no PFG installed (start lisadbg with --pfg)")
+            break
+        }
+        let entries = pfg.commandLog
+        guard !entries.isEmpty else {
+            print("      PFG log empty (no WR7 commands seen yet)")
+            break
+        }
+        // Run-length summarize, same reasoning as `widget log`: the probe
+        // repeats, and hundreds of identical lines would bury the shape.
+        var runs: [(UInt8, Int)] = []
+        for e in entries {
+            if let last = runs.last, last.0 == e { runs[runs.count - 1].1 += 1 } else { runs.append((e, 1)) }
+        }
+        for (value, count) in runs {
+            let name: String
+            switch value {
+            case PFG.openCommand: name = "open"
+            case PFG.strobeCommand: name = "strobe"
+            case PFG.firstAddress...PFG.lastAddress where value % 2 == 0: name = "addr pair \(Int(value - PFG.firstAddress) / 2)"
+            case 0x00: name = "clear"
+            default: name = "UNMODELED"
+            }
+            print("      pfg $\(String(value, radix: 16, uppercase: true)) \(name)\(count > 1 ? "  x\(count)" : "")")
+        }
+        print("      \(entries.count) logged, \(pfg.commandLogDropped) dropped")
     case .guestCursor(let mac):
         guestCursorMode = mac ? .mac : .lisa
         cachedCursorSigns = nil   // re-probe against the new guest's driver

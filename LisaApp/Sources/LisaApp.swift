@@ -101,6 +101,7 @@ struct LisaEmuApp: App {
                 // makes the app drop incoming print jobs (acts as an unplugged
                 // printer). The OS-side Serial-B config is separate (§11.6).
                 Toggle("Printer Connected (Serial B)", isOn: Bindable(model).printerConnected)
+                Toggle("PFG Installed (SCC socket)", isOn: Bindable(model).pfgInstalled)
 
                 Toggle("Throttle", isOn: Bindable(model).throttled)
                     .keyboardShortcut("t", modifiers: [.command])

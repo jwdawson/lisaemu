@@ -2829,3 +2829,93 @@ affect the byte-level command parsing:
 6. **Unknown / unmodeled codes** (including `ESC V`, malformed digit runs,
    stray control bytes) are **bounded-logged and no-op'd, never fatal**
    (house pattern: a capped log array + a dropped counter, per `Bus.mmuPortLog`).
+
+## §13 — The PFG (Programmable Frequency Generator)
+
+**Optional third-party hardware, not part of a stock Lisa.** Modeled by
+`PFG`, off by default (`SCC8530.pfg == nil`); `lisadbg --pfg`, or the
+LisaApp Machine menu's "PFG Installed (SCC socket)".
+
+### What it is
+
+A board that **plugs into the Z8530 SCC socket** (9D on the I/O board), with
+two flying leads to an LS132 at 6A. It provides real-time adjustment of the
+floppy controller's bit-cell timing under software control, letting a Lisa
+read Macintosh diskettes written with **3 bytes of bit-slip `$FF`** where the
+Lisa's controller expects 5. **MacWorks Plus II 2.5 requires one and will not
+boot without it.** No public technical documentation exists — the MacWorks
+Plus II manual covers installation only — so everything below is derived from
+the guest's own code and a live trace.
+
+### Electrical seam
+
+| Direction | Path |
+|---|---|
+| Host → PFG | SCC **channel A `WR7`** (`$FCD203`), the SDLC sync-character register |
+| PFG → host | SCC **channel B `RR0` bit 3** (`$FCD201`), the DCD modem input |
+
+`WR7` is the natural command port for a board in this socket: the Lisa's own
+RS-232 driver never programs WR6/WR7, which is why `SCCChannel`'s
+`modeledWriteRegisters` deliberately omits them.
+
+### Identity handshake (MODELED — evidence: live `iot` trace + guest code)
+
+Guest sites: writer `$023D7C`, sampler `$023E78`, boot gate `$423A96`.
+Byte-identical in 2.5.0 and 2.5.3.
+
+```text
+setup   ch-A: read (reset pointer), WR9 <- $0D, WR7 <- $50, WR9 <- $09
+        ch-B: read RR0, WR15 read, WR15 <- $00
+
+8 iterations, addr stepping $10, $12, $14 ... $1E:
+        ch-A: WR7 <- $00
+        ch-A: WR7 <- addr      -> selects a bit pair
+        ch-B: read RR0         -> bit, from DCD
+        ch-A: WR7 <- $08       -> second phase
+        ch-B: read RR0         -> bit, from DCD
+```
+
+16 bits, shifted MSB-first (`lsl.l #1,D1` + `ori.b #1,D1` when DCD is high).
+Iteration `k` supplies bits `15-2k` and `14-2k`. The guest requires the
+result's **low nibble to be `$A`** — `andi.w #$f` / `subi.w #$a`, applied
+both at the probe and again at the boot gate `$423A96`, which is a literal
+`beq`-to-itself spin on failure.
+
+**Only the low nibble is evidenced.** `PFG.identity` defaults to `$000A`, the
+minimal assumption; the upper 12 bits have never been observed being tested.
+
+### Configuration write stream (OBSERVED, NOT MODELED)
+
+After a successful identity read the guest opens again (`WR7 <- $50`) and
+then bit-bangs a serial write, captured as ~74,000 `WR7` writes in a single
+boot:
+
+| Byte | bit 3 (clock) | bit 1 (data) |
+|---|---|---|
+| `$04` | low | 0 |
+| `$0C` | **high** | 0 |
+| `$06` | low | 1 |
+| `$0E` | **high** | 1 |
+
+Bit 2 stays asserted throughout. `PFG` accepts and logs these with **no
+modeled effect**, which is deliberate on two grounds: the real device's
+function is retiming the floppy bit clock, and `FloppyController` is an HLE
+that serves whole 512-byte blocks and never synthesizes a bit stream — there
+is no frequency here to generate; and the register semantics behind the
+stream are not evidenced, so modeling them would be invention.
+
+**There is a read-back path we do not model.** The guest contains **8**
+`btst #3,$00FCD201` sites (`$023E9C`/`$023EB2` are the identity sampler's
+two; four more live in a second copy inside the later-loaded payload), so
+DCD is consulted well beyond the identity exchange.
+
+### Status
+
+With the PFG installed, MacWorks Plus II 2.5.0 clears the `$423AA2` boot gate
+that otherwise spins forever, and proceeds into code never previously
+reached. It then reaches a **Sad Mac, code `000014`**. Whether that is caused
+by the unmodeled write/read-back path, by the guessed upper identity bits, or
+by something downstream is **not yet established**.
+
+**We model a presence/identity responder, not a frequency generator.** Do not
+read more into `PFG` than that.

@@ -2943,12 +2943,50 @@ stream are not evidenced, so modeling them would be invention.
 two; four more live in a second copy inside the later-loaded payload), so
 DCD is consulted well beyond the identity exchange.
 
-### Status
+### Status — the Sad Mac was a CONFIGURATION problem (2026-08-17)
+
+**With the PFG installed AND `OFF MODE` selected, MacWorks Plus II 2.5.0
+reaches its splash cleanly** — no PFG errors, no Sad Mac, `PC = $423C06`,
+`SR = $2000`, version string `II2.5.0 Pro`, and the startup floppy icon
+loses its `?`. It sits waiting for a system disk.
+
+Holding the **mouse button** during startup enters the configuration menu
+(`lisadbg`: `press` … `release` at the `$023736` wait loop):
+
+```text
+TYPE 0-6 FOR DESIRED STARTUP CONFIGURATION
+OR CLICK MOUSE BUTTON FOR OFF MODE
+  0 - NO CHANGE.  USE PRAM SETTINGS
+  1/2/3 - FAST ONLY / ADDITIVE / OFF MODE   XLERATOR SCSI
+  4/5/6 - FAST ONLY / ADDITIVE / OFF MODE   SUN SCSI CARD
+TYPE -CLEAR- TO ZAP PARAMETER RAM
+```
+
+Every option but `0` names an **XLERATOR accelerator** or a **Sun SCSI
+card** — hardware a stock Lisa does not have. The default (PRAM) path
+configures SCSI, MW+II then scans **`$580000`** (the Mac Plus NCR 5380 base,
+absent on a Lisa — see macworks-plus-notes §4.3′), and dies. **That is what
+the Sad Mac `000014` always was**: not a PFG fault, but MacWorks configured
+for hardware that is not fitted. Clicking the mouse in that menu selects
+`OFF MODE` and the crash goes away.
+
+The PRAM contents are byte-identical with and without `OFF MODE` selected
+(same 18 words), so the choice is NOT stored — a file-backed PRAM would be
+faithful, but it would not make this configuration stick.
+
+**Unresolved: with a Widget attached, MW+II still Sad Macs**, in any config
+mode, with a byte-identical fault context — and issues **zero** Widget
+commands, where before the PFG existed it issued three (device-info `$FFFFFF`,
+block 396, block 386). So installing the PFG changed the hard-disk path.
+Cause unknown; this is the current frontier.
+
+### How it got here
 
 With the PFG installed, MacWorks Plus II 2.5.0 clears the `$423AA2` boot gate
 that otherwise spins forever, and proceeds into code never previously
-reached. It then reaches a **Sad Mac, code `000014`**, and still does with the PRAM
-EEPROM modeled and demonstrably being read. The cause is **not established**;
+reached. ~~It then reaches a **Sad Mac, code `000014`**, and still does with the PRAM
+EEPROM modeled and demonstrably being read.~~ **Superseded 2026-08-17: that
+Sad Mac is the SCSI-configured path — see "Status" above.** The cause is **not established**;
 the leading candidates are the PRAM's expected contents (see above) and the
 guessed upper 12 identity bits.
 

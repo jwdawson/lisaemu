@@ -2918,7 +2918,7 @@ the configuration we present**, not defects to suppress. Function 2 (the
 EEPROM) is the one with real work behind it -- see below. Function 3 is a
 no-op for us.
 
-### Configuration write stream (OBSERVED, NOT MODELED)
+### PRAM EEPROM (MODELED at the protocol level -- outcome unresolved)
 
 After a successful identity read the guest opens again (`WR7 <- $50`) and
 then bit-bangs a serial write, captured as ~74,000 `WR7` writes in a single
@@ -2947,10 +2947,10 @@ DCD is consulted well beyond the identity exchange.
 
 With the PFG installed, MacWorks Plus II 2.5.0 clears the `$423AA2` boot gate
 that otherwise spins forever, and proceeds into code never previously
-reached. It then reaches a **Sad Mac, code `000014`**. Whether that is caused
-by the unmodeled EEPROM/read-back path, by the guessed upper identity bits,
-or by something downstream is **not yet established** -- though the PRAM
-hypothesis above is the leading candidate.
+reached. It then reaches a **Sad Mac, code `000014`**, and still does with the PRAM
+EEPROM modeled and demonstrably being read. The cause is **not established**;
+the leading candidates are the PRAM's expected contents (see above) and the
+guessed upper 12 identity bits.
 
 **We model a presence/identity responder, not a frequency generator.** Do not
 read more into `PFG` than that.

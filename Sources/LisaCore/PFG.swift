@@ -90,6 +90,44 @@ public final class PFG {
     public static let firstAddress: UInt8 = 0x10
     public static let lastAddress: UInt8 = 0x1E
 
+    // MARK: - PRAM EEPROM (function 2 -- hardware-notes.md §13)
+
+    /// The board's **256 bytes of non-volatile PRAM**, where MacWorks Plus II
+    /// keeps its startup configuration. A factory-fresh serial EEPROM reads
+    /// all-ones, which is also what a newly fitted board would present, so
+    /// that is the initial state -- the guest is expected to initialize it
+    /// itself rather than us pre-seeding anything.
+    ///
+    /// In memory only. A real board's EEPROM survives power-off; making that
+    /// faithful means a write-through file (the `WidgetImage` shape) and is
+    /// deliberately not done here, so no test or scripted boot silently
+    /// accumulates state. Public so a file-backed option can be layered on.
+    public var eeprom = [UInt8](repeating: 0xFF, count: 256)
+
+    /// Microwire line state, decoded from `WR7`: CS = bit 2, SK = bit 3,
+    /// DI = bit 1 (DO is reported back on DCD). See §13 for the capture this
+    /// is derived from.
+    private static let csBit: UInt8 = 0x04
+    private static let skBit: UInt8 = 0x08
+    private static let diBit: UInt8 = 0x02
+    /// Bit 4 selects the *identity* function on this shared command port;
+    /// clear means the access is aimed at the EEPROM.
+    private static let identityBit: UInt8 = 0x10
+
+    private var chipSelected = false
+    private var clockHigh = false
+    /// Frame bits shifted in since the start bit, MSB first: 2 opcode bits
+    /// then 8 address bits, then (for WRITE) 8 data bits.
+    private var frame: [Int] = []
+    private var sawStartBit = false
+    /// Bits still to shift out on DO for a READ, MSB first.
+    private var readShift: UInt8 = 0
+    private var readBitsRemaining = 0
+    private var dataOut = false
+    /// Set by EWEN, cleared by EWDS -- a real 93Cxx ignores WRITE/ERASE
+    /// until write-enabled.
+    private var writeEnabled = false
+
     /// Which bit pair the last address write selected (`k` in `0...7`), or
     /// `nil` before any address has been written.
     private var selectedPair: Int?
@@ -114,6 +152,11 @@ public final class PFG {
         strobePhase = false
         commandLog.removeAll()
         commandLogDropped = 0
+        releaseChipSelect()
+        writeEnabled = false
+        // The EEPROM is NON-VOLATILE: its contents survive a reset, exactly
+        // as the real board's would. Only the serial-interface state is
+        // cleared.
     }
 
     /// A write to channel A `WR7` — the PFG's command port. Wired by
@@ -125,32 +168,118 @@ public final class PFG {
             commandLogDropped += 1
         }
 
-        switch value {
-        case Self.openCommand:
-            // Start of an exchange: nothing is selected until an address
-            // arrives.
+        // Bit 4 set selects the identity function; otherwise the byte drives
+        // the EEPROM's Microwire lines. `$00` and `$08` belong to the
+        // identity sequence (both have CS clear), so they are handled there.
+        if value & Self.identityBit != 0 {
+            selectedPair = Int((value & 0x0E) >> 1)
+            strobePhase = false
+            releaseChipSelect()
+            return
+        }
+        if value == Self.openCommand {
             selectedPair = nil
             strobePhase = false
-        case Self.strobeCommand:
-            // Second phase of the current pair. If nothing is selected this
-            // is a no-op rather than an error -- we have no evidence about
-            // what real hardware does with an unsequenced strobe, and
-            // guessing an error behavior would be inventing a fact.
-            strobePhase = true
-        case Self.firstAddress...Self.lastAddress where value % 2 == 0:
-            selectedPair = Int(value - Self.firstAddress) / 2
-            strobePhase = false
-        default:
-            // Everything else -- including the timing/frequency commands the
-            // real device exists to service -- is accepted and logged with no
-            // modeled effect. See the type doc comment.
-            break
+            releaseChipSelect()
+            return
+        }
+        if value & Self.csBit == 0 {
+            // Identity strobe ($08) or idle ($00). An unsequenced strobe is a
+            // no-op rather than an error -- we have no evidence for what real
+            // hardware does with one, and inventing an error would be a fact
+            // we cannot cite.
+            if value == Self.strobeCommand { strobePhase = true }
+            releaseChipSelect()
+            return
+        }
+
+        clockMicrowire(value)
+    }
+
+    /// Deasserting CS ends any in-flight Microwire frame, exactly as on a
+    /// real 93Cxx.
+    private func releaseChipSelect() {
+        chipSelected = false
+        clockHigh = false
+        frame.removeAll(keepingCapacity: true)
+        sawStartBit = false
+        readBitsRemaining = 0
+        dataOut = false
+    }
+
+    /// One `WR7` write with CS asserted: decode the Microwire transaction.
+    /// Bits shift on the RISING edge of SK, MSB first (93Cxx convention).
+    private func clockMicrowire(_ value: UInt8) {
+        if !chipSelected {
+            chipSelected = true
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
+            readBitsRemaining = 0
+            dataOut = false
+        }
+
+        let sk = value & Self.skBit != 0
+        defer { clockHigh = sk }
+        guard sk, !clockHigh else { return }   // rising edge only
+
+        // A READ in progress shifts its next bit out and consumes the edge;
+        // DI is don't-care for the rest of the frame.
+        if readBitsRemaining > 0 {
+            dataOut = (readShift & 0x80) != 0
+            readShift <<= 1
+            readBitsRemaining -= 1
+            return
+        }
+
+        let di = value & Self.diBit != 0 ? 1 : 0
+        guard sawStartBit else {
+            // Leading zeros are dummy clocks; the frame begins at the first 1.
+            if di == 1 { sawStartBit = true }
+            return
+        }
+
+        frame.append(di)
+        // 2 opcode bits + 8 address bits (256 x 8 organization).
+        guard frame.count >= 10 else { return }
+        let opcode = (frame[0] << 1) | frame[1]
+        let address = frame[2..<10].reduce(0) { ($0 << 1) | $1 }
+
+        switch opcode {
+        case 0b10:   // READ
+            readShift = eeprom[address]
+            readBitsRemaining = 8
+            dataOut = false   // 93Cxx emits a leading dummy 0 before the data
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
+        case 0b01:   // WRITE -- 8 data bits follow
+            guard frame.count >= 18 else { return }
+            if writeEnabled {
+                eeprom[address] = UInt8(frame[10..<18].reduce(0) { ($0 << 1) | $1 })
+            }
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
+        case 0b11:   // ERASE
+            if writeEnabled { eeprom[address] = 0xFF }
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
+        default:     // 0b00 -- the top address bits select the sub-command
+            switch address >> 6 {
+            case 0b00: writeEnabled = false                              // EWDS
+            case 0b11: writeEnabled = true                               // EWEN
+            case 0b01: if writeEnabled { eeprom = .init(repeating: 0x00, count: 256) }  // WRAL
+            default:   if writeEnabled { eeprom = .init(repeating: 0xFF, count: 256) }  // ERAL
+            }
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
         }
     }
 
     /// The DCD level this board is currently driving, sampled by channel B's
     /// `RR0` bit 3. Wired by `SCC8530` only while a PFG is attached.
     public var dcdAsserted: Bool {
+        // An EEPROM frame owns the line while CS is asserted (function 2);
+        // otherwise the identity responder does (see `selectedPair`).
+        if chipSelected { return dataOut }
         guard let pair = selectedPair else { return false }
         let bit = 15 - (2 * pair) - (strobePhase ? 1 : 0)
         guard bit >= 0 else { return false }

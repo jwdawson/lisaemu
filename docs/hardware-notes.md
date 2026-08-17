@@ -2884,6 +2884,40 @@ both at the probe and again at the boot gate `$423A96`, which is a literal
 **Only the low nibble is evidenced.** `PFG.identity` defaults to `$000A`, the
 minimal assumption; the upper 12 bits have never been observed being tested.
 
+### The three real functions (user-supplied field report, 2026-08-16)
+
+A first-hand account of the hardware, which reframes two things this section
+previously got wrong. Recorded as provenance: a field report, not a datasheet.
+
+1. **Floppy controller clock.** The Lisa clocks its FDC at 2 MHz; the PFG
+   injects its own clock into **U6A via the two clip leads**, varying it
+   slightly above/below 2 MHz *under MW+II software control*, which is what
+   lets it read Mac disks the stock clock cannot. **A PFG works with the
+   clips disconnected** -- you get a startup warning and lose the
+   disk-reading improvement, nothing more. Inert under any other OS, since
+   only MW+II ever asks for a change.
+2. **256 bytes of PRAM in an on-board EEPROM** (the 8-pin chip). The stock
+   Lisa has almost none -- it borrows leftover space in the floppy
+   controller's shared RAM, and loses it when the I/O board batteries die.
+   The PFG's is non-volatile and much larger, and **this is where MW+II keeps
+   its startup configuration** (XLerator present/mode, etc.). Inert under
+   other OSes.
+3. **SCC clock 4 MHz -> 3.672 MHz** (the Mac Plus rate), for serial-port
+   compatibility. **Unlike the other two this is always active, even under
+   other operating systems** -- the one way a fitted PFG perturbs a
+   non-MacWorks machine. No reported ill effects. We model no SCC baud clock
+   at all, so it has no effect here; noted for fidelity.
+
+**Consequences for this model.** Our PFG is, permanently and by
+construction, *a PFG with the clips disconnected*: `FloppyController` is an
+HLE that serves whole 512-byte blocks and never synthesizes a bit stream, so
+there is no 2 MHz clock to vary and function 1 cannot exist here. MacWorks
+Plus II's `TIMEOUT WAITING FOR FDC - CHECK PFG CLIPS` and `PFG CANNOT
+CONTROL FDC - CHECK PFG CLIPS` are therefore **correct, expected output for
+the configuration we present**, not defects to suppress. Function 2 (the
+EEPROM) is the one with real work behind it -- see below. Function 3 is a
+no-op for us.
+
 ### Configuration write stream (OBSERVED, NOT MODELED)
 
 After a successful identity read the guest opens again (`WR7 <- $50`) and
@@ -2914,8 +2948,9 @@ DCD is consulted well beyond the identity exchange.
 With the PFG installed, MacWorks Plus II 2.5.0 clears the `$423AA2` boot gate
 that otherwise spins forever, and proceeds into code never previously
 reached. It then reaches a **Sad Mac, code `000014`**. Whether that is caused
-by the unmodeled write/read-back path, by the guessed upper identity bits, or
-by something downstream is **not yet established**.
+by the unmodeled EEPROM/read-back path, by the guessed upper identity bits,
+or by something downstream is **not yet established** -- though the PRAM
+hypothesis above is the leading candidate.
 
 **We model a presence/identity responder, not a frequency generator.** Do not
 read more into `PFG` than that.

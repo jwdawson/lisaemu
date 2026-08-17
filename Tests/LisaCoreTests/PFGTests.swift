@@ -110,11 +110,12 @@ import Testing
         return out
     }
 
+    /// 128 x 16 organization: 2 opcode bits, 7 address bits, 16 data bits.
     private func frameBits(start: Int = 1, opcode: [Int], address: UInt8,
-                           data: UInt8? = nil, trailing: Int = 0) -> [Int] {
+                           data: UInt16? = nil, trailing: Int = 0) -> [Int] {
         var bits = [0, 0, start] + opcode
-        bits += (0..<8).map { Int((address >> (7 - $0)) & 1) }
-        if let data { bits += (0..<8).map { Int((data >> (7 - $0)) & 1) } }
+        bits += (0..<7).map { Int((address >> (6 - $0)) & 1) }
+        if let data { bits += (0..<16).map { Int((data >> (15 - $0)) & 1) } }
         bits += Array(repeating: 0, count: trailing)
         return bits
     }
@@ -123,48 +124,49 @@ import Testing
     /// on DO MSB-first after the 93Cxx leading dummy zero.
     @Test func eepromReadOfAnErasedCellShiftsOutAllOnes() {
         let pfg = PFG()
-        let out = microwire(pfg, bits: frameBits(opcode: [1, 0], address: 0x0C, trailing: 8))
-        // The 8 data bits follow the dummy 0 that lands on the frame's last
-        // address clock.
-        #expect(out.suffix(8) == [1, 1, 1, 1, 1, 1, 1, 1])
+        let out = microwire(pfg, bits: frameBits(opcode: [1, 0], address: 0x0C, trailing: 16))
+        #expect(out.suffix(16) == Array(repeating: 1, count: 16))
     }
 
     /// The exact frame captured from MacWorks Plus II: 6 dummy clocks, start
     /// bit, opcode 10 (READ), address $0C -- see hardware-notes.md §13.
+    /// The exact frame captured from MacWorks Plus II: 6 dummy clocks, start
+    /// bit, opcode 10 (READ), then SEVEN address bits -- the x16 organization
+    /// evidenced by the following frame reading address 1. See §13.
     @Test func eepromDecodesTheCapturedMacWorksReadFrame() {
         let pfg = PFG()
-        pfg.eeprom[0x0C] = 0x5A
+        pfg.eeprom[0x00] = 0x5AA5
         var bits = Array(repeating: 0, count: 6) + [1, 1, 0]
-        bits += (0..<8).map { Int((UInt8(0x0C) >> (7 - $0)) & 1) }
-        bits += Array(repeating: 0, count: 8)
+        bits += Array(repeating: 0, count: 7)      // address 0
+        bits += Array(repeating: 0, count: 16)
         let out = microwire(pfg, bits: bits)
-        #expect(out.suffix(8) == [0, 1, 0, 1, 1, 0, 1, 0])   // $5A, MSB first
+        #expect(out.suffix(16) == [0,1,0,1,1,0,1,0, 1,0,1,0,0,1,0,1])   // $5AA5
     }
 
     @Test func eepromWriteNeedsWriteEnableAndThenRoundTrips() {
         let pfg = PFG()
 
         // WRITE while not enabled: ignored (a real 93Cxx powers up disabled).
-        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x20, data: 0x3C))
-        #expect(pfg.eeprom[0x20] == 0xFF)
+        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x20, data: 0x3C5A))
+        #expect(pfg.eeprom[0x20] == 0xFFFF)
 
-        // EWEN: opcode 00 with the top address bits 11.
-        _ = microwire(pfg, bits: frameBits(opcode: [0, 0], address: 0xC0))
-        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x20, data: 0x3C))
-        #expect(pfg.eeprom[0x20] == 0x3C)
+        // EWEN: opcode 00 with the top 2 address bits 11.
+        _ = microwire(pfg, bits: frameBits(opcode: [0, 0], address: 0x60))
+        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x20, data: 0x3C5A))
+        #expect(pfg.eeprom[0x20] == 0x3C5A)
 
-        let out = microwire(pfg, bits: frameBits(opcode: [1, 0], address: 0x20, trailing: 8))
-        #expect(out.suffix(8) == [0, 0, 1, 1, 1, 1, 0, 0])   // $3C
+        let out = microwire(pfg, bits: frameBits(opcode: [1, 0], address: 0x20, trailing: 16))
+        #expect(out.suffix(16) == [0,0,1,1,1,1,0,0, 0,1,0,1,1,0,1,0])   // $3C5A
     }
 
     /// The EEPROM is non-volatile: a reset clears the serial interface but
     /// not the stored bytes, exactly as the real board behaves.
     @Test func resetPreservesEEPROMContents() {
         let pfg = PFG()
-        _ = microwire(pfg, bits: frameBits(opcode: [0, 0], address: 0xC0))   // EWEN
-        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x11, data: 0x99))
+        _ = microwire(pfg, bits: frameBits(opcode: [0, 0], address: 0x60))   // EWEN
+        _ = microwire(pfg, bits: frameBits(opcode: [0, 1], address: 0x11, data: 0x9944))
         pfg.reset()
-        #expect(pfg.eeprom[0x11] == 0x99)
+        #expect(pfg.eeprom[0x11] == 0x9944)
     }
 
     /// The identity path and the EEPROM share one command port, split by
@@ -172,7 +174,7 @@ import Testing
     @Test func identityStillWorksAfterAnEEPROMFrame() {
         let scc = SCC8530()
         scc.pfg = PFG()
-        _ = microwire(scc.pfg!, bits: frameBits(opcode: [1, 0], address: 0x00, trailing: 8))
+        _ = microwire(scc.pfg!, bits: frameBits(opcode: [1, 0], address: 0x00, trailing: 16))
 
         func writeWR7(_ value: UInt8) {
             scc.write(address: 0xD203, 0x07)

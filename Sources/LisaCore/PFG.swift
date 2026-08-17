@@ -102,7 +102,11 @@ public final class PFG {
     /// faithful means a write-through file (the `WidgetImage` shape) and is
     /// deliberately not done here, so no test or scripted boot silently
     /// accumulates state. Public so a file-backed option can be layered on.
-    public var eeprom = [UInt8](repeating: 0xFF, count: 256)
+    /// 128 words x 16 bits = the 256 bytes of the field report. The
+    /// organization is EVIDENCED, not assumed: a captured frame is
+    /// `start, 10 (READ), 7 address bits`, and the following frame reads
+    /// address 1 -- a sequential word scan. See §13.
+    public var eeprom = [UInt16](repeating: 0xFFFF, count: 128)
 
     /// Microwire line state, decoded from `WR7`: CS = bit 2, SK = bit 3,
     /// DI = bit 1 (DO is reported back on DCD). See §13 for the capture this
@@ -117,11 +121,11 @@ public final class PFG {
     private var chipSelected = false
     private var clockHigh = false
     /// Frame bits shifted in since the start bit, MSB first: 2 opcode bits
-    /// then 8 address bits, then (for WRITE) 8 data bits.
+    /// then 7 address bits, then (for WRITE) 16 data bits.
     private var frame: [Int] = []
     private var sawStartBit = false
     /// Bits still to shift out on DO for a READ, MSB first.
-    private var readShift: UInt8 = 0
+    private var readShift: UInt16 = 0
     private var readBitsRemaining = 0
     private var dataOut = false
     /// Set by EWEN, cleared by EWDS -- a real 93Cxx ignores WRITE/ERASE
@@ -225,7 +229,7 @@ public final class PFG {
         // A READ in progress shifts its next bit out and consumes the edge;
         // DI is don't-care for the rest of the frame.
         if readBitsRemaining > 0 {
-            dataOut = (readShift & 0x80) != 0
+            dataOut = (readShift & 0x8000) != 0
             readShift <<= 1
             readBitsRemaining -= 1
             return
@@ -239,38 +243,39 @@ public final class PFG {
         }
 
         frame.append(di)
-        // 2 opcode bits + 8 address bits (256 x 8 organization).
-        guard frame.count >= 10 else { return }
+        // 2 opcode bits + 7 address bits (128 x 16 organization).
+        guard frame.count >= 9 else { return }
         let opcode = (frame[0] << 1) | frame[1]
-        let address = frame[2..<10].reduce(0) { ($0 << 1) | $1 }
+        let address = frame[2..<9].reduce(0) { ($0 << 1) | $1 }
+
+        func endFrame() {
+            frame.removeAll(keepingCapacity: true)
+            sawStartBit = false
+        }
 
         switch opcode {
-        case 0b10:   // READ
+        case 0b10:   // READ -- 16 bits out, after a leading dummy 0
             readShift = eeprom[address]
-            readBitsRemaining = 8
-            dataOut = false   // 93Cxx emits a leading dummy 0 before the data
-            frame.removeAll(keepingCapacity: true)
-            sawStartBit = false
-        case 0b01:   // WRITE -- 8 data bits follow
-            guard frame.count >= 18 else { return }
+            readBitsRemaining = 16
+            dataOut = false
+            endFrame()
+        case 0b01:   // WRITE -- 16 data bits follow
+            guard frame.count >= 25 else { return }
             if writeEnabled {
-                eeprom[address] = UInt8(frame[10..<18].reduce(0) { ($0 << 1) | $1 })
+                eeprom[address] = UInt16(frame[9..<25].reduce(0) { ($0 << 1) | $1 })
             }
-            frame.removeAll(keepingCapacity: true)
-            sawStartBit = false
+            endFrame()
         case 0b11:   // ERASE
-            if writeEnabled { eeprom[address] = 0xFF }
-            frame.removeAll(keepingCapacity: true)
-            sawStartBit = false
-        default:     // 0b00 -- the top address bits select the sub-command
-            switch address >> 6 {
-            case 0b00: writeEnabled = false                              // EWDS
-            case 0b11: writeEnabled = true                               // EWEN
-            case 0b01: if writeEnabled { eeprom = .init(repeating: 0x00, count: 256) }  // WRAL
-            default:   if writeEnabled { eeprom = .init(repeating: 0xFF, count: 256) }  // ERAL
+            if writeEnabled { eeprom[address] = 0xFFFF }
+            endFrame()
+        default:     // 0b00 -- the top 2 address bits select the sub-command
+            switch address >> 5 {
+            case 0b00: writeEnabled = false                                  // EWDS
+            case 0b11: writeEnabled = true                                   // EWEN
+            case 0b01: if writeEnabled { eeprom = .init(repeating: 0x0000, count: 128) }  // WRAL
+            default:   if writeEnabled { eeprom = .init(repeating: 0xFFFF, count: 128) }  // ERAL
             }
-            frame.removeAll(keepingCapacity: true)
-            sawStartBit = false
+            endFrame()
         }
     }
 

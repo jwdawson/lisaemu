@@ -858,6 +858,16 @@ while let line = readLine(strippingNewline: true) {
             print("      pfg $\(String(value, radix: 16, uppercase: true)) \(name)\(count > 1 ? "  x\(count)" : "")")
         }
         print("      \(entries.count) logged, \(pfg.commandLogDropped) dropped")
+        // EEPROM occupancy: an erased part is all-$FF, so anything else is
+        // something the guest actually stored.
+        let written = pfg.eeprom.enumerated().filter { $0.element != 0xFFFF }
+        if written.isEmpty {
+            print("      PRAM: all 128 words still $FFFF (guest has written nothing)")
+        } else {
+            print("      PRAM: \(written.count)/256 bytes written")
+            let preview = written.prefix(16).map { "\(String(format: "%02X", $0.offset))=\(String(format: "%04X", $0.element))" }
+            print("      PRAM first writes: \(preview.joined(separator: " "))")
+        }
     case .guestCursor(let mac):
         guestCursorMode = mac ? .mac : .lisa
         cachedCursorSigns = nil   // re-probe against the new guest's driver
